@@ -63,9 +63,22 @@ chmod 0644 "${CONFIG_DIR}/ssh"/ssh_host_*_key.pub
 
 password_authentication="no"
 if truthy "${SSH_PASSWORD_LOGIN:-false}"; then
-  [ -n "${SSH_PASSWORD_HASH:-}" ] || die "SSH_PASSWORD_LOGIN is enabled, but SSH_PASSWORD_HASH is empty"
-  printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | chpasswd -e \
-    || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
+  if [ -n "${SSH_PASSWORD:-}" ] && [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    die "SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one"
+  fi
+
+  if [ -n "${SSH_PASSWORD:-}" ]; then
+    case "${SSH_PASSWORD}" in
+      *$'\n'*|*$'\r'*) die "SSH_PASSWORD must not contain newlines" ;;
+    esac
+    printf 'codex:%s\n' "${SSH_PASSWORD}" | chpasswd \
+      || die "failed to apply SSH_PASSWORD; password mode requires a writable root filesystem"
+  elif [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | chpasswd -e \
+      || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
+  else
+    die "SSH_PASSWORD_LOGIN is enabled, but SSH_PASSWORD is empty"
+  fi
   password_authentication="yes"
 fi
 

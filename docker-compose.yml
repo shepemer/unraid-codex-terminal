@@ -8,7 +8,6 @@ services:
     image: ${CODEX_TERMINAL_IMAGE:-ghcr.io/shepemer/unraid-codex-terminal:dev}
     container_name: codex-terminal
     restart: unless-stopped
-    read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -30,6 +29,7 @@ services:
     environment:
       SSH_AUTHORIZED_KEYS: ${SSH_AUTHORIZED_KEYS:-}
       SSH_PASSWORD_LOGIN: ${SSH_PASSWORD_LOGIN:-false}
+      SSH_PASSWORD: ${SSH_PASSWORD:-}
       SSH_PASSWORD_HASH: ${SSH_PASSWORD_HASH:-}
       UNRAID_MCP_BEARER_TOKEN: ${UNRAID_MCP_BEARER_TOKEN:-}
       WEBUI_ENABLED: ${WEBUI_ENABLED:-true}

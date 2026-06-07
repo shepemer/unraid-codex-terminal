@@ -38,7 +38,7 @@ The design has two hard boundaries:
    - `UNRAID_API_KEY`
    - `UNRAID_MCP_BEARER_TOKEN`
 
-5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`.
+5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
 Do not add a port mapping for `unraid-mcp`. The MCP server should only be reachable from containers attached to `codex-mgmt`.
 
@@ -89,6 +89,8 @@ ssh unraid-codex codex mcp list --json
 
 Codex Desktop Remote SSH should detect this host from your local SSH config. Open `/workspace` as the project path.
 
+SSH password auth is disabled by default. If a client cannot use SSH keys, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`; keep SSH exposed only on LAN, VPN, or Tailscale. `SSH_PASSWORD_HASH` is still supported for advanced deployments, but leave it empty when `SSH_PASSWORD` is set.
+
 ## Codex Auth And State
 
 The container persists these paths under `/mnt/user/appdata/codex-terminal`:
@@ -122,6 +124,7 @@ docker compose up -d
 ```
 
 For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key.
+To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`.
 For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
 The MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set.
 
@@ -159,6 +162,7 @@ Unraid acceptance:
 ## Security Notes
 
 - Never expose SSH directly to the public internet. Use LAN, VPN, or Tailscale.
+- Prefer SSH keys. If SSH password login is enabled, use a strong unique password.
 - Never expose the WebUI directly to the public internet. It is an authenticated browser shell, not a hardened public web app.
 - Keep `WEBUI_AUTH=true` unless another authenticated proxy is in front of the WebUI.
 - Never mount `/var/run/docker.sock`.
@@ -166,6 +170,7 @@ Unraid acceptance:
 - Use only narrow read-only diagnostic mounts.
 - Keep the Unraid API key only in the MCP sidecar.
 - The MCP sidecar always requires bearer-token auth; do not add a host port mapping for MCP.
+- The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.
 
 ## MCP Fallback
 

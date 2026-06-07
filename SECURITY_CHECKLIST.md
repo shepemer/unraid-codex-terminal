@@ -14,6 +14,7 @@ Use this before deploying or publishing the templates.
 - [ ] `UNRAID_MCP_BEARER_TOKEN` is long, random, and matches both containers.
 - [ ] Root SSH login is disabled.
 - [ ] Password SSH login is disabled unless there is a specific need.
+- [ ] If password SSH login is enabled, `SSH_PASSWORD` is strong and unique.
 - [ ] No container uses `privileged: true`.
 - [ ] No container uses host networking, host PID, host IPC, or host devices.
 - [ ] No container mounts `/var/run/docker.sock`.
@@ -43,5 +44,6 @@ Use this before deploying or publishing the templates.
 - [ ] WebUI without credentials fails when `WEBUI_AUTH=true`.
 - [ ] Root SSH login fails.
 - [ ] Password SSH login fails by default.
+- [ ] Password SSH login works only after `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD` are set.
 - [ ] The container cannot access `/var/run/docker.sock`.
 - [ ] Recreating `codex-terminal` preserves `/config/.codex`, SSH host keys, authorized keys, and workspace files.
