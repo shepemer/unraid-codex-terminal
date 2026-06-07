@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>unraid-mcp</Name>
+  <Repository>ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:1.2.4</Repository>
+  <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-unraid-mcp</Registry>
+  <Network>codex-mgmt</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
+  <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
+  <Overview>Internal GraphQL-backed Unraid MCP sidecar for codex-terminal. This container should not publish its MCP port to the LAN.</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/unraid-mcp.xml</TemplateURL>
+  <Icon/>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --tmpfs /run:rw,nosuid,size=32m --security-opt=no-new-privileges:true --cap-drop=ALL</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>Create the Docker network first: docker network create codex-mgmt. Do not add a host port mapping for 6970 unless you intentionally expose MCP.</Requires>
+  <Config Name="State" Target="/home/mcp/.unraid-mcp" Default="/mnt/user/appdata/unraid-mcp/state" Mode="rw" Description="Persistent MCP state and generated credential files." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/unraid-mcp/state</Config>
+  <Config Name="Logs" Target="/app/logs" Default="/mnt/user/appdata/unraid-mcp/logs" Mode="rw" Description="MCP application logs." Type="Path" Display="advanced" Required="false" Mask="false">/mnt/user/appdata/unraid-mcp/logs</Config>
+  <Config Name="Backups" Target="/app/backups" Default="/mnt/user/appdata/unraid-mcp/backups" Mode="rw" Description="MCP backup output directory if a supported tool writes backups." Type="Path" Display="advanced" Required="false" Mask="false">/mnt/user/appdata/unraid-mcp/backups</Config>
+  <Config Name="Unraid API URL" Target="UNRAID_API_URL" Default="https://tower.local/graphql" Mode="" Description="Unraid GraphQL endpoint. Unraid 7.2+ includes the API; pre-7.2 requires Unraid Connect." Type="Variable" Display="always" Required="true" Mask="false">https://tower.local/graphql</Config>
+  <Config Name="Unraid API Key" Target="UNRAID_API_KEY" Default="" Mode="" Description="Scoped Unraid API key. Avoid ADMIN by default." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Unraid MCP Bearer Token" Target="UNRAID_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token clients must use to call this MCP server. Must match codex-terminal." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="MCP Transport" Target="UNRAID_MCP_TRANSPORT" Default="streamable-http" Mode="" Description="Use streamable-http for Codex." Type="Variable" Display="advanced" Required="true" Mask="false">streamable-http</Config>
+  <Config Name="MCP Host" Target="UNRAID_MCP_HOST" Default="0.0.0.0" Mode="" Description="Bind inside the container/network only. Do not publish the port to the host." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0</Config>
+  <Config Name="MCP Port" Target="UNRAID_MCP_PORT" Default="6970" Mode="" Description="Internal MCP port on codex-mgmt." Type="Variable" Display="advanced" Required="true" Mask="false">6970</Config>
+</Container>

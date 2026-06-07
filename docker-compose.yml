@@ -1,0 +1,90 @@
+name: unraid-codex-terminal
+
+services:
+  codex-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CODEX_TERMINAL_IMAGE:-ghcr.io/shepemer/unraid-codex-terminal:dev}
+    container_name: codex-terminal
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+      - SYS_CHROOT
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /run:rw,nosuid,size=64m
+      - /var/run:rw,nosuid,size=64m
+    ports:
+      - "${CODEX_SSH_PORT:-2222}:2222/tcp"
+      - "${CODEX_WEBUI_PORT:-7681}:7681/tcp"
+    environment:
+      SSH_AUTHORIZED_KEYS: ${SSH_AUTHORIZED_KEYS:-}
+      SSH_PASSWORD_LOGIN: ${SSH_PASSWORD_LOGIN:-false}
+      SSH_PASSWORD_HASH: ${SSH_PASSWORD_HASH:-}
+      UNRAID_MCP_BEARER_TOKEN: ${UNRAID_MCP_BEARER_TOKEN:-}
+      WEBUI_ENABLED: ${WEBUI_ENABLED:-true}
+      WEBUI_AUTH: ${WEBUI_AUTH:-true}
+      WEBUI_USERNAME: ${WEBUI_USERNAME:-codex}
+      WEBUI_PASSWORD: ${WEBUI_PASSWORD:-}
+      WEBUI_PORT: 7681
+      WEBUI_MAX_CLIENTS: ${WEBUI_MAX_CLIENTS:-5}
+      WEBUI_TMUX_SESSION: ${WEBUI_TMUX_SESSION:-codex}
+      WEBUI_LOG_LEVEL: ${WEBUI_LOG_LEVEL:-1}
+      AUTO_LAUNCH_CODEX: ${AUTO_LAUNCH_CODEX:-true}
+      CODEX_WEBUI_BYPASS_APPROVALS: ${CODEX_WEBUI_BYPASS_APPROVALS:-true}
+    volumes:
+      - ${CODEX_CONFIG_DIR:-./data/codex-terminal}:/config:rw
+      # Optional diagnostic mounts. Keep them read-only and narrow.
+      # - /var/log:/mnt/unraid/logs:ro
+      # - /boot/config/plugins/dockerMan/templates-user:/mnt/unraid/docker-templates:ro
+    networks:
+      - codex-mgmt
+    depends_on:
+      unraid-mcp:
+        condition: service_started
+
+  unraid-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.unraid-mcp
+      args:
+        UNRAID_MCP_VERSION: "1.2.4"
+    image: ${UNRAID_MCP_IMAGE:-ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:1.2.4-dev}
+    container_name: unraid-mcp
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+      - /run:rw,nosuid,size=32m
+    environment:
+      UNRAID_API_URL: ${UNRAID_API_URL:-}
+      UNRAID_API_KEY: ${UNRAID_API_KEY:-}
+      UNRAID_MCP_BEARER_TOKEN: ${UNRAID_MCP_BEARER_TOKEN:-}
+      UNRAID_MCP_TRANSPORT: ${UNRAID_MCP_TRANSPORT:-streamable-http}
+      UNRAID_MCP_HOST: ${UNRAID_MCP_HOST:-0.0.0.0}
+      UNRAID_MCP_PORT: ${UNRAID_MCP_PORT:-6970}
+    volumes:
+      - ${UNRAID_MCP_STATE_DIR:-./data/unraid-mcp/state}:/home/mcp/.unraid-mcp:rw
+      - ${UNRAID_MCP_LOG_DIR:-./data/unraid-mcp/logs}:/app/logs:rw
+      - ${UNRAID_MCP_BACKUP_DIR:-./data/unraid-mcp/backups}:/app/backups:rw
+    networks:
+      - codex-mgmt
+
+networks:
+  codex-mgmt:
+    name: codex-mgmt
+    driver: bridge
