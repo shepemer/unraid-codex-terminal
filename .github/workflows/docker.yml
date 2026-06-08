@@ -1,0 +1,99 @@
+name: Docker
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  TERMINAL_IMAGE: unraid-codex-terminal
+  MCP_IMAGE: unraid-codex-terminal-unraid-mcp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build codex-terminal
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}
+
+      - name: Scan codex-terminal
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          version: v0.70.0
+          format: table
+          exit-code: "1"
+
+      - name: Build unraid-mcp
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.unraid-mcp
+          platforms: linux/amd64
+          load: true
+          build-args: |
+            UNRAID_MCP_VERSION=1.2.4
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:1.2.4
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}
+
+      - name: Scan unraid-mcp
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          version: v0.70.0
+          format: table
+          exit-code: "1"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push codex-terminal
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:latest"
+          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}"
+
+      - name: Push unraid-mcp
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:latest"
+          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:1.2.4"
+          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}"
