@@ -12,7 +12,7 @@
   <Category>Tools:</Category>
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/unraid-mcp.xml</TemplateURL>
-  <Icon/>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/unraid-mcp.png</Icon>
   <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --tmpfs /run:rw,nosuid,size=32m --security-opt=no-new-privileges:true --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER --cap-add=SETGID --cap-add=SETUID</ExtraParams>
   <PostArgs/>
   <CPUset/>

@@ -12,7 +12,7 @@
   <Category>Tools:</Category>
   <WebUI>http://[IP]:[PORT:7681]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/codex-terminal.xml</TemplateURL>
-  <Icon/>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/codex-terminal.png</Icon>
   <ExtraParams>--tmpfs /tmp:rw,noexec,nosuid,size=256m --tmpfs /run:rw,nosuid,size=64m --tmpfs /var/run:rw,nosuid,size=64m --security-opt=no-new-privileges:true --cap-drop=ALL --cap-add=AUDIT_WRITE --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=SETGID --cap-add=SETUID --cap-add=SYS_CHROOT</ExtraParams>
   <PostArgs/>
   <CPUset/>

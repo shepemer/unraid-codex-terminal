@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Unraid MCP</title>
+  <desc id="desc">An Unraid orange server mark with a small teal MCP node accent.</desc>
+  <defs>
+    <linearGradient id="barFill" x1="128" y1="92" x2="360" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffbd4a"/>
+      <stop offset="0.48" stop-color="#ff8a22"/>
+      <stop offset="1" stop-color="#f15a24"/>
+    </linearGradient>
+    <linearGradient id="barEdge" x1="152" y1="92" x2="342" y2="392" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd28a"/>
+      <stop offset="1" stop-color="#ff6a21"/>
+    </linearGradient>
+    <linearGradient id="mcpFill" x1="320" y1="312" x2="414" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#53f4ff"/>
+      <stop offset="0.58" stop-color="#2ee0bd"/>
+      <stop offset="1" stop-color="#2fcf7b"/>
+    </linearGradient>
+    <filter id="markShadow" x="-14%" y="-16%" width="128%" height="136%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="15" flood-color="#050816" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#markShadow)">
+    <g fill="url(#barFill)" stroke="url(#barEdge)" stroke-width="8">
+      <rect x="104" y="132" width="76" height="238" rx="28"/>
+      <rect x="218" y="94" width="76" height="314" rx="28"/>
+      <rect x="332" y="132" width="76" height="238" rx="28"/>
+    </g>
+    <g opacity="0.33" fill="#fff3d6">
+      <rect x="128" y="157" width="28" height="70" rx="14"/>
+      <rect x="242" y="119" width="28" height="88" rx="14"/>
+      <rect x="356" y="157" width="28" height="70" rx="14"/>
+    </g>
+  </g>
+
+  <g filter="url(#markShadow)">
+    <circle cx="369" cy="370" r="57" fill="#0c1422" stroke="url(#mcpFill)" stroke-width="12"/>
+    <g fill="none" stroke="url(#mcpFill)" stroke-linecap="round" stroke-linejoin="round" stroke-width="10">
+      <path d="M344 356l25-15 25 15v30l-25 15-25-15v-30Z"/>
+      <path d="M369 341v60"/>
+      <path d="M344 356l50 30"/>
+      <path d="M394 356l-50 30"/>
+    </g>
+    <g fill="#d9fff6">
+      <circle cx="369" cy="341" r="7"/>
+      <circle cx="344" cy="386" r="7"/>
+      <circle cx="394" cy="386" r="7"/>
+    </g>
+  </g>
+</svg>
