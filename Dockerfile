@@ -10,12 +10,16 @@ ARG TTYD_VERSION=1.7.7
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    CODEX_NPM_VERSION=${CODEX_NPM_VERSION} \
+    CODEX_UPDATE_ON_START=true \
+    CODEX_UPDATE_ON_START_TIMEOUT=180 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         bash \
         bubblewrap \

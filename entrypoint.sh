@@ -24,6 +24,28 @@ shell_quote() {
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
 }
 
+update_codex_cli() {
+  truthy "${CODEX_UPDATE_ON_START:-true}" || return 0
+
+  local version="${CODEX_NPM_VERSION:-latest}"
+  local timeout_seconds="${CODEX_UPDATE_ON_START_TIMEOUT:-180}"
+
+  case "${version}" in
+    ""|*[[:space:]]*) die "CODEX_NPM_VERSION must not be empty or contain whitespace" ;;
+  esac
+  case "${timeout_seconds}" in
+    ""|*[!0-9]*) die "CODEX_UPDATE_ON_START_TIMEOUT must be a positive integer number of seconds" ;;
+    0) die "CODEX_UPDATE_ON_START_TIMEOUT must be greater than zero" ;;
+  esac
+
+  echo "codex-terminal: updating Codex CLI via npm install -g @openai/codex@${version}" >&2
+  if timeout "${timeout_seconds}" npm install -g "@openai/codex@${version}"; then
+    npm cache clean --force >/dev/null 2>&1 || true
+  else
+    echo "codex-terminal: warning: Codex CLI update failed; continuing with bundled version" >&2
+  fi
+}
+
 mkdir -p \
   "${CONFIG_DIR}/.codex" \
   "${CONFIG_DIR}/cache" \
@@ -32,6 +54,11 @@ mkdir -p \
   "${CONFIG_DIR}/workspace" \
   "${RUNTIME_DIR}" \
   /run/sshd
+
+# OpenSSH StrictModes rejects group/other-writable path components for
+# AuthorizedKeysFile, including the bind-mounted /config directory itself.
+chown codex:codex "${CONFIG_DIR}"
+chmod 0755 "${CONFIG_DIR}"
 
 chown -R codex:codex \
   "${CONFIG_DIR}/.codex" \
@@ -60,6 +87,8 @@ touch "${CONFIG_DIR}/ssh/authorized_keys"
 chown codex:codex "${CONFIG_DIR}/ssh/authorized_keys" "${CONFIG_DIR}/ssh"/ssh_host_*_key*
 chmod 0600 "${CONFIG_DIR}/ssh/authorized_keys" "${CONFIG_DIR}/ssh"/ssh_host_*_key
 chmod 0644 "${CONFIG_DIR}/ssh"/ssh_host_*_key.pub
+
+update_codex_cli
 
 password_authentication="no"
 if truthy "${SSH_PASSWORD_LOGIN:-false}"; then
