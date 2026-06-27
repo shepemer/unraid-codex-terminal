@@ -13,6 +13,7 @@ services:
     cap_drop:
       - ALL
     cap_add:
+      - AUDIT_WRITE
       - CHOWN
       - DAC_OVERRIDE
       - FOWNER
@@ -42,6 +43,9 @@ services:
       WEBUI_LOG_LEVEL: ${WEBUI_LOG_LEVEL:-1}
       AUTO_LAUNCH_CODEX: ${AUTO_LAUNCH_CODEX:-true}
       CODEX_WEBUI_BYPASS_APPROVALS: ${CODEX_WEBUI_BYPASS_APPROVALS:-true}
+      CODEX_UPDATE_ON_START: ${CODEX_UPDATE_ON_START:-true}
+      CODEX_NPM_VERSION: ${CODEX_NPM_VERSION:-latest}
+      CODEX_UPDATE_ON_START_TIMEOUT: ${CODEX_UPDATE_ON_START_TIMEOUT:-180}
     volumes:
       - ${CODEX_CONFIG_DIR:-./data/codex-terminal}:/config:rw
       # Optional diagnostic mounts. Keep them read-only and narrow.
@@ -67,6 +71,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETGID
+      - SETUID
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
       - /run:rw,nosuid,size=32m

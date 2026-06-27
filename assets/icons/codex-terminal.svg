@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Terminal</title>
+  <desc id="desc">A simplified blue Codex terminal mark with a prompt.</desc>
+  <defs>
+    <linearGradient id="cloudFill" x1="148" y1="112" x2="372" y2="394" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#b9c1ff"/>
+      <stop offset="0.44" stop-color="#5d83ff"/>
+      <stop offset="1" stop-color="#2f22f4"/>
+    </linearGradient>
+    <linearGradient id="cloudEdge" x1="146" y1="130" x2="388" y2="362" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#eef3ff"/>
+      <stop offset="0.5" stop-color="#8db2ff"/>
+      <stop offset="1" stop-color="#4238ff"/>
+    </linearGradient>
+    <filter id="markShadow" x="-14%" y="-16%" width="128%" height="136%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="15" flood-color="#050816" flood-opacity="0.36"/>
+    </filter>
+    <filter id="promptShadow" x="-14%" y="-18%" width="128%" height="136%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#1a1f63" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#markShadow)">
+    <path
+      d="M158 356c-39 0-72-31-72-71 0-34 24-63 56-70 13-53 59-91 115-91 38 0 73 18 95 48 13-4 28-5 43-2 44 9 75 48 75 93 0 31-15 58-38 75 2 36-27 67-64 67-22 0-42-11-54-28-23 25-59 35-92 24-22-8-40-24-50-45h-14Z"
+      fill="url(#cloudFill)"
+      stroke="url(#cloudEdge)"
+      stroke-width="8"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M158 356c-39 0-72-31-72-71 0-34 24-63 56-70 13-53 59-91 115-91 38 0 73 18 95 48 13-4 28-5 43-2 44 9 75 48 75 93 0 31-15 58-38 75"
+      fill="none"
+      stroke="#f8fbff"
+      stroke-width="4"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      opacity="0.45"
+    />
+  </g>
+
+  <g filter="url(#promptShadow)" fill="none" stroke="#f8fbff" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M185 211l52 78-52 78" stroke-width="37"/>
+    <path d="M300 320h72" stroke-width="35"/>
+  </g>
+</svg>

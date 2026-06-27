@@ -13,4 +13,11 @@ required_env UNRAID_API_URL
 required_env UNRAID_API_KEY
 required_env UNRAID_MCP_BEARER_TOKEN
 
-exec unraid-mcp-server "$@"
+mkdir -p /home/mcp/.unraid-mcp /app/logs /app/backups
+chown -R mcp:mcp /home/mcp/.unraid-mcp /app/logs /app/backups
+chmod 0700 /home/mcp/.unraid-mcp
+
+exec runuser -u mcp -- env \
+  HOME=/home/mcp \
+  PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
+  unraid-mcp-server "$@"

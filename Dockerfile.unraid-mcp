@@ -14,7 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd --gid 1000 mcp \
     && useradd --uid 1000 --gid mcp --create-home --home-dir /home/mcp --shell /usr/sbin/nologin mcp \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libgnutls30 wget \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends ca-certificates libgnutls30 util-linux wget \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir "unraid-mcp==${UNRAID_MCP_VERSION}" \
     && mkdir -p /app/logs /app/backups /home/mcp/.unraid-mcp \
@@ -25,12 +26,13 @@ COPY unraid-mcp-entrypoint.sh /usr/local/bin/unraid-mcp-entrypoint
 
 RUN chmod 0755 /usr/local/bin/unraid-mcp-entrypoint
 
-USER mcp
 WORKDIR /app
 
 EXPOSE 6970
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD wget --quiet --tries=1 --spider "http://127.0.0.1:${UNRAID_MCP_PORT:-6970}/health" || exit 1
+    CMD test -n "${UNRAID_MCP_BEARER_TOKEN}" \
+    && wget --quiet --tries=1 --output-document=/dev/null --header="Authorization: Bearer ${UNRAID_MCP_BEARER_TOKEN}" "http://127.0.0.1:${UNRAID_MCP_PORT:-6970}/health" \
+    || exit 1
 
 ENTRYPOINT ["/usr/local/bin/unraid-mcp-entrypoint"]

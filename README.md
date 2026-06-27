@@ -34,13 +34,15 @@ The design has two hard boundaries:
 
 4. Install `unraid-mcp` first. Set:
 
-   - `UNRAID_API_URL`, usually `https://tower.local/graphql`
+   - `UNRAID_API_URL`, usually `http://tower.local/graphql` or `https://tower.local/graphql`
    - `UNRAID_API_KEY`
    - `UNRAID_MCP_BEARER_TOKEN`
 
 5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
 Do not add a port mapping for `unraid-mcp`. The MCP server should only be reachable from containers attached to `codex-mgmt`.
+
+`UNRAID_API_URL` must include `/graphql` and must match the scheme your Unraid WebUI/API actually serves. If `https://<unraid-ip>` refuses port `443` but `http://<unraid-ip>` works on port `80`, use `http://<unraid-ip>/graphql`.
 
 ## WebUI
 
@@ -55,6 +57,24 @@ The WebUI is a `ttyd` browser terminal attached to a persistent `tmux` session n
 Because this is a shell, keep `WEBUI_AUTH=true`, use a strong `WEBUI_PASSWORD`, and expose the port only on LAN, VPN, or Tailscale. Home Assistant ingress provides an auth layer for the add-on version; this Unraid template uses `ttyd` basic auth instead.
 
 `WEBUI_LOG_LEVEL` defaults to `1` so `ttyd` does not print the basic-auth credential in container startup logs. Increase it only temporarily while troubleshooting.
+
+## Codex CLI Updates
+
+`codex-terminal` updates Codex CLI during container startup by default:
+
+```text
+npm install -g @openai/codex@latest
+```
+
+The update runs as root before SSH and WebUI sessions start, so the interactive `codex` user does not need write access to global npm packages. If npm is unavailable or the update times out, the container logs a warning and continues with the bundled Codex version.
+
+Advanced settings:
+
+- `CODEX_UPDATE_ON_START=true` updates Codex on every container start.
+- `CODEX_NPM_VERSION=latest` controls the npm version spec for `@openai/codex`.
+- `CODEX_UPDATE_ON_START_TIMEOUT=180` controls the maximum update time in seconds.
+
+Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and only want Codex to change when the container image is updated.
 
 ## Unraid API Key
 
@@ -90,6 +110,8 @@ ssh unraid-codex codex mcp list --json
 Codex Desktop Remote SSH should detect this host from your local SSH config. Open `/workspace` as the project path.
 
 SSH password auth is disabled by default. If a client cannot use SSH keys, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`; keep SSH exposed only on LAN, VPN, or Tailscale. `SSH_PASSWORD_HASH` is still supported for advanced deployments, but leave it empty when `SSH_PASSWORD` is set.
+
+SSH as `codex`, not `root`. Root login is intentionally disabled.
 
 ## Codex Auth And State
 
@@ -171,6 +193,8 @@ Unraid acceptance:
 - Keep the Unraid API key only in the MCP sidecar.
 - The MCP sidecar always requires bearer-token auth; do not add a host port mapping for MCP.
 - The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.
+- Codex CLI startup updates download from npm as root before user sessions start. Disable `CODEX_UPDATE_ON_START` if you prefer only image-published Codex versions.
+- The MCP sidecar keeps a read-only root filesystem. It starts as root only to fix ownership on its mounted appdata directories, then runs the server as the unprivileged `mcp` user.
 
 ## MCP Fallback
 
