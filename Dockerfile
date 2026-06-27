@@ -6,6 +6,8 @@ FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac4
 
 ARG CODEX_NPM_VERSION=latest
 ARG NPM_VERSION=11.16.0
+ARG NPM_UNDICI_VERSION=6.27.0
+ARG NPM_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
 ARG TTYD_VERSION=1.7.7
 ARG TARGETARCH
 
@@ -54,8 +56,18 @@ RUN set -euo pipefail; \
     echo "${ttyd_sha256}  /usr/local/bin/ttyd" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/ttyd
 
-RUN npm install -g "npm@${NPM_VERSION}" "@openai/codex@${CODEX_NPM_VERSION}" \
-    && npm cache clean --force
+RUN set -euo pipefail; \
+    npm install -g "npm@${NPM_VERSION}" "@openai/codex@${CODEX_NPM_VERSION}"; \
+    npm_root="$(npm root -g)"; \
+    npm pack "undici@${NPM_UNDICI_VERSION}" --pack-destination /tmp; \
+    echo "${NPM_UNDICI_SHA256}  /tmp/undici-${NPM_UNDICI_VERSION}.tgz" | sha256sum -c -; \
+    rm -rf "${npm_root}/npm/node_modules/undici"; \
+    mkdir -p "${npm_root}/npm/node_modules/undici"; \
+    tar -xzf "/tmp/undici-${NPM_UNDICI_VERSION}.tgz" -C "${npm_root}/npm/node_modules/undici" --strip-components=1; \
+    actual_undici_version="$(node -p "require('${npm_root}/npm/node_modules/undici/package.json').version")"; \
+    test "${actual_undici_version}" = "${NPM_UNDICI_VERSION}"; \
+    rm -f "/tmp/undici-${NPM_UNDICI_VERSION}.tgz"; \
+    npm cache clean --force
 
 RUN groupmod -n codex node \
     && usermod -l codex -d /home/codex -m node \
