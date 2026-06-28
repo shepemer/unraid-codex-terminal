@@ -52,6 +52,8 @@ For full configuration, validation, local development, and security notes, see [
 
 Do not publish a host port for `unraid-mcp`. Only SSH and the WebUI should be reachable from your LAN, VPN, or Tailscale.
 
+The templates use the stable `:latest` image channel. Change the repository tag to `:beta` if you want to follow preview builds.
+
 ## Connect
 
 Add an SSH host on your workstation:

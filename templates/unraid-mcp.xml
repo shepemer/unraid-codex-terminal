@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>unraid-mcp</Name>
-  <Repository>ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:1.2.4</Repository>
+  <Repository>ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest</Repository>
   <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-unraid-mcp</Registry>
   <Network>codex-mgmt</Network>
   <Shell>sh</Shell>
