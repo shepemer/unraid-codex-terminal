@@ -34,5 +34,3 @@ MaxSessions 10
 StrictModes yes
 
 Subsystem sftp internal-sftp
-
-__MCP_SET_ENV__
