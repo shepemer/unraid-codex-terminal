@@ -83,11 +83,17 @@ RUN groupmod -n codex node \
     && chown -h codex:codex /home/codex/.cache /home/codex/.codex /home/codex/.local /workspace
 
 COPY sshd_config /etc/codex-terminal/sshd_config
+COPY codex-terminal-shell /usr/local/bin/codex-terminal-shell
+COPY codex-terminal-profile.sh /etc/profile.d/codex-terminal.sh
 COPY entrypoint.sh /usr/local/bin/codex-terminal-entrypoint
 COPY web-terminal.sh /usr/local/bin/codex-web-terminal
 
 RUN chmod 0644 /etc/codex-terminal/sshd_config \
-    && chmod 0755 /usr/local/bin/codex-terminal-entrypoint /usr/local/bin/codex-web-terminal
+    && chmod 0755 /usr/local/bin/codex-terminal-shell \
+    && chmod 0644 /etc/profile.d/codex-terminal.sh \
+    && chmod 0755 /usr/local/bin/codex-terminal-entrypoint /usr/local/bin/codex-web-terminal \
+    && printf '%s\n' /usr/local/bin/codex-terminal-shell >> /etc/shells \
+    && usermod -s /usr/local/bin/codex-terminal-shell codex
 
 EXPOSE 2222 7681
 

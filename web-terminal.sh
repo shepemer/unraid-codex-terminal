@@ -15,6 +15,7 @@ WEBUI_LOG_LEVEL="${WEBUI_LOG_LEVEL:-1}"
 AUTO_LAUNCH_CODEX="${AUTO_LAUNCH_CODEX:-true}"
 CODEX_WEBUI_BYPASS_APPROVALS="${CODEX_WEBUI_BYPASS_APPROVALS:-true}"
 MCP_URL="${UNRAID_MCP_URL:-http://unraid-mcp:6970/mcp}"
+CODEX_ENV_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 die() {
   echo "codex-web-terminal: $*" >&2
@@ -38,7 +39,7 @@ run_as_codex() {
     XDG_DATA_HOME="${CONFIG_DIR}/local/share" \
     UNRAID_MCP_URL="${MCP_URL}" \
     UNRAID_MCP_BEARER_TOKEN="${UNRAID_MCP_BEARER_TOKEN:-}" \
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    PATH="${CODEX_ENV_PATH}" \
     "$@"
 }
 

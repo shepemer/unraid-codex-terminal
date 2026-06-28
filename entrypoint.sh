@@ -6,6 +6,7 @@ RUNTIME_DIR="/run/codex-terminal"
 SSHD_TEMPLATE="/etc/codex-terminal/sshd_config"
 SSHD_RUNTIME="${RUNTIME_DIR}/sshd_config"
 MCP_URL="${UNRAID_MCP_URL:-http://unraid-mcp:6970/mcp}"
+CODEX_ENV_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 die() {
   echo "codex-terminal: $*" >&2
@@ -41,8 +42,44 @@ update_codex_cli() {
   echo "codex-terminal: updating Codex CLI via npm install -g @openai/codex@${version}" >&2
   if timeout "${timeout_seconds}" npm install -g "@openai/codex@${version}"; then
     npm cache clean --force >/dev/null 2>&1 || true
+    verify_codex_cli
   else
     echo "codex-terminal: warning: Codex CLI update failed; continuing with bundled version" >&2
+  fi
+}
+
+run_as_codex() {
+  runuser -u codex -- env \
+    HOME=/home/codex \
+    CODEX_HOME="${CONFIG_DIR}/.codex" \
+    CODEX_WORKSPACE=/workspace \
+    XDG_CONFIG_HOME="${CONFIG_DIR}/.config" \
+    XDG_CACHE_HOME="${CONFIG_DIR}/cache" \
+    XDG_DATA_HOME="${CONFIG_DIR}/local/share" \
+    UNRAID_MCP_URL="${MCP_URL}" \
+    UNRAID_MCP_BEARER_TOKEN="${UNRAID_MCP_BEARER_TOKEN:-}" \
+    PATH="${CODEX_ENV_PATH}" \
+    "$@"
+}
+
+verify_codex_cli() {
+  local codex_version
+
+  if codex_version="$(run_as_codex codex --version 2>/dev/null)"; then
+    echo "codex-terminal: Codex CLI ready for SSH/WebUI sessions: ${codex_version}" >&2
+  else
+    echo "codex-terminal: warning: Codex CLI update completed, but verification as codex user failed" >&2
+  fi
+}
+
+validate_runtime_env() {
+  case "${MCP_URL}" in
+    *[[:space:]]*) die "UNRAID_MCP_URL must not contain whitespace" ;;
+  esac
+  if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
+    case "${UNRAID_MCP_BEARER_TOKEN}" in
+      *[[:space:]]*) die "UNRAID_MCP_BEARER_TOKEN must not contain whitespace" ;;
+    esac
   fi
 }
 
@@ -88,6 +125,7 @@ chown codex:codex "${CONFIG_DIR}/ssh/authorized_keys" "${CONFIG_DIR}/ssh"/ssh_ho
 chmod 0600 "${CONFIG_DIR}/ssh/authorized_keys" "${CONFIG_DIR}/ssh"/ssh_host_*_key
 chmod 0644 "${CONFIG_DIR}/ssh"/ssh_host_*_key.pub
 
+validate_runtime_env
 update_codex_cli
 
 password_authentication="no"
@@ -111,35 +149,28 @@ if truthy "${SSH_PASSWORD_LOGIN:-false}"; then
   password_authentication="yes"
 fi
 
-set_env_line=""
-if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
-  case "${UNRAID_MCP_BEARER_TOKEN}" in
-    *[[:space:]]*) die "UNRAID_MCP_BEARER_TOKEN must not contain whitespace" ;;
-  esac
-  set_env_line="SetEnv UNRAID_MCP_BEARER_TOKEN=${UNRAID_MCP_BEARER_TOKEN}"
-fi
-
 awk \
   -v password_authentication="${password_authentication}" \
-  -v set_env_line="${set_env_line}" \
   '{
     gsub("__PASSWORD_AUTHENTICATION__", password_authentication)
-    if ($0 == "__MCP_SET_ENV__") {
-      if (set_env_line != "") print set_env_line
-      next
-    }
     print
   }' "${SSHD_TEMPLATE}" > "${SSHD_RUNTIME}"
 chmod 0600 "${SSHD_RUNTIME}"
 
 cat > "${RUNTIME_DIR}/codex-env.sh" <<EOF
+export CODEX_HOME=$(shell_quote "${CONFIG_DIR}/.codex")
 export CODEX_WORKSPACE=/workspace
+export XDG_CONFIG_HOME=$(shell_quote "${CONFIG_DIR}/.config")
+export XDG_CACHE_HOME=$(shell_quote "${CONFIG_DIR}/cache")
+export XDG_DATA_HOME=$(shell_quote "${CONFIG_DIR}/local/share")
 export UNRAID_MCP_URL=$(shell_quote "${MCP_URL}")
+export PATH=$(shell_quote "${CODEX_ENV_PATH}")
 EOF
 if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
   printf 'export UNRAID_MCP_BEARER_TOKEN=%s\n' "$(shell_quote "${UNRAID_MCP_BEARER_TOKEN}")" >> "${RUNTIME_DIR}/codex-env.sh"
 fi
-chmod 0600 "${RUNTIME_DIR}/codex-env.sh"
+chown root:codex "${RUNTIME_DIR}/codex-env.sh"
+chmod 0640 "${RUNTIME_DIR}/codex-env.sh"
 
 if [ ! -s "${CONFIG_DIR}/.codex/config.toml" ]; then
   cat > "${CONFIG_DIR}/.codex/config.toml" <<EOF
