@@ -10,6 +10,19 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to publish, such as main, a commit SHA, or v0.2.0"
+        required: true
+        default: main
+        type: string
+      channel:
+        description: "Mutable release channel to update"
+        required: true
+        type: choice
+        options:
+          - beta
+          - latest
 
 permissions:
   contents: read
@@ -26,9 +39,48 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Compute image tags
+        id: image-tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_sha="$(git rev-parse HEAD)"
+          terminal_base="${REGISTRY}/${{ github.repository_owner }}/${TERMINAL_IMAGE}"
+          mcp_base="${REGISTRY}/${{ github.repository_owner }}/${MCP_IMAGE}"
+          terminal_tags=("${terminal_base}:${image_sha}")
+          mcp_tags=("${mcp_base}:${image_sha}")
+
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "branch" ] && [ "${{ github.ref_name }}" = "main" ]; then
+            terminal_tags+=("${terminal_base}:main")
+            mcp_tags+=("${mcp_base}:main")
+          fi
+
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            terminal_tags+=("${terminal_base}:${GITHUB_REF_NAME}")
+            mcp_tags+=("${mcp_base}:${GITHUB_REF_NAME}")
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            terminal_tags+=("${terminal_base}:${{ inputs.channel }}")
+            mcp_tags+=("${mcp_base}:${{ inputs.channel }}")
+          fi
+
+          {
+            echo "image_sha=${image_sha}"
+            echo "terminal_tags<<EOF"
+            printf '%s\n' "${terminal_tags[@]}"
+            echo "EOF"
+            echo "mcp_tags<<EOF"
+            printf '%s\n' "${mcp_tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build codex-terminal
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -37,14 +89,12 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           load: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:latest
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}
+          tags: ${{ steps.image-tags.outputs.terminal_tags }}
 
       - name: Scan codex-terminal
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
           vuln-type: os,library
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -61,15 +111,12 @@ jobs:
           load: true
           build-args: |
             UNRAID_MCP_VERSION=1.2.4
-          tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:latest
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:1.2.4
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}
+          tags: ${{ steps.image-tags.outputs.mcp_tags }}
 
       - name: Scan unraid-mcp
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
           vuln-type: os,library
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -88,12 +135,19 @@ jobs:
       - name: Push codex-terminal
         if: github.event_name != 'pull_request'
         run: |
-          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:latest"
-          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ github.sha }}"
+          while IFS= read -r image_tag; do
+            [ -n "${image_tag}" ] || continue
+            docker push "${image_tag}"
+          done <<'EOF'
+          ${{ steps.image-tags.outputs.terminal_tags }}
+          EOF
 
       - name: Push unraid-mcp
         if: github.event_name != 'pull_request'
         run: |
-          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:latest"
-          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:1.2.4"
-          docker push "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ github.sha }}"
+          while IFS= read -r image_tag; do
+            [ -n "${image_tag}" ] || continue
+            docker push "${image_tag}"
+          done <<'EOF'
+          ${{ steps.image-tags.outputs.mcp_tags }}
+          EOF

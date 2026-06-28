@@ -49,7 +49,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 3. Confirm the templates reference the published images:
 
    - `ghcr.io/shepemer/unraid-codex-terminal:latest`
-   - `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:1.2.4`
+   - `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest`
 
 4. Install `unraid-mcp` first. Set:
 
@@ -149,6 +149,40 @@ docker compose up -d
 For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key. To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`. For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
 
 The MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set.
+
+## Release Channels
+
+The Docker workflow separates validation from release promotion:
+
+- Pull requests build and scan both images, but do not push tags.
+- Merges to `main` build, scan, and push `:main` plus an immutable full commit SHA tag.
+- Pushing a Git tag named `v*`, such as `v0.2.0`, builds, scans, and pushes that version tag plus the full commit SHA tag.
+- Manual workflow runs promote a chosen Git ref to either `:beta` or `:latest`.
+
+Use these image channels:
+
+- `:beta` for preview installs you control.
+- `:latest` for the stable public install path.
+- `:main` for the newest merged code after CI passes.
+- `:<sha>` for an exact immutable build.
+- `:v*` for named release tags.
+
+To promote a ref in GitHub:
+
+1. Open Actions > Docker > Run workflow.
+2. Enter the ref to publish, such as `main`, a full commit SHA, or `v0.2.0`.
+3. Choose `beta` or `latest`.
+4. Run the workflow and wait for the build, scan, and push steps to pass.
+
+Example release flow:
+
+```text
+Merge PR to main
+Run Docker workflow with ref=main, channel=beta
+Test :beta on your Unraid install
+Run Docker workflow with the same commit SHA, channel=latest
+Optionally create and push v0.2.0 for an immutable named release
+```
 
 ## Validation
 
