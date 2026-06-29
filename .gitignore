@@ -1,0 +1,8 @@
+node_modules/
+media-mcp/node_modules/
+utilities-mcp/node_modules/
+data/
+tmp/
+*.log
+.DS_Store
+SECRETS_TEMP_DO_NOT_COMMIT.md

@@ -8,7 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
   <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
-  <Overview>SSH and browser-accessible Codex CLI environment for Codex Desktop Remote SSH and direct WebUI access. Unraid management is routed through the internal Unraid MCP sidecar.</Overview>
+  <Overview>SSH and browser-accessible Codex CLI environment for Codex Desktop Remote SSH and direct WebUI access. Unraid management is routed through the internal Unraid MCP sidecar, with optional media and utility MCP sidecars.</Overview>
   <Category>Tools:</Category>
   <WebUI>http://[IP]:[PORT:7681]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/codex-terminal.xml</TemplateURL>
@@ -37,4 +37,8 @@
   <Config Name="Codex NPM Version" Target="CODEX_NPM_VERSION" Default="latest" Mode="" Description="npm version spec for @openai/codex used by startup updates. Use latest for automatic updates on restart." Type="Variable" Display="advanced" Required="false" Mask="false">latest</Config>
   <Config Name="Codex Update Timeout" Target="CODEX_UPDATE_ON_START_TIMEOUT" Default="180" Mode="" Description="Maximum seconds to wait for the startup Codex npm update before continuing with the bundled version." Type="Variable" Display="advanced" Required="false" Mask="false">180</Config>
   <Config Name="Unraid MCP Bearer Token" Target="UNRAID_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token used by Codex to authenticate to the internal Unraid MCP sidecar. Must match the sidecar." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Media MCP URL" Target="MEDIA_MCP_URL" Default="http://media-mcp:6971/mcp" Mode="" Description="Internal optional media MCP endpoint. Leave at the default when media-mcp is on codex-mgmt." Type="Variable" Display="advanced" Required="false" Mask="false">http://media-mcp:6971/mcp</Config>
+  <Config Name="Media MCP Bearer Token" Target="MEDIA_MCP_BEARER_TOKEN" Default="" Mode="" Description="Optional bearer token used by Codex to authenticate to media-mcp. Leave blank to skip adding the media MCP server to Codex config." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Utilities MCP URL" Target="UTILITIES_MCP_URL" Default="http://utilities-mcp:6972/mcp" Mode="" Description="Internal optional utilities MCP endpoint. Leave at the default when utilities-mcp is on codex-mgmt." Type="Variable" Display="advanced" Required="false" Mask="false">http://utilities-mcp:6972/mcp</Config>
+  <Config Name="Utilities MCP Bearer Token" Target="UTILITIES_MCP_BEARER_TOKEN" Default="" Mode="" Description="Optional bearer token used by Codex to authenticate to utilities-mcp. Leave blank to skip adding the utilities MCP server to Codex config." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 </Container>

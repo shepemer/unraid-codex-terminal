@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732
+
+ARG NPM_VERSION=11.16.0
+ARG NPM_UNDICI_VERSION=6.27.0
+ARG NPM_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
+
+ENV NODE_ENV=production \
+    MEDIA_MCP_HOST=0.0.0.0 \
+    MEDIA_MCP_PORT=6971 \
+    MEDIA_MCP_REQUEST_TIMEOUT_MS=30000
+
+WORKDIR /app
+
+RUN groupmod -n mcp node \
+    && usermod -l mcp -d /home/mcp -m node \
+    && usermod -s /usr/sbin/nologin mcp \
+    && apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends ca-certificates libgnutls30 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY media-mcp/package.json media-mcp/package-lock.json ./
+
+RUN set -e; \
+    npm install -g "npm@${NPM_VERSION}"; \
+    npm_root="$(npm root -g)"; \
+    npm pack "undici@${NPM_UNDICI_VERSION}" --pack-destination /tmp; \
+    echo "${NPM_UNDICI_SHA256}  /tmp/undici-${NPM_UNDICI_VERSION}.tgz" | sha256sum -c -; \
+    rm -rf "${npm_root}/npm/node_modules/undici"; \
+    mkdir -p "${npm_root}/npm/node_modules/undici"; \
+    tar -xzf "/tmp/undici-${NPM_UNDICI_VERSION}.tgz" -C "${npm_root}/npm/node_modules/undici" --strip-components=1; \
+    actual_undici_version="$(node -p "require('${npm_root}/npm/node_modules/undici/package.json').version")"; \
+    test "${actual_undici_version}" = "${NPM_UNDICI_VERSION}"; \
+    rm -f "/tmp/undici-${NPM_UNDICI_VERSION}.tgz"; \
+    npm ci --omit=dev \
+    && npm cache clean --force
+
+COPY media-mcp/server.js ./server.js
+
+RUN chown -R mcp:mcp /app /home/mcp
+
+USER mcp
+
+EXPOSE 6971
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD node -e "const port=process.env.MEDIA_MCP_PORT||'6971'; const token=process.env.MEDIA_MCP_BEARER_TOKEN||''; fetch('http://127.0.0.1:'+port+'/health',{headers:{Authorization:'Bearer '+token}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+
+CMD ["node", "server.js"]

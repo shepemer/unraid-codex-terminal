@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>media-mcp</Name>
+  <Repository>ghcr.io/shepemer/unraid-codex-terminal-media-mcp:latest</Repository>
+  <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-media-mcp</Registry>
+  <Network>codex-mgmt</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
+  <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
+  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/media-mcp.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/unraid-mcp.png</Icon>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --security-opt=no-new-privileges:true --cap-drop=ALL</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>Create the Docker network first: docker network create codex-mgmt. Do not add a host port mapping for 6971 unless you intentionally expose MCP.</Requires>
+  <Config Name="Media MCP Bearer Token" Target="MEDIA_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token clients must use to call this MCP server. Must match codex-terminal if media MCP is enabled there." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="MCP Host" Target="MEDIA_MCP_HOST" Default="0.0.0.0" Mode="" Description="Bind inside the container/network only. Do not publish the port to the host." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0</Config>
+  <Config Name="MCP Port" Target="MEDIA_MCP_PORT" Default="6971" Mode="" Description="Internal MCP port on codex-mgmt." Type="Variable" Display="advanced" Required="true" Mask="false">6971</Config>
+  <Config Name="Request Timeout Ms" Target="MEDIA_MCP_REQUEST_TIMEOUT_MS" Default="30000" Mode="" Description="Maximum time for one upstream media API call." Type="Variable" Display="advanced" Required="false" Mask="false">30000</Config>
+  <Config Name="Sonarr URL" Target="SONARR_URL" Default="" Mode="" Description="Sonarr base URL. Leave blank to disable Sonarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Default="" Mode="" Description="Sonarr Settings &gt; General API key. Required when Sonarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Radarr URL" Target="RADARR_URL" Default="" Mode="" Description="Radarr base URL. Leave blank to disable Radarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Radarr API Key" Target="RADARR_API_KEY" Default="" Mode="" Description="Radarr Settings &gt; General API key. Required when Radarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Plex URL" Target="PLEX_URL" Default="" Mode="" Description="Plex base URL. Leave blank to disable Plex tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Plex Token" Target="PLEX_TOKEN" Default="" Mode="" Description="Plex token. Required when Plex URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Bazarr URL" Target="BAZARR_URL" Default="" Mode="" Description="Bazarr base URL. Leave blank to disable Bazarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Bazarr API Key" Target="BAZARR_API_KEY" Default="" Mode="" Description="Bazarr API key. Required when Bazarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Prowlarr URL" Target="PROWLARR_URL" Default="" Mode="" Description="Prowlarr base URL. Leave blank to disable Prowlarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Prowlarr API Key" Target="PROWLARR_API_KEY" Default="" Mode="" Description="Prowlarr Settings &gt; General API key. Required when Prowlarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="qBittorrent URL" Target="QBITTORRENT_URL" Default="" Mode="" Description="qBittorrent WebUI base URL. Leave blank to disable qBittorrent tools." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="qBittorrent Username" Target="QBITTORRENT_USERNAME" Default="" Mode="" Description="qBittorrent WebUI username. Required when qBittorrent URL is set." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="qBittorrent Password" Target="QBITTORRENT_PASSWORD" Default="" Mode="" Description="qBittorrent WebUI password. Required when qBittorrent URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="NZBGet URL" Target="NZBGET_URL" Default="" Mode="" Description="NZBGet base URL. Leave blank to disable NZBGet tools." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="NZBGet Username" Target="NZBGET_USERNAME" Default="" Mode="" Description="NZBGet username. Required when NZBGet URL is set." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="NZBGet Password" Target="NZBGET_PASSWORD" Default="" Mode="" Description="NZBGet password. Required when NZBGet URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Seerr URL" Target="SEERR_URL" Default="" Mode="" Description="Seerr, Overseerr, or Jellyseerr base URL. Leave blank to disable Seerr-family request tools." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Seerr API Key" Target="SEERR_API_KEY" Default="" Mode="" Description="Seerr, Overseerr, or Jellyseerr API key. Required when Seerr URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+</Container>

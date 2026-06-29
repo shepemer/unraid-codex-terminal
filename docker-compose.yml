@@ -33,6 +33,10 @@ services:
       SSH_PASSWORD: ${SSH_PASSWORD:-}
       SSH_PASSWORD_HASH: ${SSH_PASSWORD_HASH:-}
       UNRAID_MCP_BEARER_TOKEN: ${UNRAID_MCP_BEARER_TOKEN:-}
+      MEDIA_MCP_URL: ${MEDIA_MCP_URL:-http://media-mcp:6971/mcp}
+      MEDIA_MCP_BEARER_TOKEN: ${MEDIA_MCP_BEARER_TOKEN:-}
+      UTILITIES_MCP_URL: ${UTILITIES_MCP_URL:-http://utilities-mcp:6972/mcp}
+      UTILITIES_MCP_BEARER_TOKEN: ${UTILITIES_MCP_BEARER_TOKEN:-}
       WEBUI_ENABLED: ${WEBUI_ENABLED:-true}
       WEBUI_AUTH: ${WEBUI_AUTH:-true}
       WEBUI_USERNAME: ${WEBUI_USERNAME:-codex}
@@ -90,6 +94,74 @@ services:
       - ${UNRAID_MCP_STATE_DIR:-./data/unraid-mcp/state}:/home/mcp/.unraid-mcp:rw
       - ${UNRAID_MCP_LOG_DIR:-./data/unraid-mcp/logs}:/app/logs:rw
       - ${UNRAID_MCP_BACKUP_DIR:-./data/unraid-mcp/backups}:/app/backups:rw
+    networks:
+      - codex-mgmt
+
+  media-mcp:
+    profiles:
+      - media
+    build:
+      context: .
+      dockerfile: Dockerfile.media-mcp
+    image: ${MEDIA_MCP_IMAGE:-ghcr.io/shepemer/unraid-codex-terminal-media-mcp:dev}
+    container_name: media-mcp
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      MEDIA_MCP_BEARER_TOKEN: ${MEDIA_MCP_BEARER_TOKEN:-}
+      MEDIA_MCP_HOST: ${MEDIA_MCP_HOST:-0.0.0.0}
+      MEDIA_MCP_PORT: ${MEDIA_MCP_PORT:-6971}
+      MEDIA_MCP_REQUEST_TIMEOUT_MS: ${MEDIA_MCP_REQUEST_TIMEOUT_MS:-30000}
+      SONARR_URL: ${SONARR_URL:-}
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+      RADARR_URL: ${RADARR_URL:-}
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
+      PROWLARR_URL: ${PROWLARR_URL:-}
+      PROWLARR_API_KEY: ${PROWLARR_API_KEY:-}
+      QBITTORRENT_URL: ${QBITTORRENT_URL:-}
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:-}
+      NZBGET_URL: ${NZBGET_URL:-}
+      NZBGET_USERNAME: ${NZBGET_USERNAME:-}
+      NZBGET_PASSWORD: ${NZBGET_PASSWORD:-}
+      SEERR_URL: ${SEERR_URL:-}
+      SEERR_API_KEY: ${SEERR_API_KEY:-}
+      PLEX_URL: ${PLEX_URL:-}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
+      BAZARR_URL: ${BAZARR_URL:-}
+      BAZARR_API_KEY: ${BAZARR_API_KEY:-}
+    networks:
+      - codex-mgmt
+
+  utilities-mcp:
+    profiles:
+      - utilities
+    build:
+      context: .
+      dockerfile: Dockerfile.utilities-mcp
+    image: ${UTILITIES_MCP_IMAGE:-ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:dev}
+    container_name: utilities-mcp
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      UTILITIES_MCP_BEARER_TOKEN: ${UTILITIES_MCP_BEARER_TOKEN:-}
+      UTILITIES_MCP_HOST: ${UTILITIES_MCP_HOST:-0.0.0.0}
+      UTILITIES_MCP_PORT: ${UTILITIES_MCP_PORT:-6972}
+      UTILITIES_MCP_REQUEST_TIMEOUT_MS: ${UTILITIES_MCP_REQUEST_TIMEOUT_MS:-30000}
+      SCRUTINY_URL: ${SCRUTINY_URL:-}
+      SCRUTINY_BASE_PATH: ${SCRUTINY_BASE_PATH:-}
     networks:
       - codex-mgmt
 
