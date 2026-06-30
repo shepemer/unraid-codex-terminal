@@ -18,7 +18,9 @@ For full configuration, validation, local development, and security notes, see [
 
 - `codex-terminal`: SSH on container port `2222`, WebUI on `7681`, Codex CLI, persistent `/config`, and `/workspace`.
 - `unraid-mcp`: internal HTTP MCP sidecar for Unraid API access.
-- `codex-mgmt`: private Docker bridge network shared by both containers.
+- `media-mcp`: optional internal HTTP MCP sidecar for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `utilities-mcp`: optional internal HTTP MCP sidecar for Scrutiny storage health monitoring.
+- `codex-mgmt`: private Docker bridge network shared by the containers.
 
 ## Install On Unraid
 
@@ -28,7 +30,7 @@ For full configuration, validation, local development, and security notes, see [
    docker network create codex-mgmt
    ```
 
-2. Copy both XML templates from `templates/` into:
+2. Copy the XML templates from `templates/` into:
 
    ```text
    /boot/config/plugins/dockerMan/templates-user/
@@ -50,7 +52,25 @@ For full configuration, validation, local development, and security notes, see [
    - at least one public key in `SSH_AUTHORIZED_KEYS`
    - strong `WEBUI_PASSWORD`
 
-Do not publish a host port for `unraid-mcp`. Only SSH and the WebUI should be reachable from your LAN, VPN, or Tailscale.
+5. Optional: install `media-mcp` on the same network.
+
+   Required settings:
+
+   - `MEDIA_MCP_BEARER_TOKEN`
+   - at least one complete media app credential pair, such as `SONARR_URL` and `SONARR_API_KEY`
+
+   Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `media` MCP server to Codex config.
+
+6. Optional: install `utilities-mcp` on the same network.
+
+   Required settings:
+
+   - `UTILITIES_MCP_BEARER_TOKEN`
+   - `SCRUTINY_URL`
+
+   Set the same `UTILITIES_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `utilities` MCP server to Codex config.
+
+Do not publish host ports for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. Only SSH and the WebUI should be reachable from your LAN, VPN, or Tailscale.
 
 The templates use the stable `:latest` image channel. Change the repository tag to `:beta` if you want to follow preview builds.
 
@@ -92,3 +112,5 @@ The WebUI attaches to a persistent `tmux` session and starts Codex automatically
 - Keep `WEBUI_AUTH=true` and use a strong `WEBUI_PASSWORD`.
 - Never mount `/var/run/docker.sock`, `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Use a scoped Unraid API key, not an unrestricted admin key.
+- Keep media app API keys only on `media-mcp`, and enable only the services you want Codex to manage.
+- Keep Scrutiny endpoints only on `utilities-mcp`, and do not expose MCP sidecar ports to the host.

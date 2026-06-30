@@ -15,6 +15,8 @@ WEBUI_LOG_LEVEL="${WEBUI_LOG_LEVEL:-1}"
 AUTO_LAUNCH_CODEX="${AUTO_LAUNCH_CODEX:-true}"
 CODEX_WEBUI_BYPASS_APPROVALS="${CODEX_WEBUI_BYPASS_APPROVALS:-true}"
 MCP_URL="${UNRAID_MCP_URL:-http://unraid-mcp:6970/mcp}"
+MEDIA_MCP_URL="${MEDIA_MCP_URL:-http://media-mcp:6971/mcp}"
+UTILITIES_MCP_URL="${UTILITIES_MCP_URL:-http://utilities-mcp:6972/mcp}"
 CODEX_ENV_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 die() {
@@ -39,6 +41,10 @@ run_as_codex() {
     XDG_DATA_HOME="${CONFIG_DIR}/local/share" \
     UNRAID_MCP_URL="${MCP_URL}" \
     UNRAID_MCP_BEARER_TOKEN="${UNRAID_MCP_BEARER_TOKEN:-}" \
+    MEDIA_MCP_URL="${MEDIA_MCP_URL}" \
+    MEDIA_MCP_BEARER_TOKEN="${MEDIA_MCP_BEARER_TOKEN:-}" \
+    UTILITIES_MCP_URL="${UTILITIES_MCP_URL}" \
+    UTILITIES_MCP_BEARER_TOKEN="${UTILITIES_MCP_BEARER_TOKEN:-}" \
     PATH="${CODEX_ENV_PATH}" \
     "$@"
 }

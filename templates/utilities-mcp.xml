@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>utilities-mcp</Name>
+  <Repository>ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest</Repository>
+  <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-utilities-mcp</Registry>
+  <Network>codex-mgmt</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
+  <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
+  <Overview>Optional internal MCP sidecar for read-only Scrutiny storage health monitoring. This container should not publish its MCP port to the LAN.</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/utilities-mcp.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/unraid-mcp.png</Icon>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --security-opt=no-new-privileges:true --cap-drop=ALL</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>Create the Docker network first: docker network create codex-mgmt. Do not add a host port mapping for 6972 unless you intentionally expose MCP.</Requires>
+  <Config Name="Utilities MCP Bearer Token" Target="UTILITIES_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token clients must use to call this MCP server. Must match codex-terminal if utilities MCP is enabled there." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="MCP Host" Target="UTILITIES_MCP_HOST" Default="0.0.0.0" Mode="" Description="Bind inside the container/network only. Do not publish the port to the host." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0</Config>
+  <Config Name="MCP Port" Target="UTILITIES_MCP_PORT" Default="6972" Mode="" Description="Internal MCP port on codex-mgmt." Type="Variable" Display="advanced" Required="true" Mask="false">6972</Config>
+  <Config Name="Request Timeout Ms" Target="UTILITIES_MCP_REQUEST_TIMEOUT_MS" Default="30000" Mode="" Description="Maximum time for one upstream utility API call." Type="Variable" Display="advanced" Required="false" Mask="false">30000</Config>
+  <Config Name="Scrutiny URL" Target="SCRUTINY_URL" Default="" Mode="" Description="Scrutiny base URL, such as http://scrutiny:8080. Leave blank to disable Scrutiny tools." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Scrutiny Base Path" Target="SCRUTINY_BASE_PATH" Default="" Mode="" Description="Optional reverse-proxy base path before /api, such as scrutiny. Leave blank for normal Scrutiny installs." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

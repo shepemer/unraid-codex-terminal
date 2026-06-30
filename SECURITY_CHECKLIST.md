@@ -9,9 +9,15 @@ Use this before deploying or publishing the templates.
 - [ ] `WEBUI_AUTH=true` and `WEBUI_PASSWORD` is strong, unless another authenticated proxy is in front of the WebUI.
 - [ ] `WEBUI_LOG_LEVEL=1` unless temporarily troubleshooting, because higher `ttyd` startup logs can include the basic-auth credential.
 - [ ] `unraid-mcp` has no host port mapping.
-- [ ] Both containers are on `codex-mgmt`.
+- [ ] Optional `media-mcp` has no host port mapping.
+- [ ] Optional `utilities-mcp` has no host port mapping.
+- [ ] All deployed containers are on `codex-mgmt`.
 - [ ] `UNRAID_API_KEY` is configured only on `unraid-mcp`.
-- [ ] `UNRAID_MCP_BEARER_TOKEN` is long, random, and matches both containers.
+- [ ] `UNRAID_MCP_BEARER_TOKEN` is long, random, and matches `unraid-mcp` and `codex-terminal`.
+- [ ] Media app API keys and passwords are configured only on `media-mcp`.
+- [ ] `MEDIA_MCP_BEARER_TOKEN` is long, random, and matches `media-mcp` and `codex-terminal` when media MCP is enabled.
+- [ ] Scrutiny endpoints are configured only on `utilities-mcp`.
+- [ ] `UTILITIES_MCP_BEARER_TOKEN` is long, random, and matches `utilities-mcp` and `codex-terminal` when utilities MCP is enabled.
 - [ ] Root SSH login is disabled.
 - [ ] Password SSH login is disabled unless there is a specific need.
 - [ ] If password SSH login is enabled, `SSH_PASSWORD` is strong and unique.
@@ -20,7 +26,7 @@ Use this before deploying or publishing the templates.
 - [ ] No container mounts `/var/run/docker.sock`.
 - [ ] No container mounts `/`, `/boot`, broad `/mnt`, or all appdata.
 - [ ] Any diagnostic mount is narrow and read-only.
-- [ ] The MCP sidecar requires bearer-token auth.
+- [ ] MCP sidecars require bearer-token auth.
 
 ## API Key Scope
 
@@ -31,18 +37,39 @@ Use this before deploying or publishing the templates.
 - [ ] VM mutations are enabled only if Codex should manage VMs.
 - [ ] Array mutations, flash, API key, config, network, OS, permission, and plugin mutations remain disabled unless intentionally enabled.
 
+## Media App Scope
+
+- [ ] Only the media services Codex should manage are configured on `media-mcp`.
+- [ ] qBittorrent delete-with-files is treated as destructive and requires explicit confirmation.
+- [ ] Seerr request approval, decline, and delete actions require explicit confirmation.
+- [ ] Sonarr/Radarr add actions use known root folders and quality profiles.
+
+## Utility App Scope
+
+- [ ] Only the utility services Codex should inspect are configured on `utilities-mcp`.
+- [ ] Scrutiny tools are read-only health, summary, temperature, and detail calls.
+
 ## Validation
 
 - [ ] `bash -n entrypoint.sh` passes.
 - [ ] `bash -n web-terminal.sh` passes.
-- [ ] Both XML templates parse.
+- [ ] `npm --prefix media-mcp run check` passes.
+- [ ] `npm --prefix utilities-mcp run check` passes.
+- [ ] All XML templates parse.
 - [ ] `docker compose config` passes.
+- [ ] `docker compose --profile media config` passes.
+- [ ] `docker compose --profile utilities config` passes.
+- [ ] `docker compose --profile media --profile utilities config` passes.
 - [ ] CI vulnerability scans pass before images are pushed.
 - [ ] `sshd -t` passes inside the built `codex-terminal` image.
 - [ ] Codex CLI startup update succeeds when `CODEX_UPDATE_ON_START=true`, or logs a warning and continues with the bundled version.
 - [ ] `unraid-mcp` starts with root-owned appdata directories and rewrites them to UID/GID 1000.
+- [ ] `media-mcp` starts with a read-only root filesystem and no host mounts.
+- [ ] `utilities-mcp` starts with a read-only root filesystem and no host mounts.
 - [ ] `ssh unraid-codex codex --version` works.
 - [ ] `ssh unraid-codex codex mcp list --json` shows the `unraid` MCP server.
+- [ ] If media MCP is enabled, `ssh unraid-codex codex mcp list --json` shows the `media` MCP server.
+- [ ] If utilities MCP is enabled, `ssh unraid-codex codex mcp list --json` shows the `utilities` MCP server.
 - [ ] WebUI login works and attaches to the persistent `tmux` session.
 - [ ] WebUI without credentials fails when `WEBUI_AUTH=true`.
 - [ ] Root SSH login fails.

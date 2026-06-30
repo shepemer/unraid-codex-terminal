@@ -6,6 +6,8 @@ RUNTIME_DIR="/run/codex-terminal"
 SSHD_TEMPLATE="/etc/codex-terminal/sshd_config"
 SSHD_RUNTIME="${RUNTIME_DIR}/sshd_config"
 MCP_URL="${UNRAID_MCP_URL:-http://unraid-mcp:6970/mcp}"
+MEDIA_MCP_URL="${MEDIA_MCP_URL:-http://media-mcp:6971/mcp}"
+UTILITIES_MCP_URL="${UTILITIES_MCP_URL:-http://utilities-mcp:6972/mcp}"
 CODEX_ENV_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 die() {
@@ -23,6 +25,51 @@ truthy() {
 shell_quote() {
   local value="$1"
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
+
+remove_mcp_server_block() {
+  local server_name="$1"
+  local config_file="$2"
+  awk -v server_name="${server_name}" '
+    $0 == "[mcp_servers." server_name "]" {
+      skip = 1
+      next
+    }
+    skip && /^\[/ {
+      skip = 0
+    }
+    !skip
+  ' "${config_file}" > "${config_file}.tmp"
+  mv "${config_file}.tmp" "${config_file}"
+}
+
+ensure_mcp_server_block() {
+  local server_name="$1"
+  local server_url="$2"
+  local token_env_var="$3"
+  local config_file="$4"
+
+  remove_mcp_server_block "${server_name}" "${config_file}"
+  cat >> "${config_file}" <<EOF
+
+[mcp_servers.${server_name}]
+url = "${server_url}"
+bearer_token_env_var = "${token_env_var}"
+EOF
+}
+
+sync_optional_mcp_server_block() {
+  local server_name="$1"
+  local server_url="$2"
+  local token_env_var="$3"
+  local token_value="$4"
+  local config_file="$5"
+
+  if [ -n "${token_value}" ]; then
+    ensure_mcp_server_block "${server_name}" "${server_url}" "${token_env_var}" "${config_file}"
+  else
+    remove_mcp_server_block "${server_name}" "${config_file}"
+  fi
 }
 
 update_codex_cli() {
@@ -58,6 +105,10 @@ run_as_codex() {
     XDG_DATA_HOME="${CONFIG_DIR}/local/share" \
     UNRAID_MCP_URL="${MCP_URL}" \
     UNRAID_MCP_BEARER_TOKEN="${UNRAID_MCP_BEARER_TOKEN:-}" \
+    MEDIA_MCP_URL="${MEDIA_MCP_URL}" \
+    MEDIA_MCP_BEARER_TOKEN="${MEDIA_MCP_BEARER_TOKEN:-}" \
+    UTILITIES_MCP_URL="${UTILITIES_MCP_URL}" \
+    UTILITIES_MCP_BEARER_TOKEN="${UTILITIES_MCP_BEARER_TOKEN:-}" \
     PATH="${CODEX_ENV_PATH}" \
     "$@"
 }
@@ -76,9 +127,25 @@ validate_runtime_env() {
   case "${MCP_URL}" in
     *[[:space:]]*) die "UNRAID_MCP_URL must not contain whitespace" ;;
   esac
+  case "${MEDIA_MCP_URL}" in
+    *[[:space:]]*) die "MEDIA_MCP_URL must not contain whitespace" ;;
+  esac
+  case "${UTILITIES_MCP_URL}" in
+    *[[:space:]]*) die "UTILITIES_MCP_URL must not contain whitespace" ;;
+  esac
   if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
     case "${UNRAID_MCP_BEARER_TOKEN}" in
       *[[:space:]]*) die "UNRAID_MCP_BEARER_TOKEN must not contain whitespace" ;;
+    esac
+  fi
+  if [ -n "${MEDIA_MCP_BEARER_TOKEN:-}" ]; then
+    case "${MEDIA_MCP_BEARER_TOKEN}" in
+      *[[:space:]]*) die "MEDIA_MCP_BEARER_TOKEN must not contain whitespace" ;;
+    esac
+  fi
+  if [ -n "${UTILITIES_MCP_BEARER_TOKEN:-}" ]; then
+    case "${UTILITIES_MCP_BEARER_TOKEN}" in
+      *[[:space:]]*) die "UTILITIES_MCP_BEARER_TOKEN must not contain whitespace" ;;
     esac
   fi
 }
@@ -164,10 +231,18 @@ export XDG_CONFIG_HOME=$(shell_quote "${CONFIG_DIR}/.config")
 export XDG_CACHE_HOME=$(shell_quote "${CONFIG_DIR}/cache")
 export XDG_DATA_HOME=$(shell_quote "${CONFIG_DIR}/local/share")
 export UNRAID_MCP_URL=$(shell_quote "${MCP_URL}")
+export MEDIA_MCP_URL=$(shell_quote "${MEDIA_MCP_URL}")
+export UTILITIES_MCP_URL=$(shell_quote "${UTILITIES_MCP_URL}")
 export PATH=$(shell_quote "${CODEX_ENV_PATH}")
 EOF
 if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
   printf 'export UNRAID_MCP_BEARER_TOKEN=%s\n' "$(shell_quote "${UNRAID_MCP_BEARER_TOKEN}")" >> "${RUNTIME_DIR}/codex-env.sh"
+fi
+if [ -n "${MEDIA_MCP_BEARER_TOKEN:-}" ]; then
+  printf 'export MEDIA_MCP_BEARER_TOKEN=%s\n' "$(shell_quote "${MEDIA_MCP_BEARER_TOKEN}")" >> "${RUNTIME_DIR}/codex-env.sh"
+fi
+if [ -n "${UTILITIES_MCP_BEARER_TOKEN:-}" ]; then
+  printf 'export UTILITIES_MCP_BEARER_TOKEN=%s\n' "$(shell_quote "${UTILITIES_MCP_BEARER_TOKEN}")" >> "${RUNTIME_DIR}/codex-env.sh"
 fi
 chown root:codex "${RUNTIME_DIR}/codex-env.sh"
 chmod 0640 "${RUNTIME_DIR}/codex-env.sh"
@@ -178,9 +253,11 @@ if [ ! -s "${CONFIG_DIR}/.codex/config.toml" ]; then
 url = "${MCP_URL}"
 bearer_token_env_var = "UNRAID_MCP_BEARER_TOKEN"
 EOF
-  chown codex:codex "${CONFIG_DIR}/.codex/config.toml"
-  chmod 0600 "${CONFIG_DIR}/.codex/config.toml"
 fi
+sync_optional_mcp_server_block "media" "${MEDIA_MCP_URL}" "MEDIA_MCP_BEARER_TOKEN" "${MEDIA_MCP_BEARER_TOKEN:-}" "${CONFIG_DIR}/.codex/config.toml"
+sync_optional_mcp_server_block "utilities" "${UTILITIES_MCP_URL}" "UTILITIES_MCP_BEARER_TOKEN" "${UTILITIES_MCP_BEARER_TOKEN:-}" "${CONFIG_DIR}/.codex/config.toml"
+chown codex:codex "${CONFIG_DIR}/.codex/config.toml"
+chmod 0600 "${CONFIG_DIR}/.codex/config.toml"
 
 if [ ! -s "${CONFIG_DIR}/workspace/AGENTS.md" ]; then
   cat > "${CONFIG_DIR}/workspace/AGENTS.md" <<'EOF'
@@ -189,6 +266,8 @@ if [ ! -s "${CONFIG_DIR}/workspace/AGENTS.md" ]; then
 - Do not request or use SSH access to the Unraid host.
 - Do not request or use access to `/var/run/docker.sock`.
 - Use the configured Unraid MCP server for Unraid management.
+- Use the configured media MCP server for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation when present.
+- Use the configured utilities MCP server for Scrutiny monitoring when present.
 - Ask for explicit user confirmation before array start or stop, correcting parity checks, VM force stop or reset, container deletes, plugin changes, API key changes, flash backup, network settings changes, and destructive notification archive or delete actions.
 - Summarize logs. Do not print secrets, bearer tokens, API keys, cookies, passwords, or session values.
 - Treat `/mnt/unraid/*` diagnostic mounts as read-only inspection surfaces.

@@ -30,6 +30,8 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
+- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
 
 ## Unraid Install Details
@@ -50,6 +52,8 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
    - `ghcr.io/shepemer/unraid-codex-terminal:latest`
    - `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest`
+   - `ghcr.io/shepemer/unraid-codex-terminal-media-mcp:latest`
+   - `ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest`
 
 4. Install `unraid-mcp` first. Set:
 
@@ -59,7 +63,26 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
-Do not add a port mapping for `unraid-mcp`. The MCP server should only be reachable from containers attached to `codex-mgmt`.
+6. Optional: install `media-mcp` on `codex-mgmt`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
+
+   - Sonarr: `SONARR_URL` and `SONARR_API_KEY`
+   - Radarr: `RADARR_URL` and `RADARR_API_KEY`
+   - Plex: `PLEX_URL` and `PLEX_TOKEN`
+   - Bazarr: `BAZARR_URL` and `BAZARR_API_KEY`
+   - Prowlarr: `PROWLARR_URL` and `PROWLARR_API_KEY`
+   - qBittorrent: `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, and `QBITTORRENT_PASSWORD`
+   - NZBGet: `NZBGET_URL`, `NZBGET_USERNAME`, and `NZBGET_PASSWORD`
+   - Seerr, Overseerr, or Jellyseerr: `SEERR_URL` and `SEERR_API_KEY`
+
+   Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
+
+7. Optional: install `utilities-mcp` on `codex-mgmt`. Set `UTILITIES_MCP_BEARER_TOKEN` and the Scrutiny endpoint:
+
+   - Scrutiny: `SCRUTINY_URL`, plus optional `SCRUTINY_BASE_PATH` for reverse-proxy base paths
+
+   Set the same `UTILITIES_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
+
+Do not add a port mapping for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. MCP servers should only be reachable from containers attached to `codex-mgmt`.
 
 `UNRAID_API_URL` must include `/graphql` and must match the scheme your Unraid WebUI/API actually serves. If `https://<unraid-ip>` refuses port `443` but `http://<unraid-ip>` works on port `80`, use `http://<unraid-ip>/graphql`.
 
@@ -130,11 +153,50 @@ url = "http://unraid-mcp:6970/mcp"
 bearer_token_env_var = "UNRAID_MCP_BEARER_TOKEN"
 ```
 
+When `MEDIA_MCP_BEARER_TOKEN` is set on `codex-terminal`, startup also adds this block if it is not already present:
+
+```toml
+[mcp_servers.media]
+url = "http://media-mcp:6971/mcp"
+bearer_token_env_var = "MEDIA_MCP_BEARER_TOKEN"
+```
+
+When `UTILITIES_MCP_BEARER_TOKEN` is set on `codex-terminal`, startup also adds this block if it is not already present:
+
+```toml
+[mcp_servers.utilities]
+url = "http://utilities-mcp:6972/mcp"
+bearer_token_env_var = "UTILITIES_MCP_BEARER_TOKEN"
+```
+
 Sign in to Codex inside the SSH container if needed:
 
 ```sh
 ssh -t unraid-codex codex login
 ```
+
+## Optional Media MCP
+
+`media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
+
+- Shared: configured service status.
+- Sonarr: list, lookup, add series, queue, quality profiles, and root folders.
+- Radarr: list, lookup, add movies, queue, quality profiles, and root folders.
+- Plex: server status, libraries, library items, search, metadata, and active sessions.
+- Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, and subtitle history.
+- Prowlarr: list indexers and search.
+- qBittorrent: list torrents, pause or resume selected hashes, and delete selected hashes with explicit optional file deletion.
+- NZBGet: status, queue, history, pause or resume downloads, and set rate limits.
+- Seerr, Overseerr, or Jellyseerr: search media, list requests, request media, and approve, decline, or delete requests.
+
+Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories.
+
+## Optional Utilities MCP
+
+`utilities-mcp` exposes a separate `utilities` MCP server for operational services that do not belong in media automation:
+
+- Shared: configured service status.
+- Scrutiny: API health, device summary, temperature history, and device details.
 
 ## Local Development
 
@@ -148,13 +210,27 @@ docker compose up -d
 
 For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key. To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`. For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
 
-The MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set.
+The Unraid MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set. The media MCP sidecar refuses to start unless `MEDIA_MCP_BEARER_TOKEN` and at least one supported media service credential set are configured. The utilities MCP sidecar refuses to start unless `UTILITIES_MCP_BEARER_TOKEN` and at least one supported utility endpoint are configured.
+
+To include the optional media sidecar in local compose runs:
+
+```sh
+docker compose --profile media config
+docker compose --profile media build media-mcp
+```
+
+To include the optional utilities sidecar in local compose runs:
+
+```sh
+docker compose --profile utilities config
+docker compose --profile utilities build utilities-mcp
+```
 
 ## Release Channels
 
 The Docker workflow separates validation from release promotion:
 
-- Pull requests build and scan both images, but do not push tags.
+- Pull requests build and scan all images, but do not push tags.
 - Merges to `main` build, scan, and push `:main` plus an immutable full commit SHA tag.
 - Pushing a Git tag named `v*`, such as `v0.2.0`, builds, scans, and pushes that version tag plus the full commit SHA tag.
 - Manual workflow runs promote a chosen Git ref to either `:beta` or `:latest`.
@@ -193,11 +269,16 @@ bash -n entrypoint.sh
 bash -n web-terminal.sh
 bash -n codex-terminal-shell
 sh -n codex-terminal-profile.sh
-python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml")]'
+npm --prefix media-mcp run check
+npm --prefix utilities-mcp run check
+python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml", "templates/media-mcp.xml", "templates/utilities-mcp.xml")]'
 docker compose config
+docker compose --profile media config
+docker compose --profile utilities config
+docker compose --profile media --profile utilities config
 ```
 
-CI builds both images locally and scans them with Trivy for fixed high and critical OS/library vulnerabilities on pull requests. Pushes to `main`, tags, and manual runs publish to GHCR only after both scans pass.
+CI builds all images locally and scans them with Trivy for fixed high and critical OS/library vulnerabilities on pull requests. Pushes to `main`, tags, and manual runs publish to GHCR only after scans pass.
 
 Container checks:
 
@@ -215,6 +296,8 @@ Unraid acceptance:
 - Codex Desktop can connect to `unraid-codex` and open `/workspace`.
 - If Codex Desktop reports a version mismatch, restart `codex-terminal` and reconnect.
 - MCP can list Unraid system status and Docker containers.
+- Optional media MCP can list configured media service status.
+- Optional utilities MCP can list configured utility service status.
 - Destructive MCP actions require explicit confirmation.
 - Recreating containers preserves Codex config, SSH host keys, authorized keys, and workspace files.
 
@@ -228,10 +311,13 @@ Unraid acceptance:
 - Never mount `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Use only narrow read-only diagnostic mounts.
 - Keep the Unraid API key only in the MCP sidecar.
-- The MCP sidecar always requires bearer-token auth; do not add a host port mapping for MCP.
+- Keep Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
+- Keep Scrutiny endpoints only in the optional utilities MCP sidecar.
+- MCP sidecars require bearer-token auth; do not add host port mappings for MCP.
 - The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.
 - Codex CLI startup updates download from npm as root before user sessions start. Disable `CODEX_UPDATE_ON_START` if you prefer only image-published Codex versions.
 - The MCP sidecar keeps a read-only root filesystem. It starts as root only to fix ownership on its mounted appdata directories, then runs the server as the unprivileged `mcp` user.
+- The media MCP sidecar runs as the unprivileged `mcp` user with a read-only root filesystem and no host mounts.
 
 ## MCP Fallback
 
