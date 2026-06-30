@@ -8,6 +8,7 @@ const port = Number(env.UTILITIES_MCP_PORT || 6972);
 const host = env.UTILITIES_MCP_HOST || "0.0.0.0";
 const bearerToken = env.UTILITIES_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.UTILITIES_MCP_REQUEST_TIMEOUT_MS || 30000);
+const allowedHosts = allowedHostnames(env.UTILITIES_MCP_ALLOWED_HOSTS, "utilities-mcp", host);
 
 if (!bearerToken) {
   console.error("utilities-mcp: UTILITIES_MCP_BEARER_TOKEN is required");
@@ -52,6 +53,20 @@ function normalizeBaseUrl(value) {
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/+$/, "");
+}
+
+function allowedHostnames(value, serviceName, bindHost) {
+  const hosts = new Set(["localhost", "127.0.0.1", "[::1]", serviceName]);
+  if (bindHost && !["0.0.0.0", "::"].includes(bindHost)) {
+    hosts.add(bindHost);
+  }
+  for (const hostName of (value || "").split(",")) {
+    const trimmed = hostName.trim();
+    if (trimmed) {
+      hosts.add(trimmed);
+    }
+  }
+  return [...hosts];
 }
 
 function normalizePath(value) {
@@ -186,7 +201,7 @@ function authorize(req, res, next) {
   next();
 }
 
-const app = createMcpExpressApp();
+const app = createMcpExpressApp({ host, allowedHosts });
 app.use(authorize);
 
 app.get("/health", async (_req, res) => {

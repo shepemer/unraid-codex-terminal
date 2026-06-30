@@ -8,6 +8,7 @@ const port = Number(env.MEDIA_MCP_PORT || 6971);
 const host = env.MEDIA_MCP_HOST || "0.0.0.0";
 const bearerToken = env.MEDIA_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.MEDIA_MCP_REQUEST_TIMEOUT_MS || 30000);
+const allowedHosts = allowedHostnames(env.MEDIA_MCP_ALLOWED_HOSTS, "media-mcp", host);
 
 if (!bearerToken) {
   console.error("media-mcp: MEDIA_MCP_BEARER_TOKEN is required");
@@ -99,6 +100,20 @@ function normalizeBaseUrl(value) {
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/+$/, "");
+}
+
+function allowedHostnames(value, serviceName, bindHost) {
+  const hosts = new Set(["localhost", "127.0.0.1", "[::1]", serviceName]);
+  if (bindHost && !["0.0.0.0", "::"].includes(bindHost)) {
+    hosts.add(bindHost);
+  }
+  for (const hostName of (value || "").split(",")) {
+    const trimmed = hostName.trim();
+    if (trimmed) {
+      hosts.add(trimmed);
+    }
+  }
+  return [...hosts];
 }
 
 function requireService(name) {
@@ -770,7 +785,7 @@ function authorize(req, res, next) {
   next();
 }
 
-const app = createMcpExpressApp();
+const app = createMcpExpressApp({ host, allowedHosts });
 app.use(authorize);
 
 app.get("/health", async (_req, res) => {
