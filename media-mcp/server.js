@@ -339,6 +339,260 @@ async function nzbgetRpc(method, params = []) {
   return body.result;
 }
 
+function uniquePositiveIds(ids) {
+  return [...new Set(ids.map(id => Number(id)))];
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
+}
+
+function summarizeQueueRecord(record) {
+  return compactObject({
+    id: record.id,
+    title: record.title,
+    seriesId: record.seriesId ?? record.series?.id,
+    seriesTitle: record.series?.title,
+    movieId: record.movieId ?? record.movie?.id,
+    movieTitle: record.movie?.title,
+    episodeId: record.episodeId,
+    seasonNumber: record.seasonNumber,
+    status: record.status,
+    trackedDownloadStatus: record.trackedDownloadStatus,
+    trackedDownloadState: record.trackedDownloadState,
+    errorMessage: record.errorMessage,
+    downloadId: record.downloadId,
+    protocol: record.protocol,
+    downloadClient: record.downloadClient,
+    indexer: record.indexer,
+    outputPath: record.outputPath,
+    size: record.size,
+    sizeLeft: record.sizeLeft ?? record.sizeleft,
+    timeLeft: record.timeLeft ?? record.timeleft,
+    estimatedCompletionTime: record.estimatedCompletionTime,
+    statusMessages: Array.isArray(record.statusMessages)
+      ? record.statusMessages.map(message => compactObject({
+        title: message.title,
+        messages: message.messages
+      }))
+      : undefined
+  });
+}
+
+function summarizeImportCandidate(candidate) {
+  return compactObject({
+    id: candidate.id,
+    path: candidate.path,
+    relativePath: candidate.relativePath,
+    folderName: candidate.folderName,
+    name: candidate.name,
+    size: candidate.size,
+    seriesId: candidate.series?.id,
+    seriesTitle: candidate.series?.title,
+    tvdbId: candidate.series?.tvdbId,
+    seasonNumber: candidate.seasonNumber,
+    episodes: Array.isArray(candidate.episodes)
+      ? candidate.episodes.map(episode => compactObject({
+        id: episode.id,
+        seasonNumber: episode.seasonNumber,
+        episodeNumber: episode.episodeNumber,
+        absoluteEpisodeNumber: episode.absoluteEpisodeNumber,
+        title: episode.title,
+        airDate: episode.airDate,
+        airDateUtc: episode.airDateUtc
+      }))
+      : undefined,
+    episodeIds: Array.isArray(candidate.episodeIds)
+      ? candidate.episodeIds
+      : candidate.episodes?.map(episode => episode.id).filter(Boolean),
+    episodeFileId: candidate.episodeFileId,
+    releaseGroup: candidate.releaseGroup,
+    quality: candidate.quality,
+    languages: candidate.languages,
+    downloadId: candidate.downloadId,
+    customFormats: candidate.customFormats,
+    customFormatScore: candidate.customFormatScore,
+    indexerFlags: candidate.indexerFlags,
+    releaseType: candidate.releaseType,
+    rejections: Array.isArray(candidate.rejections)
+      ? candidate.rejections.map(rejection => compactObject({
+        reason: rejection.reason,
+        type: rejection.type
+      }))
+      : undefined
+  });
+}
+
+function summarizeNzbgetHistory(record) {
+  return compactObject({
+    id: record.ID ?? record.Id ?? record.id ?? record.NZBID,
+    nzbId: record.NZBID,
+    name: record.Name ?? record.NZBName ?? record.name,
+    kind: record.Kind,
+    status: record.Status,
+    category: record.Category,
+    totalSizeMb: record.FileSizeMB,
+    downloadedSizeMb: record.DownloadedSizeMB,
+    downloadTimeSec: record.DownloadTimeSec,
+    postTotalTimeSec: record.PostTotalTimeSec
+  });
+}
+
+async function arrQueueDetails(serviceName) {
+  const records = await arrApi(serviceName, "v3", "queue/details");
+  return Array.isArray(records) ? records : [];
+}
+
+function recordsById(records, ids) {
+  const wanted = new Set(ids);
+  return records.filter(record => wanted.has(record.id));
+}
+
+async function removeArrQueueItems(serviceName, ids, options) {
+  const uniqueIds = uniquePositiveIds(ids);
+  const beforeRecords = await arrQueueDetails(serviceName);
+  const matchedBefore = recordsById(beforeRecords, uniqueIds);
+  const missingBefore = uniqueIds.filter(id => !matchedBefore.some(record => record.id === id));
+  const query = {
+    removeFromClient: options.removeFromClient,
+    blocklist: options.blocklist
+  };
+
+  if (options.dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      requestedIds: uniqueIds,
+      removeFromClient: options.removeFromClient,
+      blocklist: options.blocklist,
+      matchedBefore: matchedBefore.map(summarizeQueueRecord),
+      missingBefore
+    };
+  }
+
+  const deleteResults = [];
+  for (const id of uniqueIds) {
+    try {
+      await arrApi(serviceName, "v3", `queue/${id}`, { method: "DELETE", query });
+      deleteResults.push({ id, ok: true });
+    } catch (error) {
+      deleteResults.push({ id, ok: false, error: error.message });
+    }
+  }
+
+  const afterRecords = await arrQueueDetails(serviceName);
+  const remainingAfter = recordsById(afterRecords, uniqueIds);
+  return {
+    dryRun: false,
+    service: serviceName,
+    requestedIds: uniqueIds,
+    removeFromClient: options.removeFromClient,
+    blocklist: options.blocklist,
+    matchedBefore: matchedBefore.map(summarizeQueueRecord),
+    missingBefore,
+    deleteResults,
+    remainingAfter: remainingAfter.map(summarizeQueueRecord)
+  };
+}
+
+async function sonarrManualImportCandidates(input) {
+  let folder = input.path;
+  let downloadId = input.downloadId;
+  let seriesId = input.seriesId;
+  let queueRecord = null;
+
+  if (input.queueId) {
+    const records = await arrQueueDetails("sonarr");
+    queueRecord = records.find(record => record.id === input.queueId);
+    if (!queueRecord) {
+      throw new Error(`sonarr queue item ${input.queueId} was not found`);
+    }
+    folder = folder || queueRecord.outputPath;
+    downloadId = downloadId || queueRecord.downloadId;
+    seriesId = seriesId || queueRecord.seriesId || queueRecord.series?.id;
+  }
+
+  if (!folder) {
+    throw new Error("path is required when queueId does not provide an outputPath");
+  }
+
+  const candidates = await arrApi("sonarr", "v3", "manualimport", {
+    query: {
+      folder,
+      downloadId,
+      seriesId,
+      filterExistingFiles: input.filterExistingFiles
+    }
+  });
+  const records = Array.isArray(candidates) ? candidates : [];
+  const limited = limitList(records.map(summarizeImportCandidate), input.limit);
+  return {
+    queueRecord: queueRecord ? summarizeQueueRecord(queueRecord) : undefined,
+    query: compactObject({
+      folder,
+      downloadId,
+      seriesId,
+      filterExistingFiles: input.filterExistingFiles
+    }),
+    ...limited
+  };
+}
+
+function manualImportFile(input) {
+  return compactObject({
+    id: input.id,
+    path: input.path,
+    seriesId: input.seriesId,
+    seasonNumber: input.seasonNumber,
+    episodeIds: input.episodeIds,
+    quality: input.quality,
+    languages: input.languages,
+    releaseGroup: input.releaseGroup,
+    downloadId: input.downloadId,
+    customFormats: input.customFormats,
+    customFormatScore: input.customFormatScore,
+    indexerFlags: input.indexerFlags,
+    releaseType: input.releaseType
+  });
+}
+
+async function removeNzbgetHistory(ids, options) {
+  const uniqueIds = uniquePositiveIds(ids);
+  const history = await nzbgetRpc("history");
+  const records = Array.isArray(history) ? history : [];
+  const matchedBefore = records.filter(record => uniqueIds.includes(record.NZBID));
+  const missingBefore = uniqueIds.filter(id => !matchedBefore.some(record => record.NZBID === id));
+  const command = options.deleteFiles ? "HistoryFinalDelete" : "HistoryDelete";
+
+  if (options.dryRun) {
+    return {
+      dryRun: true,
+      clientType: "nzbget",
+      command,
+      requestedIds: uniqueIds,
+      deleteFiles: options.deleteFiles,
+      matchedBefore: matchedBefore.map(summarizeNzbgetHistory),
+      missingBefore
+    };
+  }
+
+  const result = await nzbgetRpc("editqueue", [command, "", uniqueIds]);
+  const afterHistory = await nzbgetRpc("history");
+  const afterRecords = Array.isArray(afterHistory) ? afterHistory : [];
+  const remainingAfter = afterRecords.filter(record => uniqueIds.includes(record.NZBID));
+  return {
+    dryRun: false,
+    clientType: "nzbget",
+    command,
+    requestedIds: uniqueIds,
+    deleteFiles: options.deleteFiles,
+    result,
+    matchedBefore: matchedBefore.map(summarizeNzbgetHistory),
+    missingBefore,
+    remainingAfter: remainingAfter.map(summarizeNzbgetHistory)
+  };
+}
+
 async function serviceStatus(name) {
   try {
     switch (name) {
@@ -544,6 +798,80 @@ function createServer() {
     return jsonText(limitList(await arrApi("sonarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
   });
 
+  server.registerTool("sonarr_remove_queue_items", {
+    title: "Sonarr Remove Queue Items",
+    description: "Remove exact Sonarr queue item IDs. Dry-run is enabled by default and reports the matched records before deletion.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      ids: z.array(z.number().int().positive()).min(1),
+      removeFromClient: z.boolean().default(true),
+      blocklist: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => {
+    return jsonText(await removeArrQueueItems("sonarr", input.ids, input));
+  });
+
+  server.registerTool("sonarr_manual_import_candidates", {
+    title: "Sonarr Manual Import Candidates",
+    description: "Find Sonarr manual import candidates for an exact queue item ID or path.",
+    inputSchema: {
+      queueId: z.number().int().positive().optional(),
+      path: z.string().min(1).optional(),
+      downloadId: z.string().min(1).optional(),
+      seriesId: z.number().int().positive().optional(),
+      filterExistingFiles: z.boolean().default(true),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async (input) => {
+    if (!input.queueId && !input.path) {
+      throw new Error("queueId or path is required");
+    }
+    return jsonText(await sonarrManualImportCandidates(input));
+  });
+
+  server.registerTool("sonarr_manual_import", {
+    title: "Sonarr Manual Import",
+    description: "Import exact Sonarr manual import candidate files. Dry-run is enabled by default and returns the command that would be queued.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      files: z.array(z.object({
+        id: z.number().int().positive().optional(),
+        path: z.string().min(1),
+        seriesId: z.number().int().positive(),
+        seasonNumber: z.number().int().min(0).optional(),
+        episodeIds: z.array(z.number().int().positive()).min(1),
+        quality: z.any().optional(),
+        languages: z.array(z.any()).optional(),
+        releaseGroup: z.string().optional(),
+        downloadId: z.string().optional(),
+        customFormats: z.array(z.any()).optional(),
+        customFormatScore: z.number().int().optional(),
+        indexerFlags: z.number().int().optional(),
+        releaseType: z.string().optional()
+      })).min(1),
+      importMode: z.string().min(1).default("move"),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ files, importMode, dryRun }) => {
+    const command = {
+      name: "ManualImport",
+      importMode,
+      files: files.map(manualImportFile)
+    };
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        command,
+        note: "Set dryRun to false to queue this Sonarr ManualImport command."
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      command: await arrApi("sonarr", "v3", "command", { method: "POST", body: command })
+    });
+  });
+
   server.registerTool("sonarr_profiles", {
     title: "Sonarr Profiles",
     description: "List Sonarr quality profiles and root folders."
@@ -617,6 +945,20 @@ function createServer() {
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => {
     return jsonText(limitList(await arrApi("radarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
+  });
+
+  server.registerTool("radarr_remove_queue_items", {
+    title: "Radarr Remove Queue Items",
+    description: "Remove exact Radarr queue item IDs. Dry-run is enabled by default and reports the matched records before deletion.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      ids: z.array(z.number().int().positive()).min(1),
+      removeFromClient: z.boolean().default(true),
+      blocklist: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => {
+    return jsonText(await removeArrQueueItems("radarr", input.ids, input));
   });
 
   server.registerTool("radarr_profiles", {
@@ -711,6 +1053,23 @@ function createServer() {
     description: "List recent NZBGet history records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => jsonText(limitList(await nzbgetRpc("history"), limit)));
+
+  server.registerTool("download_client_remove_history", {
+    title: "Download Client Remove History",
+    description: "Remove exact NZBGet history NZBID values. Dry-run is enabled by default and reports the matched history records.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      clientType: z.enum(["nzbget"]),
+      ids: z.array(z.number().int().positive()).min(1),
+      deleteFiles: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ clientType, ids, deleteFiles, dryRun }) => {
+    if (clientType !== "nzbget") {
+      throw new Error(`download client ${clientType} is not supported by this tool`);
+    }
+    return jsonText(await removeNzbgetHistory(ids, { deleteFiles, dryRun }));
+  });
 
   server.registerTool("nzbget_control_downloads", {
     title: "NZBGet Control Downloads",
