@@ -86,12 +86,13 @@ COPY sshd_config /etc/codex-terminal/sshd_config
 COPY codex-terminal-shell /usr/local/bin/codex-terminal-shell
 COPY codex-terminal-profile.sh /etc/profile.d/codex-terminal.sh
 COPY entrypoint.sh /usr/local/bin/codex-terminal-entrypoint
+COPY media-path-check /usr/local/bin/media-path-check
 COPY web-terminal.sh /usr/local/bin/codex-web-terminal
 
 RUN chmod 0644 /etc/codex-terminal/sshd_config \
     && chmod 0755 /usr/local/bin/codex-terminal-shell \
     && chmod 0644 /etc/profile.d/codex-terminal.sh \
-    && chmod 0755 /usr/local/bin/codex-terminal-entrypoint /usr/local/bin/codex-web-terminal \
+    && chmod 0755 /usr/local/bin/codex-terminal-entrypoint /usr/local/bin/media-path-check /usr/local/bin/codex-web-terminal \
     && printf '%s\n' /usr/local/bin/codex-terminal-shell >> /etc/shells \
     && usermod -s /usr/local/bin/codex-terminal-shell codex
 

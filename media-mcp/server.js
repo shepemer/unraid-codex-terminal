@@ -1094,6 +1094,547 @@ async function mediaAdminOverview() {
   };
 }
 
+function redactText(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return value
+    .replace(/([?&](?:api[_-]?key|apikey|token|password|passkey)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/\b(api[_-]?key|apikey|token|password|passkey)=\S+/gi, "$1=[redacted]")
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
+    .replace(/\b(X-Api-Key|X-Plex-Token):\s*\S+/gi, "$1: [redacted]");
+}
+
+function summarizeArrLogRecord(record) {
+  return compactObject({
+    id: record.id,
+    time: record.time,
+    level: record.level,
+    logger: record.logger,
+    exception: redactText(record.exception),
+    message: redactText(record.message)
+  });
+}
+
+function summarizeArrHistoryRecord(record) {
+  return compactObject({
+    id: record.id,
+    eventType: record.eventType,
+    sourceTitle: record.sourceTitle,
+    seriesId: record.seriesId ?? record.series?.id,
+    seriesTitle: record.series?.title,
+    movieId: record.movieId ?? record.movie?.id,
+    movieTitle: record.movie?.title,
+    quality: record.quality,
+    languages: record.languages,
+    downloadId: record.downloadId,
+    data: record.data ? Object.fromEntries(Object.entries(record.data)
+      .filter(([key]) => !/api|token|password|url/i.test(key))
+      .map(([key, value]) => [key, redactText(value)])) : undefined,
+    date: record.date
+  });
+}
+
+function summarizeArrBlocklistRecord(record) {
+  return compactObject({
+    id: record.id,
+    sourceTitle: record.sourceTitle,
+    seriesId: record.seriesId ?? record.series?.id,
+    seriesTitle: record.series?.title,
+    movieId: record.movieId ?? record.movie?.id,
+    movieTitle: record.movie?.title,
+    quality: record.quality,
+    languages: record.languages,
+    protocol: record.protocol,
+    indexer: record.indexer,
+    message: redactText(record.message),
+    date: record.date
+  });
+}
+
+function summarizeArrWantedRecord(record) {
+  return compactObject({
+    id: record.id,
+    title: record.title,
+    seriesId: record.seriesId ?? record.series?.id,
+    seriesTitle: record.series?.title,
+    movieId: record.movieId ?? record.movie?.id,
+    movieTitle: record.movie?.title,
+    episodeId: record.episodeId ?? record.id,
+    seasonNumber: record.seasonNumber,
+    episodeNumber: record.episodeNumber,
+    airDateUtc: record.airDateUtc,
+    quality: record.quality,
+    monitored: record.monitored
+  });
+}
+
+function arrRecordsPage(body, mapper, limit) {
+  const records = Array.isArray(body?.records) ? body.records : Array.isArray(body) ? body : [];
+  return {
+    page: body?.page,
+    pageSize: body?.pageSize,
+    totalRecords: body?.totalRecords ?? records.length,
+    returned: Math.min(records.length, limit),
+    records: records.slice(0, limit).map(mapper)
+  };
+}
+
+async function arrWanted(serviceName, kind, limit) {
+  const body = await arrApi(serviceName, "v3", `wanted/${kind}`, {
+    query: { page: 1, pageSize: limit }
+  });
+  return arrRecordsPage(body, summarizeArrWantedRecord, limit);
+}
+
+async function arrRecentHistory(serviceName, limit) {
+  const body = await arrApi(serviceName, "v3", "history", {
+    query: { page: 1, pageSize: limit, sortKey: "date", sortDirection: "descending" }
+  });
+  return arrRecordsPage(body, summarizeArrHistoryRecord, limit);
+}
+
+async function arrBlocklist(serviceName, limit) {
+  const body = await arrApi(serviceName, "v3", "blocklist", {
+    query: { page: 1, pageSize: limit, sortKey: "date", sortDirection: "descending" }
+  });
+  return arrRecordsPage(body, summarizeArrBlocklistRecord, limit);
+}
+
+async function arrCommandStatus(serviceName, commandId) {
+  return arrApi(serviceName, "v3", commandId ? `command/${commandId}` : "command");
+}
+
+async function arrRecentLogs(serviceName, limit) {
+  const body = await arrApi(serviceName, "v3", "log", {
+    query: { page: 1, pageSize: limit, sortKey: "time", sortDirection: "descending" }
+  });
+  return arrRecordsPage(body, summarizeArrLogRecord, limit);
+}
+
+function queueProblemTags(record) {
+  const tags = [];
+  const text = [
+    record.status,
+    record.trackedDownloadStatus,
+    record.trackedDownloadState,
+    record.errorMessage
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (/import/.test(text)) tags.push("import");
+  if (/warning/.test(text)) tags.push("warning");
+  if (/error|fail/.test(text)) tags.push("failed");
+  if (/stalled|blocked|unavailable/.test(text)) tags.push("blocked");
+  if (!tags.length) tags.push("unknown");
+  return tags;
+}
+
+function importActionFromCandidate(serviceName, candidate, importMode = "move") {
+  if (!candidate?.safeToImport || !candidate.path) {
+    return null;
+  }
+  if (serviceName === "sonarr" && candidate.seriesId && candidate.episodeIds?.length) {
+    return {
+      type: "manual_import",
+      importMode,
+      file: compactObject({
+        path: candidate.path,
+        seriesId: candidate.seriesId,
+        seasonNumber: candidate.seasonNumber,
+        episodeIds: candidate.episodeIds,
+        quality: candidate.quality,
+        languages: candidate.languages,
+        releaseGroup: candidate.releaseGroup,
+        downloadId: candidate.downloadId,
+        customFormats: candidate.customFormats,
+        customFormatScore: candidate.customFormatScore,
+        indexerFlags: candidate.indexerFlags,
+        releaseType: candidate.releaseType
+      })
+    };
+  }
+  if (serviceName === "radarr" && candidate.movieId) {
+    return {
+      type: "manual_import",
+      importMode,
+      file: compactObject({
+        path: candidate.path,
+        movieId: candidate.movieId,
+        quality: candidate.quality,
+        languages: candidate.languages,
+        releaseGroup: candidate.releaseGroup,
+        downloadId: candidate.downloadId,
+        customFormats: candidate.customFormats,
+        customFormatScore: candidate.customFormatScore,
+        indexerFlags: candidate.indexerFlags,
+        releaseType: candidate.releaseType
+      })
+    };
+  }
+  return null;
+}
+
+function queueRepairActions(serviceName, queueRecord, candidates) {
+  const actions = [
+    {
+      type: "remove_queue_item",
+      removeFromClient: true,
+      blocklist: false,
+      reason: "Remove the exact queue item and optionally remove it from the download client."
+    },
+    {
+      type: "remove_queue_item",
+      removeFromClient: true,
+      blocklist: true,
+      reason: "Remove and blocklist the exact queue item when the release should not be retried."
+    }
+  ];
+  const safeCandidates = (candidates?.records || []).filter(candidate => candidate.safeToImport);
+  if (safeCandidates.length === 1) {
+    const action = importActionFromCandidate(serviceName, safeCandidates[0]);
+    if (action) {
+      actions.unshift({ ...action, reason: "Exactly one safe manual import candidate was found." });
+    }
+  }
+  const downloadId = queueRecord.downloadId;
+  if (queueRecord.downloadClient?.toLowerCase().includes("qbittorrent") && downloadId) {
+    actions.push({
+      type: "qbittorrent_recheck",
+      hashes: [downloadId],
+      reason: "Ask qBittorrent to recheck the exact torrent hash from the queue record."
+    });
+    actions.push({
+      type: "qbittorrent_reannounce",
+      hashes: [downloadId],
+      reason: "Ask qBittorrent to reannounce the exact torrent hash from the queue record."
+    });
+  }
+  return actions;
+}
+
+async function diagnoseQueueItem(serviceName, queueId) {
+  const records = await arrQueueDetails(serviceName);
+  const queueRecord = records.find(record => record.id === queueId);
+  if (!queueRecord) {
+    throw new Error(`${serviceName} queue item ${queueId} was not found`);
+  }
+  const candidates = await arrManualImportCandidates(serviceName, { queueId, filterExistingFiles: true, limit: 25 }).catch(error => ({
+    error: error.message,
+    records: []
+  }));
+  return {
+    service: serviceName,
+    queueItem: summarizeQueueRecord(queueRecord),
+    problemTags: queueProblemTags(queueRecord),
+    manualImportCandidates: candidates,
+    repairActions: queueRepairActions(serviceName, queueRecord, candidates)
+  };
+}
+
+function validateRepairAction(action) {
+  if (!action || typeof action !== "object" || typeof action.type !== "string") {
+    throw new Error("each repair action must include a type");
+  }
+}
+
+function comparableAction(value) {
+  if (Array.isArray(value)) {
+    return value.map(comparableAction);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => key !== "reason")
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, comparableAction(entry)]));
+  }
+  return value;
+}
+
+function actionMatchesPlan(action, plannedActions) {
+  const candidate = JSON.stringify(comparableAction(action));
+  return plannedActions.some(planned => JSON.stringify(comparableAction(planned)) === candidate);
+}
+
+function exactSeerrFollowUpAction(action) {
+  if (action.type === "seerr_add_comment") {
+    return Number.isInteger(action.issueId) && action.issueId > 0 && typeof action.message === "string" && Boolean(action.message.trim());
+  }
+  if (action.type === "seerr_resolve_issue") {
+    return Number.isInteger(action.issueId) && action.issueId > 0;
+  }
+  return false;
+}
+
+function uniqueExactHashes(hashes) {
+  const uniqueHashes = [...new Set(hashes.map(hash => String(hash).trim()).filter(Boolean))];
+  if (!uniqueHashes.length) {
+    throw new Error("at least one exact torrent hash is required");
+  }
+  if (uniqueHashes.some(hash => hash.toLowerCase() === "all")) {
+    throw new Error("the qBittorrent all selector is not allowed; provide exact torrent hashes");
+  }
+  return uniqueHashes;
+}
+
+async function qbitTorrentHashAction(kind, hashes, dryRun) {
+  const uniqueHashes = uniqueExactHashes(hashes);
+  if (dryRun) {
+    return { dryRun: true, action: kind, hashes: uniqueHashes };
+  }
+  await qbitRequest(`torrents/${kind}`, {
+    method: "POST",
+    form: { hashes: uniqueHashes.join("|") }
+  });
+  return { dryRun: false, action: kind, hashes: uniqueHashes, ok: true };
+}
+
+async function applyQueueRepairPlan(serviceName, queueId, actions, dryRun) {
+  const diagnosis = await diagnoseQueueItem(serviceName, queueId);
+  for (const action of actions) {
+    validateRepairAction(action);
+    if (!actionMatchesPlan(action, diagnosis.repairActions) && !exactSeerrFollowUpAction(action)) {
+      throw new Error(`repair action ${action.type} must exactly match a current repair plan action or an exact Seerr follow-up action`);
+    }
+  }
+  if (dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      queueId,
+      diagnosis,
+      wouldExecute: actions
+    };
+  }
+  const results = [];
+  for (const action of actions) {
+    switch (action.type) {
+      case "remove_queue_item":
+        results.push(await removeArrQueueItems(serviceName, [queueId], {
+          removeFromClient: action.removeFromClient ?? true,
+          blocklist: action.blocklist ?? false,
+          dryRun: false
+        }));
+        break;
+      case "manual_import": {
+        if (!action.file?.path) {
+          throw new Error("manual_import action requires file.path");
+        }
+        const command = manualImportCommand([action.file], action.importMode || "move");
+        results.push({
+          type: action.type,
+          service: serviceName,
+          command: await arrApi(serviceName, "v3", "command", { method: "POST", body: command })
+        });
+        break;
+      }
+      case "qbittorrent_recheck":
+        results.push(await qbitTorrentHashAction("recheck", action.hashes || [], false));
+        break;
+      case "qbittorrent_reannounce":
+        results.push(await qbitTorrentHashAction("reannounce", action.hashes || [], false));
+        break;
+      case "seerr_add_comment":
+        if (!action.issueId || !action.message) {
+          throw new Error("seerr_add_comment action requires issueId and message");
+        }
+        results.push({
+          type: action.type,
+          issue: summarizeSeerrIssue(await seerrApi(`issue/${action.issueId}/comment`, { method: "POST", body: { message: action.message } }))
+        });
+        break;
+      case "seerr_resolve_issue":
+        if (!action.issueId) {
+          throw new Error("seerr_resolve_issue action requires issueId");
+        }
+        results.push({
+          type: action.type,
+          issue: summarizeSeerrIssue(await seerrApi(`issue/${action.issueId}/resolved`, { method: "POST" }))
+        });
+        break;
+      default:
+        throw new Error(`unsupported repair action type: ${action.type}`);
+    }
+  }
+  return {
+    dryRun: false,
+    service: serviceName,
+    queueId,
+    results
+  };
+}
+
+function summarizeSeerrRequest(request, verbose = false) {
+  const media = request.media ?? request.mediaInfo ?? {};
+  return compactObject({
+    id: request.id,
+    status: request.status,
+    mediaType: request.type ?? mediaType(media),
+    mediaTitle: mediaTitle(media) ?? request.title,
+    media: verbose
+      ? compactObject({
+        id: media.id,
+        tmdbId: media.tmdbId,
+        tvdbId: media.tvdbId,
+        status: mediaStatusName(media.status),
+        ratingKey: plexRatingKey(media)
+      })
+      : undefined,
+    requestedBy: summarizeUser(request.requestedBy ?? request.createdBy ?? request.user, verbose),
+    seasons: request.seasons,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt
+  });
+}
+
+async function getSeerrRequest(requestId, verbose = false) {
+  return summarizeSeerrRequest(await seerrApi(`request/${requestId}`), verbose);
+}
+
+async function requestTriage(requestId, verbose = false) {
+  const request = await seerrApi(`request/${requestId}`);
+  const mediaKind = request.type ?? mediaType(request.media ?? request.mediaInfo);
+  const targetService = mediaKind === "tv" ? "sonarr" : mediaKind === "movie" ? "radarr" : undefined;
+  return {
+    request: summarizeSeerrRequest(request, verbose),
+    targetService,
+    targetServiceStatus: targetService
+      ? await serviceResult(targetService, async () => ({
+        health: await arrApi(targetService, "v3", "health"),
+        queue: await arrQueueOverview(targetService)
+      }))
+      : { configured: false, note: "Request media type did not map to Sonarr or Radarr" },
+    suggestedActions: [
+      { type: "approve_request", requestId, action: "approve" },
+      { type: "decline_request", requestId, action: "decline" }
+    ]
+  };
+}
+
+async function updateSeerrRequestStatus(requestId, action, dryRun, verbose = false) {
+  if (dryRun) {
+    return {
+      dryRun: true,
+      wouldUpdateRequest: { requestId, action },
+      request: await getSeerrRequest(requestId, verbose)
+    };
+  }
+  if (action === "delete") {
+    await seerrApi(`request/${requestId}`, { method: "DELETE" });
+    return { dryRun: false, deletedRequestId: requestId, deleted: true };
+  }
+  return {
+    dryRun: false,
+    request: summarizeSeerrRequest(await seerrApi(`request/${requestId}/${action}`, { method: "POST" }), verbose)
+  };
+}
+
+async function commentAndResolveIssue(issueId, message, dryRun, verbose = false) {
+  if (dryRun) {
+    return {
+      dryRun: true,
+      wouldAddComment: { issueId, message },
+      wouldSetStatus: "resolved",
+      issue: await getSeerrIssue(issueId, verbose)
+    };
+  }
+  const commented = await seerrApi(`issue/${issueId}/comment`, { method: "POST", body: { message } });
+  const resolved = await seerrApi(`issue/${issueId}/resolved`, { method: "POST" });
+  return {
+    dryRun: false,
+    commentedIssue: summarizeSeerrIssue(commented, verbose),
+    resolvedIssue: summarizeSeerrIssue(resolved, verbose)
+  };
+}
+
+async function diagnoseIssue(source, issueId, verbose = false) {
+  if (source !== "seerr") {
+    throw new Error(`issue source ${source} is not supported`);
+  }
+  const details = await plexIssueDetails({ source, issueId, verbose });
+  return {
+    ...details,
+    suggestedActions: [
+      { type: "seerr_add_comment", issueId, message: "Investigated and found a likely fix. Confirm before applying." },
+      { type: "seerr_resolve_issue", issueId }
+    ]
+  };
+}
+
+async function prowlarrIndexerHealth(limit) {
+  const [indexers, health, history] = await Promise.all([
+    arrApi("prowlarr", "v1", "indexer"),
+    arrApi("prowlarr", "v1", "health"),
+    arrApi("prowlarr", "v1", "history", { query: { page: 1, pageSize: limit, sortKey: "date", sortDirection: "descending" } }).catch(error => ({ error: error.message }))
+  ]);
+  return {
+    indexers: limitList(indexers, limit),
+    health,
+    history: history.error ? history : arrRecordsPage(history, record => compactObject({
+      id: record.id,
+      eventType: record.eventType,
+      indexerId: record.indexerId,
+      indexer: record.indexer,
+      successful: record.successful,
+      date: record.date
+    }), limit)
+  };
+}
+
+async function bazarrSubtitleOverview(limit) {
+  const [wantedMovies, wantedEpisodes, movieHistory, episodeHistory, providers] = await Promise.all([
+    bazarrApi("movies/wanted", { query: { start: 0, length: limit } }),
+    bazarrApi("episodes/wanted", { query: { start: 0, length: limit } }),
+    bazarrApi("movies/history", { query: { start: 0, length: limit } }),
+    bazarrApi("episodes/history", { query: { start: 0, length: limit } }),
+    bazarrApi("providers")
+  ]);
+  return {
+    wantedMovies: limitList(wantedMovies, limit),
+    wantedEpisodes: limitList(wantedEpisodes, limit),
+    movieHistory: limitList(movieHistory, limit),
+    episodeHistory: limitList(episodeHistory, limit),
+    providers
+  };
+}
+
+async function diagnosticsBundle(scope, limit) {
+  const bundle = { scope, generatedAt: new Date().toISOString() };
+  if (scope === "overview" || scope === "all") {
+    bundle.overview = await mediaAdminOverview();
+  }
+  if (scope === "queues" || scope === "all") {
+    bundle.queues = {
+      sonarr: await serviceResult("sonarr", () => arrQueueOverview("sonarr")),
+      radarr: await serviceResult("radarr", () => arrQueueOverview("radarr")),
+      nzbget: await serviceResult("nzbget", nzbgetOverview),
+      qbittorrent: await serviceResult("qbittorrent", qbittorrentOverview)
+    };
+  }
+  if (scope === "requests" || scope === "all") {
+    bundle.requests = await serviceResult("seerr", async () => {
+      const body = await seerrApi("request", { query: { take: limit, skip: 0 } });
+      const records = (Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [])
+        .slice(0, limit)
+        .map(request => summarizeSeerrRequest(request, false));
+      return {
+        pageInfo: body?.pageInfo,
+        total: body?.pageInfo?.results ?? records.length,
+        returned: records.length,
+        records
+      };
+    });
+  }
+  if (scope === "issues" || scope === "all") {
+    bundle.issues = await serviceResult("seerr", () => plexReportedIssues({ status: "open", source: "seerr", mediaType: "all", take: limit, skip: 0, verbose: false }));
+  }
+  if (scope === "subtitles" || scope === "all") {
+    bundle.subtitles = await serviceResult("bazarr", () => bazarrSubtitleOverview(limit));
+  }
+  if (scope === "indexers" || scope === "all") {
+    bundle.indexers = await serviceResult("prowlarr", () => prowlarrIndexerHealth(limit));
+  }
+  return bundle;
+}
+
 async function serviceStatus(name) {
   try {
     switch (name) {
@@ -1146,6 +1687,66 @@ function createServer() {
     title: "Media Admin Overview",
     description: "Return compact actionable counts for queues, download clients, Plex streams, and Seerr issues/requests."
   }, async () => jsonText(await mediaAdminOverview()));
+
+  server.registerTool("media_diagnostics_bundle", {
+    title: "Media Diagnostics Bundle",
+    description: "Collect a concise diagnosis bundle across queues, requests, issues, subtitles, and indexers.",
+    inputSchema: {
+      scope: z.enum(["overview", "queues", "requests", "issues", "subtitles", "indexers", "all"]).default("overview"),
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ scope, limit }) => jsonText(await diagnosticsBundle(scope, limit)));
+
+  server.registerTool("media_diagnose_queue_item", {
+    title: "Media Diagnose Queue Item",
+    description: "Diagnose one exact Sonarr or Radarr queue item and return safe candidate repair actions.",
+    inputSchema: {
+      service: z.enum(["sonarr", "radarr"]),
+      queueId: z.number().int().positive()
+    }
+  }, async ({ service, queueId }) => jsonText(await diagnoseQueueItem(service, queueId)));
+
+  server.registerTool("media_queue_repair_plan", {
+    title: "Media Queue Repair Plan",
+    description: "Return exact possible repair actions for one Sonarr or Radarr queue item.",
+    inputSchema: {
+      service: z.enum(["sonarr", "radarr"]),
+      queueId: z.number().int().positive()
+    }
+  }, async ({ service, queueId }) => jsonText(await diagnoseQueueItem(service, queueId)));
+
+  server.registerTool("media_apply_queue_repair_plan", {
+    title: "Media Apply Queue Repair Plan",
+    description: "Execute exact repair actions from media_queue_repair_plan. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      service: z.enum(["sonarr", "radarr"]),
+      queueId: z.number().int().positive(),
+      actions: z.array(z.object({
+        type: z.string().min(1)
+      }).passthrough()).min(1),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ service, queueId, actions, dryRun }) => jsonText(await applyQueueRepairPlan(service, queueId, actions, dryRun)));
+
+  server.registerTool("media_diagnose_issue", {
+    title: "Media Diagnose Issue",
+    description: "Diagnose one normalized Seerr-family user-reported issue with optional Plex/Tautulli context.",
+    inputSchema: {
+      source: z.enum(["seerr"]).default("seerr"),
+      issueId: z.number().int().positive(),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ source, issueId, verbose }) => jsonText(await diagnoseIssue(source, issueId, verbose)));
+
+  server.registerTool("media_request_triage", {
+    title: "Media Request Triage",
+    description: "Summarize one Seerr-family request and the matching Sonarr or Radarr operational context.",
+    inputSchema: {
+      requestId: z.number().int().positive(),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ requestId, verbose }) => jsonText(await requestTriage(requestId, verbose)));
 
   server.registerTool("plex_status", {
     title: "Plex Status",
@@ -1299,6 +1900,14 @@ function createServer() {
     }
   }, async ({ start, length }) => jsonText(limitList(await bazarrApi("episodes/history", { query: { start, length } }), length)));
 
+  server.registerTool("bazarr_subtitle_overview", {
+    title: "Bazarr Subtitle Overview",
+    description: "Summarize wanted subtitles, recent subtitle history, and provider configuration.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ limit }) => jsonText(await bazarrSubtitleOverview(limit)));
+
   server.registerTool("sonarr_list_series", {
     title: "Sonarr List Series",
     description: "List Sonarr series, optionally filtering by a title substring.",
@@ -1449,6 +2058,42 @@ function createServer() {
     });
   });
 
+  server.registerTool("sonarr_wanted_missing", {
+    title: "Sonarr Wanted Missing",
+    description: "List Sonarr wanted missing episode records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrWanted("sonarr", "missing", limit)));
+
+  server.registerTool("sonarr_cutoff_unmet", {
+    title: "Sonarr Cutoff Unmet",
+    description: "List Sonarr cutoff-unmet episode records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrWanted("sonarr", "cutoff", limit)));
+
+  server.registerTool("sonarr_recent_history", {
+    title: "Sonarr Recent History",
+    description: "List recent Sonarr history records with secret-like fields removed.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrRecentHistory("sonarr", limit)));
+
+  server.registerTool("sonarr_blocklist", {
+    title: "Sonarr Blocklist",
+    description: "List recent Sonarr blocklist records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrBlocklist("sonarr", limit)));
+
+  server.registerTool("sonarr_command_status", {
+    title: "Sonarr Command Status",
+    description: "List Sonarr command status records or one exact command ID.",
+    inputSchema: { commandId: z.number().int().positive().optional() }
+  }, async ({ commandId }) => jsonText(await arrCommandStatus("sonarr", commandId)));
+
+  server.registerTool("sonarr_recent_logs", {
+    title: "Sonarr Recent Logs",
+    description: "List recent Sonarr logs with token-like values redacted.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrRecentLogs("sonarr", limit)));
+
   server.registerTool("radarr_list_movies", {
     title: "Radarr List Movies",
     description: "List Radarr movies, optionally filtering by title substring.",
@@ -1597,6 +2242,42 @@ function createServer() {
     });
   });
 
+  server.registerTool("radarr_wanted_missing", {
+    title: "Radarr Wanted Missing",
+    description: "List Radarr wanted missing movie records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrWanted("radarr", "missing", limit)));
+
+  server.registerTool("radarr_cutoff_unmet", {
+    title: "Radarr Cutoff Unmet",
+    description: "List Radarr cutoff-unmet movie records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrWanted("radarr", "cutoff", limit)));
+
+  server.registerTool("radarr_recent_history", {
+    title: "Radarr Recent History",
+    description: "List recent Radarr history records with secret-like fields removed.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrRecentHistory("radarr", limit)));
+
+  server.registerTool("radarr_blocklist", {
+    title: "Radarr Blocklist",
+    description: "List recent Radarr blocklist records.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrBlocklist("radarr", limit)));
+
+  server.registerTool("radarr_command_status", {
+    title: "Radarr Command Status",
+    description: "List Radarr command status records or one exact command ID.",
+    inputSchema: { commandId: z.number().int().positive().optional() }
+  }, async ({ commandId }) => jsonText(await arrCommandStatus("radarr", commandId)));
+
+  server.registerTool("radarr_recent_logs", {
+    title: "Radarr Recent Logs",
+    description: "List recent Radarr logs with token-like values redacted.",
+    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
+  }, async ({ limit }) => jsonText(await arrRecentLogs("radarr", limit)));
+
   server.registerTool("prowlarr_list_indexers", {
     title: "Prowlarr List Indexers",
     description: "List Prowlarr indexers and their enabled state.",
@@ -1616,6 +2297,14 @@ function createServer() {
   }, async ({ query, categories, limit }) => {
     return jsonText(limitList(await arrApi("prowlarr", "v1", "search", { query: { query, categories } }), limit));
   });
+
+  server.registerTool("prowlarr_indexer_health", {
+    title: "Prowlarr Indexer Health",
+    description: "Summarize Prowlarr indexers, health records, and recent indexer history.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ limit }) => jsonText(await prowlarrIndexerHealth(limit)));
 
   server.registerTool("qbittorrent_list_torrents", {
     title: "qBittorrent List Torrents",
@@ -1662,6 +2351,26 @@ function createServer() {
       form: { hashes: hashes.join("|"), deleteFiles: deleteFiles ? "true" : "false" }
     }));
   });
+
+  server.registerTool("qbittorrent_recheck_torrents", {
+    title: "qBittorrent Recheck Torrents",
+    description: "Ask qBittorrent to recheck exact torrent hashes. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      hashes: z.array(z.string().min(1)).min(1),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ hashes, dryRun }) => jsonText(await qbitTorrentHashAction("recheck", hashes, dryRun)));
+
+  server.registerTool("qbittorrent_reannounce_torrents", {
+    title: "qBittorrent Reannounce Torrents",
+    description: "Ask qBittorrent to reannounce exact torrent hashes. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      hashes: z.array(z.string().min(1)).min(1),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ hashes, dryRun }) => jsonText(await qbitTorrentHashAction("reannounce", hashes, dryRun)));
 
   server.registerTool("nzbget_status", {
     title: "NZBGet Status",
@@ -1873,13 +2582,33 @@ function createServer() {
 
   server.registerTool("seerr_list_requests", {
     title: "Seerr List Requests",
-    description: "List Seerr-family media requests.",
+    description: "List normalized Seerr-family media requests without exposing user emails by default.",
     inputSchema: {
       take: z.number().int().min(1).max(100).default(20),
       skip: z.number().int().min(0).default(0),
-      filter: z.string().optional()
+      filter: z.string().optional(),
+      verbose: z.boolean().default(false)
     }
-  }, async ({ take, skip, filter }) => jsonText(await seerrApi("request", { query: { take, skip, filter } })));
+  }, async ({ take, skip, filter, verbose }) => {
+    const body = await seerrApi("request", { query: { take, skip, filter } });
+    const records = (Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [])
+      .map(request => summarizeSeerrRequest(request, verbose));
+    return jsonText({
+      pageInfo: body?.pageInfo,
+      total: body?.pageInfo?.results ?? records.length,
+      returned: records.length,
+      records
+    });
+  });
+
+  server.registerTool("seerr_request_details", {
+    title: "Seerr Request Details",
+    description: "Get normalized Seerr-family request details by exact request ID.",
+    inputSchema: {
+      requestId: z.number().int().positive(),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ requestId, verbose }) => jsonText(await getSeerrRequest(requestId, verbose)));
 
   server.registerTool("seerr_request_media", {
     title: "Seerr Request Media",
@@ -1895,6 +2624,30 @@ function createServer() {
       rootFolder: z.string().optional()
     }
   }, async (input) => jsonText(await seerrApi("request", { method: "POST", body: input })));
+
+  server.registerTool("seerr_update_request_status", {
+    title: "Seerr Update Request Status",
+    description: "Approve, decline, or delete an exact Seerr-family request. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      requestId: z.number().int().positive(),
+      action: z.enum(["approve", "decline", "delete"]),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ requestId, action, dryRun, verbose }) => jsonText(await updateSeerrRequestStatus(requestId, action, dryRun, verbose)));
+
+  server.registerTool("seerr_comment_and_resolve_issue", {
+    title: "Seerr Comment And Resolve Issue",
+    description: "Add an exact issue comment and resolve the same Seerr-family issue. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      message: z.string().min(1),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, message, dryRun, verbose }) => jsonText(await commentAndResolveIssue(issueId, message, dryRun, verbose)));
 
   server.registerTool("seerr_manage_request", {
     title: "Seerr Manage Request",

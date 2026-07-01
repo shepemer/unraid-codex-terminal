@@ -63,6 +63,8 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
+   Optional media/download path diagnostics belong on `codex-terminal` only. If you want agents to compare media-service paths with host files, configure the advanced read-only mounts for narrow shares such as `/mnt/user/media` and `/mnt/user/downloads`, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`.
+
 6. Optional: install `media-mcp` on `codex-mgmt`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
 
    - Sonarr: `SONARR_URL` and `SONARR_API_KEY`
@@ -73,6 +75,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - qBittorrent: `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, and `QBITTORRENT_PASSWORD`
    - NZBGet: `NZBGET_URL`, `NZBGET_USERNAME`, and `NZBGET_PASSWORD`
    - Seerr, Overseerr, or Jellyseerr: `SEERR_URL` and `SEERR_API_KEY`
+   - Tautulli: `TAUTULLI_URL` and `TAUTULLI_API_KEY`
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
 
@@ -179,18 +182,30 @@ ssh -t unraid-codex codex login
 
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
-- Shared: configured service status and compact media admin overview.
-- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, quality profiles, and root folders.
-- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, quality profiles, and root folders.
+- Shared: configured service status, compact media admin overview, diagnostics bundles, exact queue-item diagnosis, exact queue repair plans, issue diagnosis, and request triage.
+- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status, recent logs, quality profiles, and root folders.
+- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status, recent logs, quality profiles, and root folders.
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
 - Tautulli: current activity and playback history diagnostics.
-- Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, and subtitle history.
-- Prowlarr: list indexers and search.
-- qBittorrent: list torrents, pause or resume selected hashes, and delete selected hashes with explicit optional file deletion.
+- Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, subtitle history, and subtitle overview.
+- Prowlarr: list indexers, search, and indexer health/history summary.
+- qBittorrent: list torrents, pause or resume selected hashes, recheck/reannounce exact hashes, and delete selected hashes with explicit optional file deletion.
 - NZBGet: status, queue, history, guarded history removal, pause or resume downloads, and set rate limits.
-- Seerr, Overseerr, or Jellyseerr: search media, list/manage requests, and list/comment/resolve/reopen/delete reported issues.
+- Seerr, Overseerr, or Jellyseerr: search media, list/request details, guarded request status updates, and list/comment/resolve/reopen/delete reported issues.
 
 Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories.
+
+Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and the new admin tools default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
+
+## Codex-Terminal Path Diagnostics
+
+The `media-path-check` command runs inside `codex-terminal`, not the MCP sidecars. It only performs `stat` and readability checks:
+
+```sh
+media-path-check --json /downloads/example.mkv /media/Movie
+```
+
+When `CODEX_MEDIA_PATH_MAPS=/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`, the command reports both the original service path and the mapped read-only mount alternative. Keep mounts narrow and read-only. Do not mount `/mnt/user`, `/`, `/boot`, appdata, or the Docker socket for this workflow.
 
 ## Optional Utilities MCP
 
@@ -267,6 +282,7 @@ Static checks:
 
 ```sh
 bash -n entrypoint.sh
+bash -n media-path-check
 bash -n web-terminal.sh
 bash -n codex-terminal-shell
 sh -n codex-terminal-profile.sh
@@ -277,6 +293,7 @@ docker compose config
 docker compose --profile media config
 docker compose --profile utilities config
 docker compose --profile media --profile utilities config
+tmpdir="$(mktemp -d)" && mkdir -p "$tmpdir/downloads" && touch "$tmpdir/downloads/sample.mkv" && CODEX_MEDIA_PATH_MAPS="/downloads=$tmpdir/downloads" ./media-path-check --json /downloads/sample.mkv >/dev/null
 ```
 
 CI builds all images locally and scans them with Trivy for fixed high and critical OS/library vulnerabilities on pull requests. Pushes to `main`, tags, and manual runs publish to GHCR only after scans pass.

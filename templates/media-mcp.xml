@@ -8,7 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
   <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
-  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
+  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
   <Category>Tools:</Category>
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/media-mcp.xml</TemplateURL>

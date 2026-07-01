@@ -26,6 +26,8 @@ Use this before deploying or publishing the templates.
 - [ ] No container mounts `/var/run/docker.sock`.
 - [ ] No container mounts `/`, `/boot`, broad `/mnt`, or all appdata.
 - [ ] Any diagnostic mount is narrow and read-only.
+- [ ] Optional media/download path diagnostics mounts are on `codex-terminal` only, not MCP sidecars.
+- [ ] `CODEX_MEDIA_PATH_MAPS` maps only service paths to narrow read-only mounts such as `/mnt/unraid/media` or `/mnt/unraid/downloads`.
 - [ ] MCP sidecars require bearer-token auth.
 
 ## API Key Scope
@@ -52,6 +54,7 @@ Use this before deploying or publishing the templates.
 ## Validation
 
 - [ ] `bash -n entrypoint.sh` passes.
+- [ ] `bash -n media-path-check` passes.
 - [ ] `bash -n web-terminal.sh` passes.
 - [ ] `npm --prefix media-mcp run check` passes.
 - [ ] `npm --prefix utilities-mcp run check` passes.
@@ -66,6 +69,7 @@ Use this before deploying or publishing the templates.
 - [ ] `unraid-mcp` starts with root-owned appdata directories and rewrites them to UID/GID 1000.
 - [ ] `media-mcp` starts with a read-only root filesystem and no host mounts.
 - [ ] `utilities-mcp` starts with a read-only root filesystem and no host mounts.
+- [ ] `media-path-check --json` reports mapped alternatives without creating, deleting, or editing files.
 - [ ] `ssh unraid-codex codex --version` works.
 - [ ] `ssh unraid-codex codex mcp list --json` shows the `unraid` MCP server.
 - [ ] If media MCP is enabled, `ssh unraid-codex codex mcp list --json` shows the `media` MCP server.
