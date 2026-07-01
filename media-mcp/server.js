@@ -34,7 +34,8 @@ const configuredServices = {
   qbittorrent: basicServiceConfig("QBITTORRENT"),
   nzbget: basicServiceConfig("NZBGET"),
   seerr: seerrConfig(),
-  tautulli: serviceConfig("TAUTULLI", "apiKey")
+  tautulli: serviceConfig("TAUTULLI", "apiKey"),
+  tracearr: serviceConfig("TRACEARR", "apiKey")
 };
 
 if (!Object.values(configuredServices).some(Boolean)) {
@@ -281,6 +282,24 @@ async function tautulliApi(cmd, options = {}) {
     throw new Error(`Tautulli ${cmd} failed: ${body.response.message || "unknown error"}`);
   }
   return body?.response?.data ?? body;
+}
+
+async function tracearrApi(path, options = {}) {
+  const service = requireService("tracearr");
+  const cleanPath = path.replace(/^\/+/, "");
+  const url = new URL(`${service.url}/api/v1/public/${cleanPath}`);
+  for (const [key, value] of Object.entries(options.query || {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return fetchJson(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${service.apiKey}`,
+      Accept: "application/json"
+    }
+  });
 }
 
 async function qbitRequest(path, options = {}) {
@@ -921,6 +940,209 @@ function summarizeTautulliHistory(data, limit = 25) {
   };
 }
 
+function tracearrRecords(body) {
+  return Array.isArray(body?.data) ? body.data : [];
+}
+
+function tracearrPage(body, mapper, limit = 25, predicate = () => true) {
+  const records = tracearrRecords(body)
+    .filter(predicate)
+    .slice(0, limit)
+    .map(mapper);
+  return {
+    meta: body?.meta,
+    total: body?.meta?.total ?? tracearrRecords(body).length,
+    returned: records.length,
+    records
+  };
+}
+
+function tracearrTitleMatches(title) {
+  const lowered = title?.toLowerCase();
+  if (!lowered) {
+    return () => true;
+  }
+  return record => [record.mediaTitle, record.showTitle, record.grandparentTitle, record.title]
+    .filter(Boolean)
+    .some(value => String(value).toLowerCase().includes(lowered));
+}
+
+function summarizeTracearrStream(record) {
+  return compactObject({
+    id: record.id,
+    serverId: record.serverId,
+    serverName: record.serverName,
+    username: record.username,
+    mediaTitle: record.mediaTitle,
+    showTitle: record.showTitle,
+    mediaType: record.mediaType,
+    state: record.state,
+    progressMs: record.progressMs,
+    durationMs: record.durationMs,
+    startedAt: record.startedAt,
+    watched: record.watched,
+    isTranscode: record.isTranscode,
+    videoDecision: record.videoDecision,
+    audioDecision: record.audioDecision,
+    resolution: record.resolution,
+    sourceVideoCodecDisplay: record.sourceVideoCodecDisplay,
+    sourceAudioCodecDisplay: record.sourceAudioCodecDisplay,
+    streamVideoCodecDisplay: record.streamVideoCodecDisplay,
+    streamAudioCodecDisplay: record.streamAudioCodecDisplay,
+    platform: record.platform,
+    product: record.product,
+    player: record.player,
+    device: record.device,
+    transcodeInfo: record.transcodeInfo,
+    subtitleInfo: record.subtitleInfo
+  });
+}
+
+function summarizeTracearrStreams(body, limit = 25, title) {
+  return compactObject({
+    summary: body?.summary,
+    ...tracearrPage(body, summarizeTracearrStream, limit, tracearrTitleMatches(title))
+  });
+}
+
+function summarizeTracearrHistoryRecord(record) {
+  return compactObject({
+    id: record.id,
+    serverId: record.serverId,
+    serverName: record.serverName,
+    state: record.state,
+    mediaTitle: record.mediaTitle,
+    showTitle: record.showTitle,
+    mediaType: record.mediaType,
+    startedAt: record.startedAt,
+    stoppedAt: record.stoppedAt,
+    watched: record.watched,
+    durationMs: record.durationMs,
+    progressMs: record.progressMs,
+    totalDurationMs: record.totalDurationMs,
+    segmentCount: record.segmentCount,
+    user: summarizeUser(record.user, false),
+    platform: record.platform,
+    product: record.product,
+    player: record.player,
+    device: record.device,
+    isTranscode: record.isTranscode,
+    videoDecision: record.videoDecision,
+    audioDecision: record.audioDecision,
+    resolution: record.resolution,
+    sourceVideoCodecDisplay: record.sourceVideoCodecDisplay,
+    sourceAudioCodecDisplay: record.sourceAudioCodecDisplay,
+    streamVideoCodecDisplay: record.streamVideoCodecDisplay,
+    streamAudioCodecDisplay: record.streamAudioCodecDisplay,
+    transcodeInfo: record.transcodeInfo,
+    subtitleInfo: record.subtitleInfo
+  });
+}
+
+function summarizeTracearrHistory(body, limit = 25, title) {
+  return tracearrPage(body, summarizeTracearrHistoryRecord, limit, tracearrTitleMatches(title));
+}
+
+function summarizeTracearrUser(record) {
+  return compactObject({
+    id: record.id,
+    username: record.username,
+    displayName: record.displayName,
+    role: record.role,
+    trustScore: record.trustScore,
+    totalViolations: record.totalViolations,
+    serverId: record.serverId,
+    serverName: record.serverName,
+    lastActivityAt: record.lastActivityAt,
+    sessionCount: record.sessionCount,
+    createdAt: record.createdAt
+  });
+}
+
+function summarizeTracearrUsers(body, limit = 25) {
+  return tracearrPage(body, summarizeTracearrUser, limit);
+}
+
+function summarizeTracearrViolation(record) {
+  return compactObject({
+    id: record.id,
+    serverId: record.serverId,
+    serverName: record.serverName,
+    severity: record.severity,
+    acknowledged: record.acknowledged,
+    createdAt: record.createdAt,
+    rule: record.rule,
+    user: summarizeUser(record.user, false),
+    data: record.data
+  });
+}
+
+function summarizeTracearrViolations(body, limit = 25) {
+  return tracearrPage(body, summarizeTracearrViolation, limit);
+}
+
+async function tracearrOverview() {
+  const [health, stats, today, streams] = await Promise.all([
+    tracearrApi("health"),
+    tracearrApi("stats"),
+    tracearrApi("stats/today", { query: { timezone: "UTC" } }),
+    tracearrApi("streams", { query: { summary: true } })
+  ]);
+  return {
+    health,
+    stats,
+    today,
+    activeStreams: streams?.summary ?? streams,
+    recentViolationCount: stats?.recentViolations
+  };
+}
+
+async function tracearrDiagnostics(limit = 25) {
+  const [health, stats, today, activity, streams, users, violations, history] = await Promise.all([
+    tracearrApi("health"),
+    tracearrApi("stats"),
+    tracearrApi("stats/today", { query: { timezone: "UTC" } }),
+    tracearrApi("activity", { query: { period: "month", timezone: "UTC" } }),
+    tracearrApi("streams", { query: { summary: false } }),
+    tracearrApi("users", { query: { page: 1, pageSize: limit } }),
+    tracearrApi("violations", { query: { page: 1, pageSize: limit } }),
+    tracearrApi("history", { query: { page: 1, pageSize: limit, timezone: "UTC" } })
+  ]);
+  return {
+    health,
+    stats,
+    today,
+    activity,
+    streams: summarizeTracearrStreams(streams, limit),
+    users: summarizeTracearrUsers(users, limit),
+    violations: summarizeTracearrViolations(violations, limit),
+    history: summarizeTracearrHistory(history, limit)
+  };
+}
+
+async function tracearrIssueContext(issue) {
+  if (!configuredServices.tracearr) {
+    return { configured: false };
+  }
+  const title = mediaTitle(issue.media ?? issue.mediaInfo);
+  try {
+    const [streams, violations, history] = await Promise.all([
+      tracearrApi("streams", { query: { summary: false } }),
+      tracearrApi("violations", { query: { page: 1, pageSize: 10 } }),
+      tracearrApi("history", { query: { page: 1, pageSize: 25, timezone: "UTC" } })
+    ]);
+    return {
+      configured: true,
+      title,
+      activeStreams: summarizeTracearrStreams(streams, 10, title),
+      recentViolations: summarizeTracearrViolations(violations, 10),
+      recentHistory: summarizeTracearrHistory(history, 10, title)
+    };
+  } catch (error) {
+    return { configured: true, error: error.message };
+  }
+}
+
 async function tautulliIssueContext(issue) {
   if (!configuredServices.tautulli) {
     return { configured: false };
@@ -948,7 +1170,8 @@ async function plexIssueDetails(input) {
   const rawIssue = await seerrApi(`issue/${input.issueId}`);
   return {
     issue: summarizeSeerrIssue(rawIssue, input.verbose),
-    tautulli: await tautulliIssueContext(rawIssue)
+    tautulli: await tautulliIssueContext(rawIssue),
+    tracearr: await tracearrIssueContext(rawIssue)
   };
 }
 
@@ -1072,7 +1295,8 @@ async function mediaAdminOverview() {
     qbittorrent,
     plex,
     seerr,
-    tautulli
+    tautulli,
+    tracearr
   ] = await Promise.all([
     serviceResult("sonarr", () => arrQueueOverview("sonarr")),
     serviceResult("radarr", () => arrQueueOverview("radarr")),
@@ -1080,7 +1304,8 @@ async function mediaAdminOverview() {
     serviceResult("qbittorrent", qbittorrentOverview),
     serviceResult("plex", plexOverview),
     serviceResult("seerr", seerrOverview),
-    serviceResult("tautulli", tautulliOverview)
+    serviceResult("tautulli", tautulliOverview),
+    serviceResult("tracearr", tracearrOverview)
   ]);
   return {
     generatedAt: new Date().toISOString(),
@@ -1090,7 +1315,8 @@ async function mediaAdminOverview() {
     qbittorrent,
     plex,
     seerr,
-    tautulli
+    tautulli,
+    tracearr
   };
 }
 
@@ -1600,6 +1826,7 @@ async function diagnosticsBundle(scope, limit) {
   const bundle = { scope, generatedAt: new Date().toISOString() };
   if (scope === "overview" || scope === "all") {
     bundle.overview = await mediaAdminOverview();
+    bundle.tracearr = await serviceResult("tracearr", () => tracearrDiagnostics(limit));
   }
   if (scope === "queues" || scope === "all") {
     bundle.queues = {
@@ -1656,6 +1883,8 @@ async function serviceStatus(name) {
         return { configured: true, status: await seerrApi("status") };
       case "tautulli":
         return { configured: true, status: await tautulliApi("server_status") };
+      case "tracearr":
+        return { configured: true, health: await tracearrApi("health") };
       default:
         return { configured: false };
     }
@@ -1672,7 +1901,7 @@ function createServer() {
 
   server.registerTool("media_services_status", {
     title: "Media Services Status",
-    description: "Check configured Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, Seerr-family, and Tautulli services."
+    description: "Check configured Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, Seerr-family, Tautulli, and Tracearr services."
   }, async () => {
     const entries = await Promise.all(Object.entries(configuredServices).map(async ([name, config]) => {
       if (!config) {
@@ -1731,7 +1960,7 @@ function createServer() {
 
   server.registerTool("media_diagnose_issue", {
     title: "Media Diagnose Issue",
-    description: "Diagnose one normalized Seerr-family user-reported issue with optional Plex/Tautulli context.",
+    description: "Diagnose one normalized Seerr-family user-reported issue with optional Plex, Tautulli, and Tracearr context.",
     inputSchema: {
       source: z.enum(["seerr"]).default("seerr"),
       issueId: z.number().int().positive(),
@@ -1826,7 +2055,7 @@ function createServer() {
 
   server.registerTool("plex_issue_details", {
     title: "Plex Issue Details",
-    description: "Get normalized issue details and optional Tautulli playback context for a reported Plex/media issue.",
+    description: "Get normalized issue details and optional Tautulli/Tracearr playback context for a reported Plex/media issue.",
     inputSchema: {
       source: z.enum(["seerr"]).default("seerr"),
       issueId: z.number().int().positive(),
@@ -1853,6 +2082,103 @@ function createServer() {
   }, async ({ start, length, search }) => jsonText(summarizeTautulliHistory(await tautulliApi("get_history", {
     query: { start, length, search }
   }), length)));
+
+  server.registerTool("tracearr_health", {
+    title: "Tracearr Health",
+    description: "Get Tracearr public API health and configured media server connectivity."
+  }, async () => jsonText(await tracearrApi("health")));
+
+  server.registerTool("tracearr_openapi", {
+    title: "Tracearr OpenAPI",
+    description: "Get Tracearr's public OpenAPI document."
+  }, async () => jsonText(await tracearrApi("docs")));
+
+  server.registerTool("tracearr_stats", {
+    title: "Tracearr Stats",
+    description: "Get Tracearr dashboard statistics with optional media server filtering.",
+    inputSchema: {
+      serverId: z.string().uuid().optional()
+    }
+  }, async ({ serverId }) => jsonText(await tracearrApi("stats", { query: { serverId } })));
+
+  server.registerTool("tracearr_stats_today", {
+    title: "Tracearr Stats Today",
+    description: "Get Tracearr dashboard metrics for today in the requested timezone.",
+    inputSchema: {
+      serverId: z.string().uuid().optional(),
+      timezone: z.string().min(1).max(100).default("UTC")
+    }
+  }, async ({ serverId, timezone }) => jsonText(await tracearrApi("stats/today", { query: { serverId, timezone } })));
+
+  server.registerTool("tracearr_activity", {
+    title: "Tracearr Activity",
+    description: "Get Tracearr playback activity trends and breakdowns.",
+    inputSchema: {
+      period: z.enum(["week", "month", "year"]).default("month"),
+      serverId: z.string().uuid().optional(),
+      timezone: z.string().min(1).max(100).default("UTC")
+    }
+  }, async ({ period, serverId, timezone }) => jsonText(await tracearrApi("activity", { query: { period, serverId, timezone } })));
+
+  server.registerTool("tracearr_active_streams", {
+    title: "Tracearr Active Streams",
+    description: "List Tracearr active streams with codec and transcode details, or request summary-only output.",
+    inputSchema: {
+      serverId: z.string().uuid().optional(),
+      summary: z.boolean().default(false),
+      limit: z.number().int().min(1).max(100).default(50)
+    }
+  }, async ({ serverId, summary, limit }) => {
+    const body = await tracearrApi("streams", { query: { serverId, summary } });
+    return jsonText(summary ? body : summarizeTracearrStreams(body, limit));
+  });
+
+  server.registerTool("tracearr_users", {
+    title: "Tracearr Users",
+    description: "List Tracearr users with activity metrics and trust scores.",
+    inputSchema: {
+      serverId: z.string().uuid().optional(),
+      page: z.number().int().min(1).default(1),
+      pageSize: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ serverId, page, pageSize }) => {
+    return jsonText(summarizeTracearrUsers(await tracearrApi("users", { query: { serverId, page, pageSize } }), pageSize));
+  });
+
+  server.registerTool("tracearr_violations", {
+    title: "Tracearr Violations",
+    description: "List Tracearr rule violations with optional server, severity, and acknowledged filters.",
+    inputSchema: {
+      serverId: z.string().uuid().optional(),
+      severity: z.enum(["low", "warning", "high"]).optional(),
+      acknowledged: z.boolean().optional(),
+      page: z.number().int().min(1).default(1),
+      pageSize: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ serverId, severity, acknowledged, page, pageSize }) => {
+    return jsonText(summarizeTracearrViolations(await tracearrApi("violations", {
+      query: { serverId, severity, acknowledged, page, pageSize }
+    }), pageSize));
+  });
+
+  server.registerTool("tracearr_history", {
+    title: "Tracearr History",
+    description: "List Tracearr playback history grouped by unique plays.",
+    inputSchema: {
+      serverId: z.string().uuid().optional(),
+      state: z.enum(["playing", "paused", "stopped"]).optional(),
+      mediaType: z.enum(["movie", "episode", "track", "live", "photo", "unknown"]).optional(),
+      startDate: z.string().min(1).optional(),
+      endDate: z.string().min(1).optional(),
+      timezone: z.string().min(1).max(100).default("UTC"),
+      page: z.number().int().min(1).default(1),
+      pageSize: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ serverId, state, mediaType, startDate, endDate, timezone, page, pageSize }) => {
+    return jsonText(summarizeTracearrHistory(await tracearrApi("history", {
+      query: { serverId, state, mediaType, startDate, endDate, timezone, page, pageSize }
+    }), pageSize));
+  });
 
   server.registerTool("bazarr_status", {
     title: "Bazarr Status",

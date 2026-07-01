@@ -42,6 +42,7 @@ Use this before deploying or publishing the templates.
 ## Media App Scope
 
 - [ ] Only the media services Codex should manage are configured on `media-mcp`.
+- [ ] Tracearr tools are read-only diagnostics only; stream termination is not exposed.
 - [ ] qBittorrent delete-with-files is treated as destructive and requires explicit confirmation.
 - [ ] Seerr request approval, decline, and delete actions require explicit confirmation.
 - [ ] Sonarr/Radarr add actions use known root folders and quality profiles.

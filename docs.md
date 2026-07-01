@@ -30,7 +30,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
-- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
 - `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
 
@@ -76,6 +76,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - NZBGet: `NZBGET_URL`, `NZBGET_USERNAME`, and `NZBGET_PASSWORD`
    - Seerr, Overseerr, or Jellyseerr: `SEERR_URL` and `SEERR_API_KEY`
    - Tautulli: `TAUTULLI_URL` and `TAUTULLI_API_KEY`
+   - Tracearr: `TRACEARR_URL` and `TRACEARR_API_KEY`
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
 
@@ -187,13 +188,14 @@ ssh -t unraid-codex codex login
 - Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status, recent logs, quality profiles, and root folders.
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
 - Tautulli: current activity and playback history diagnostics.
+- Tracearr: health, OpenAPI, stats, today stats, activity trends, active streams, users, violations, and playback history diagnostics.
 - Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, subtitle history, and subtitle overview.
 - Prowlarr: list indexers, search, and indexer health/history summary.
 - qBittorrent: list torrents, pause or resume selected hashes, recheck/reannounce exact hashes, and delete selected hashes with explicit optional file deletion.
 - NZBGet: status, queue, history, guarded history removal, pause or resume downloads, and set rate limits.
 - Seerr, Overseerr, or Jellyseerr: search media, list/request details, guarded request status updates, and list/comment/resolve/reopen/delete reported issues.
 
-Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories.
+Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories. Tracearr support is read-only and does not expose stream termination.
 
 Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and the new admin tools default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
 
@@ -329,7 +331,7 @@ Unraid acceptance:
 - Never mount `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Use only narrow read-only diagnostic mounts.
 - Keep the Unraid API key only in the MCP sidecar.
-- Keep Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
+- Keep Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
 - Keep Scrutiny endpoints only in the optional utilities MCP sidecar.
 - MCP sidecars require bearer-token auth; do not add host port mappings for MCP.
 - The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.

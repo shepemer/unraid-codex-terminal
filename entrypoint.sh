@@ -273,7 +273,7 @@ if [ ! -s "${CONFIG_DIR}/workspace/AGENTS.md" ]; then
 - Do not request or use SSH access to the Unraid host.
 - Do not request or use access to `/var/run/docker.sock`.
 - Use the configured Unraid MCP server for Unraid management.
-- Use the configured media MCP server for Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation when present.
+- Use the configured media MCP server for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation when present.
 - Use the configured utilities MCP server for Scrutiny monitoring when present.
 - Ask for explicit user confirmation before array start or stop, correcting parity checks, VM force stop or reset, container deletes, plugin changes, API key changes, flash backup, network settings changes, and destructive notification archive or delete actions.
 - Summarize logs. Do not print secrets, bearer tokens, API keys, cookies, passwords, or session values.
