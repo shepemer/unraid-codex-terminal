@@ -33,7 +33,8 @@ const configuredServices = {
   prowlarr: serviceConfig("PROWLARR", "apiKey"),
   qbittorrent: basicServiceConfig("QBITTORRENT"),
   nzbget: basicServiceConfig("NZBGET"),
-  seerr: seerrConfig()
+  seerr: seerrConfig(),
+  tautulli: serviceConfig("TAUTULLI", "apiKey")
 };
 
 if (!Object.values(configuredServices).some(Boolean)) {
@@ -265,6 +266,23 @@ async function seerrApi(path, options = {}) {
   return fetchJson(url, { method: options.method || "GET", headers, body });
 }
 
+async function tautulliApi(cmd, options = {}) {
+  const service = requireService("tautulli");
+  const url = new URL(`${service.url}/api/v2`);
+  url.searchParams.set("apikey", service.apiKey);
+  url.searchParams.set("cmd", cmd);
+  for (const [key, value] of Object.entries(options.query || {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  const body = await fetchJson(url, { method: "GET", headers: { Accept: "application/json" } });
+  if (body?.response?.result === "error") {
+    throw new Error(`Tautulli ${cmd} failed: ${body.response.message || "unknown error"}`);
+  }
+  return body?.response?.data ?? body;
+}
+
 async function qbitRequest(path, options = {}) {
   const service = requireService("qbittorrent");
   const loginBody = new URLSearchParams({
@@ -347,6 +365,140 @@ function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
 }
 
+async function serviceResult(name, fn) {
+  if (!configuredServices[name]) {
+    return { configured: false };
+  }
+  try {
+    return { configured: true, ...(await fn()) };
+  } catch (error) {
+    return { configured: true, error: error.message };
+  }
+}
+
+function firstString(...values) {
+  return values.find(value => typeof value === "string" && value.trim()) || undefined;
+}
+
+function firstPresent(...values) {
+  return values.find(value => value !== undefined && value !== null && value !== "") ?? undefined;
+}
+
+function issueTypeName(value) {
+  const labels = {
+    1: "video",
+    2: "audio",
+    3: "subtitles",
+    4: "other",
+    video: "video",
+    audio: "audio",
+    subtitles: "subtitles",
+    other: "other"
+  };
+  return labels[value] || value;
+}
+
+function mediaStatusName(value) {
+  const labels = {
+    1: "unknown",
+    2: "pending",
+    3: "processing",
+    4: "partially_available",
+    5: "available",
+    6: "deleted"
+  };
+  return labels[value] || value;
+}
+
+function seerrIssueStatus(issue) {
+  if (typeof issue.status === "string") {
+    return issue.status;
+  }
+  if (typeof issue.status === "number") {
+    return issue.status === 2 ? "resolved" : "open";
+  }
+  if (issue.resolvedAt || issue.isResolved === true || issue.closedAt) {
+    return "resolved";
+  }
+  return "open";
+}
+
+function summarizeUser(user, verbose = false) {
+  if (!user) {
+    return undefined;
+  }
+  return compactObject({
+    id: user.id,
+    displayName: firstString(user.displayName, user.username, user.plexUsername, user.name, verbose ? user.email : undefined),
+    username: firstString(user.username, user.plexUsername),
+    email: verbose ? user.email : undefined
+  });
+}
+
+function mediaTitle(media) {
+  return firstString(media?.title, media?.name, media?.mediaInfo?.title, media?.movie?.title, media?.tv?.title);
+}
+
+function mediaType(media) {
+  return firstString(media?.mediaType, media?.type, media?.mediaInfo?.mediaType)
+    || (media?.tvdbId ? "tv" : undefined)
+    || (media?.tmdbId ? "movie" : undefined);
+}
+
+function plexRatingKey(media) {
+  return firstPresent(media?.ratingKey, media?.plexRatingKey, media?.plexId, media?.externalServiceId);
+}
+
+function summarizeIssueComment(comment, verbose = false) {
+  return compactObject({
+    id: comment.id,
+    message: comment.message,
+    reporter: summarizeUser(comment.user ?? comment.createdBy, verbose),
+    createdAt: comment.createdAt,
+    updatedAt: comment.updatedAt
+  });
+}
+
+function summarizeSeerrIssue(issue, verbose = false) {
+  const comments = Array.isArray(issue.comments) ? issue.comments.map(comment => summarizeIssueComment(comment, verbose)) : [];
+  const media = issue.media ?? issue.mediaInfo ?? {};
+  return compactObject({
+    source: "seerr",
+    id: issue.id,
+    type: issueTypeName(issue.issueType ?? issue.type),
+    category: issueTypeName(issue.issueType ?? issue.type),
+    status: seerrIssueStatus(issue),
+    subject: firstString(issue.subject, issue.message, comments[0]?.message),
+    reporter: summarizeUser(issue.createdBy ?? issue.user ?? issue.reportedBy, verbose),
+    modifiedBy: summarizeUser(issue.modifiedBy, verbose),
+    mediaTitle: mediaTitle(media),
+    mediaType: mediaType(media),
+    plexRatingKey: plexRatingKey(media),
+    media: verbose
+      ? compactObject({
+        id: media.id,
+        tmdbId: media.tmdbId,
+        tvdbId: media.tvdbId,
+        status: mediaStatusName(media.status),
+        mediaType: mediaType(media),
+        title: mediaTitle(media)
+      })
+      : undefined,
+    comments,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    resolvedAt: issue.resolvedAt,
+    rawStatus: verbose ? issue.status : undefined
+  });
+}
+
+function seerrIssueMatchesMediaType(issue, desired) {
+  if (!desired || desired === "all") {
+    return true;
+  }
+  return mediaType(issue.media ?? issue.mediaInfo) === desired;
+}
+
 function summarizeQueueRecord(record) {
   return compactObject({
     id: record.id,
@@ -380,6 +532,28 @@ function summarizeQueueRecord(record) {
 }
 
 function summarizeImportCandidate(candidate) {
+  const rejections = Array.isArray(candidate.rejections)
+    ? candidate.rejections.map(rejection => compactObject({
+      reason: rejection.reason,
+      type: rejection.type
+    }))
+    : [];
+  const episodeIds = Array.isArray(candidate.episodeIds)
+    ? candidate.episodeIds
+    : candidate.episodes?.map(episode => episode.id).filter(Boolean);
+  const hasTarget = Boolean(candidate.series?.id && episodeIds?.length) || Boolean(candidate.movie?.id ?? candidate.movieId);
+  const warnings = [];
+  if (!candidate.path) {
+    warnings.push("candidate is missing an exact file path");
+  }
+  if (!hasTarget) {
+    warnings.push("candidate is missing an exact target media match");
+  }
+  for (const rejection of rejections) {
+    if (rejection.reason) {
+      warnings.push(rejection.reason);
+    }
+  }
   return compactObject({
     id: candidate.id,
     path: candidate.path,
@@ -390,6 +564,9 @@ function summarizeImportCandidate(candidate) {
     seriesId: candidate.series?.id,
     seriesTitle: candidate.series?.title,
     tvdbId: candidate.series?.tvdbId,
+    movieId: candidate.movie?.id ?? candidate.movieId,
+    movieTitle: candidate.movie?.title,
+    tmdbId: candidate.movie?.tmdbId ?? candidate.tmdbId,
     seasonNumber: candidate.seasonNumber,
     episodes: Array.isArray(candidate.episodes)
       ? candidate.episodes.map(episode => compactObject({
@@ -402,9 +579,7 @@ function summarizeImportCandidate(candidate) {
         airDateUtc: episode.airDateUtc
       }))
       : undefined,
-    episodeIds: Array.isArray(candidate.episodeIds)
-      ? candidate.episodeIds
-      : candidate.episodes?.map(episode => episode.id).filter(Boolean),
+    episodeIds,
     episodeFileId: candidate.episodeFileId,
     releaseGroup: candidate.releaseGroup,
     quality: candidate.quality,
@@ -414,12 +589,9 @@ function summarizeImportCandidate(candidate) {
     customFormatScore: candidate.customFormatScore,
     indexerFlags: candidate.indexerFlags,
     releaseType: candidate.releaseType,
-    rejections: Array.isArray(candidate.rejections)
-      ? candidate.rejections.map(rejection => compactObject({
-        reason: rejection.reason,
-        type: rejection.type
-      }))
-      : undefined
+    safeToImport: Boolean(candidate.path && hasTarget && rejections.length === 0),
+    warnings,
+    rejections
   });
 }
 
@@ -495,32 +667,35 @@ async function removeArrQueueItems(serviceName, ids, options) {
   };
 }
 
-async function sonarrManualImportCandidates(input) {
+async function arrManualImportCandidates(serviceName, input) {
   let folder = input.path;
   let downloadId = input.downloadId;
-  let seriesId = input.seriesId;
+  let seriesId = serviceName === "sonarr" ? input.seriesId : undefined;
+  let movieId = serviceName === "radarr" ? input.movieId : undefined;
   let queueRecord = null;
 
   if (input.queueId) {
-    const records = await arrQueueDetails("sonarr");
+    const records = await arrQueueDetails(serviceName);
     queueRecord = records.find(record => record.id === input.queueId);
     if (!queueRecord) {
-      throw new Error(`sonarr queue item ${input.queueId} was not found`);
+      throw new Error(`${serviceName} queue item ${input.queueId} was not found`);
     }
     folder = folder || queueRecord.outputPath;
     downloadId = downloadId || queueRecord.downloadId;
     seriesId = seriesId || queueRecord.seriesId || queueRecord.series?.id;
+    movieId = movieId || queueRecord.movieId || queueRecord.movie?.id;
   }
 
   if (!folder) {
     throw new Error("path is required when queueId does not provide an outputPath");
   }
 
-  const candidates = await arrApi("sonarr", "v3", "manualimport", {
+  const candidates = await arrApi(serviceName, "v3", "manualimport", {
     query: {
       folder,
       downloadId,
       seriesId,
+      movieId,
       filterExistingFiles: input.filterExistingFiles
     }
   });
@@ -532,10 +707,19 @@ async function sonarrManualImportCandidates(input) {
       folder,
       downloadId,
       seriesId,
+      movieId,
       filterExistingFiles: input.filterExistingFiles
     }),
     ...limited
   };
+}
+
+async function sonarrManualImportCandidates(input) {
+  return arrManualImportCandidates("sonarr", input);
+}
+
+async function radarrManualImportCandidates(input) {
+  return arrManualImportCandidates("radarr", input);
 }
 
 function manualImportFile(input) {
@@ -543,6 +727,7 @@ function manualImportFile(input) {
     id: input.id,
     path: input.path,
     seriesId: input.seriesId,
+    movieId: input.movieId,
     seasonNumber: input.seasonNumber,
     episodeIds: input.episodeIds,
     quality: input.quality,
@@ -554,6 +739,34 @@ function manualImportFile(input) {
     indexerFlags: input.indexerFlags,
     releaseType: input.releaseType
   });
+}
+
+function manualImportWarnings(serviceName, files) {
+  const warnings = [];
+  for (const [index, file] of files.entries()) {
+    const label = file.path || `file ${index + 1}`;
+    if (!file.quality) {
+      warnings.push(`${label}: quality was not provided; use candidate output when possible`);
+    }
+    if (!file.languages?.length) {
+      warnings.push(`${label}: languages were not provided; use candidate output when possible`);
+    }
+    if (serviceName === "sonarr" && !file.episodeIds?.length) {
+      warnings.push(`${label}: episodeIds are required for an exact Sonarr import target`);
+    }
+    if (serviceName === "radarr" && !file.movieId) {
+      warnings.push(`${label}: movieId is required for an exact Radarr import target`);
+    }
+  }
+  return warnings;
+}
+
+function manualImportCommand(files, importMode) {
+  return {
+    name: "ManualImport",
+    importMode,
+    files: files.map(manualImportFile)
+  };
 }
 
 async function removeNzbgetHistory(ids, options) {
@@ -593,6 +806,294 @@ async function removeNzbgetHistory(ids, options) {
   };
 }
 
+function seerrIssueRecords(body) {
+  return Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [];
+}
+
+async function listSeerrIssues(input) {
+  const status = input.status || "open";
+  const body = await seerrApi("issue", {
+    query: {
+      take: input.take,
+      skip: input.skip,
+      sort: input.sort || "added",
+      filter: status === "all" ? "all" : status
+    }
+  });
+  const records = seerrIssueRecords(body)
+    .filter(issue => seerrIssueMatchesMediaType(issue, input.mediaType))
+    .map(issue => summarizeSeerrIssue(issue, input.verbose));
+  return compactObject({
+    source: "seerr",
+    status,
+    mediaType: input.mediaType || "all",
+    pageInfo: body?.pageInfo,
+    total: body?.pageInfo?.results ?? records.length,
+    returned: records.length,
+    records
+  });
+}
+
+async function getSeerrIssue(issueId, verbose = false) {
+  return summarizeSeerrIssue(await seerrApi(`issue/${issueId}`), verbose);
+}
+
+async function plexReportedIssues(input) {
+  if (input.source && !["all", "seerr"].includes(input.source)) {
+    throw new Error(`issue source ${input.source} is not supported`);
+  }
+  if (!configuredServices.seerr) {
+    return {
+      sources: [],
+      records: [],
+      returned: 0,
+      note: "Seerr-family issue source is not configured"
+    };
+  }
+  const issues = await listSeerrIssues(input);
+  return {
+    sources: ["seerr"],
+    ...issues
+  };
+}
+
+function tautulliTableRows(data) {
+  if (Array.isArray(data)) {
+    return data;
+  }
+  if (Array.isArray(data?.data)) {
+    return data.data;
+  }
+  if (Array.isArray(data?.rows)) {
+    return data.rows;
+  }
+  return [];
+}
+
+function summarizeTautulliActivity(data, limit = 25) {
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : tautulliTableRows(data);
+  const records = sessions.slice(0, limit).map(session => compactObject({
+    sessionKey: session.session_key ?? session.sessionKey,
+    sessionId: session.session_id ?? session.sessionId,
+    user: firstString(session.friendly_name, session.username, session.user),
+    title: firstString(session.full_title, session.title, session.grandparent_title),
+    mediaType: session.media_type,
+    state: session.state,
+    player: session.player,
+    product: session.product,
+    streamType: session.stream_type,
+    transcodeDecision: session.transcode_decision,
+    videoDecision: session.video_decision,
+    audioDecision: session.audio_decision,
+    progressPercent: session.progress_percent,
+    bandwidth: session.bandwidth,
+    location: session.location
+  }));
+  return {
+    streamCount: Number(data?.stream_count ?? data?.streamCount ?? records.length),
+    transcodeCount: Number(data?.transcode_stream_count ?? data?.transcodeCount ?? records.filter(record => record.transcodeDecision && record.transcodeDecision !== "direct play").length),
+    returned: records.length,
+    records
+  };
+}
+
+function summarizeTautulliHistory(data, limit = 25) {
+  const rows = tautulliTableRows(data);
+  const records = rows.slice(0, limit).map(row => compactObject({
+    rowId: row.id ?? row.row_id,
+    user: firstString(row.friendly_name, row.username, row.user),
+    title: firstString(row.full_title, row.title, row.grandparent_title),
+    mediaType: row.media_type,
+    watchedAt: row.date,
+    started: row.started,
+    stopped: row.stopped,
+    duration: row.duration,
+    pausedCounter: row.paused_counter,
+    platform: row.platform,
+    player: row.player,
+    transcodeDecision: row.transcode_decision,
+    location: row.location
+  }));
+  return {
+    total: data?.recordsTotal ?? data?.total ?? rows.length,
+    returned: records.length,
+    records
+  };
+}
+
+async function tautulliIssueContext(issue) {
+  if (!configuredServices.tautulli) {
+    return { configured: false };
+  }
+  const title = mediaTitle(issue.media ?? issue.mediaInfo);
+  try {
+    const [activity, history] = await Promise.all([
+      tautulliApi("get_activity"),
+      tautulliApi("get_history", { query: compactObject({ length: 10, search: title }) })
+    ]);
+    return {
+      configured: true,
+      activity: summarizeTautulliActivity(activity, 10),
+      history: summarizeTautulliHistory(history, 10)
+    };
+  } catch (error) {
+    return { configured: true, error: error.message };
+  }
+}
+
+async function plexIssueDetails(input) {
+  if (input.source !== "seerr") {
+    throw new Error(`issue source ${input.source} is not supported`);
+  }
+  const rawIssue = await seerrApi(`issue/${input.issueId}`);
+  return {
+    issue: summarizeSeerrIssue(rawIssue, input.verbose),
+    tautulli: await tautulliIssueContext(rawIssue)
+  };
+}
+
+function arrQueueProblem(record) {
+  const statusMessages = Array.isArray(record.statusMessages)
+    ? record.statusMessages.flatMap(message => [message.title, ...(message.messages || [])]).join(" ")
+    : "";
+  const text = [
+    record.status,
+    record.trackedDownloadStatus,
+    record.trackedDownloadState,
+    record.errorMessage,
+    statusMessages
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /warning|error|fail|blocked|import|stalled|unavailable/.test(text);
+}
+
+async function arrQueueOverview(serviceName) {
+  const records = await arrQueueDetails(serviceName);
+  const problemRecords = records.filter(arrQueueProblem);
+  return {
+    queueCount: records.length,
+    blockedOrImportFailedCount: problemRecords.length,
+    records: problemRecords.slice(0, 10).map(summarizeQueueRecord)
+  };
+}
+
+function nzbgetHistoryProblem(record) {
+  const status = String(record.Status || record.status || "").toLowerCase();
+  return status && !/success|completed/.test(status);
+}
+
+async function nzbgetOverview() {
+  const [groups, history] = await Promise.all([
+    nzbgetRpc("listgroups"),
+    nzbgetRpc("history")
+  ]);
+  const queue = Array.isArray(groups) ? groups : [];
+  const records = Array.isArray(history) ? history : [];
+  const failed = records.filter(nzbgetHistoryProblem);
+  return {
+    activeQueueCount: queue.length,
+    failedHistoryCount: failed.length,
+    failedHistory: failed.slice(0, 10).map(summarizeNzbgetHistory)
+  };
+}
+
+async function qbittorrentOverview() {
+  const torrents = await qbitRequest("torrents/info");
+  const records = Array.isArray(torrents) ? torrents : [];
+  const problemRecords = records.filter(torrent => /error|missing|stalled/.test(String(torrent.state || "").toLowerCase()));
+  return {
+    torrentCount: records.length,
+    erroredOrStalledCount: problemRecords.length,
+    records: problemRecords.slice(0, 10).map(torrent => compactObject({
+      hash: torrent.hash,
+      name: torrent.name,
+      state: torrent.state,
+      progress: torrent.progress,
+      category: torrent.category
+    }))
+  };
+}
+
+function plexSessionRecords(body) {
+  const metadata = body?.MediaContainer?.Metadata;
+  return Array.isArray(metadata) ? metadata : [];
+}
+
+function plexTranscodeErrorSummary(records) {
+  const transcodeSessions = records.map(record => record.TranscodeSession).filter(Boolean);
+  const errorRecords = transcodeSessions.filter(session => Object.entries(session)
+    .some(([key, value]) => key.toLowerCase().includes("error") && value));
+  if (!errorRecords.length) {
+    return {
+      status: "unavailable",
+      note: "Plex session metadata did not expose active transcode error fields"
+    };
+  }
+  return { count: errorRecords.length };
+}
+
+async function plexOverview() {
+  const sessions = await plexApi("status/sessions");
+  const records = plexSessionRecords(sessions);
+  return {
+    activeStreamCount: records.length,
+    activeTranscodeCount: records.filter(record => record.TranscodeSession).length,
+    transcodeErrors: plexTranscodeErrorSummary(records)
+  };
+}
+
+async function seerrOverview() {
+  const [issueCounts, pendingRequests] = await Promise.all([
+    seerrApi("issue/count"),
+    seerrApi("request", { query: { take: 1, skip: 0, filter: "pending" } })
+  ]);
+  return {
+    openIssueCount: issueCounts.open ?? issueCounts.openIssues ?? 0,
+    resolvedIssueCount: issueCounts.closed ?? issueCounts.resolved ?? 0,
+    pendingRequestCount: pendingRequests?.pageInfo?.results ?? pendingRequests?.results?.length ?? 0
+  };
+}
+
+async function tautulliOverview() {
+  const [activity, history] = await Promise.all([
+    tautulliApi("get_activity"),
+    tautulliApi("get_history", { query: { length: 10 } })
+  ]);
+  return {
+    activity: summarizeTautulliActivity(activity, 10),
+    history: summarizeTautulliHistory(history, 10)
+  };
+}
+
+async function mediaAdminOverview() {
+  const [
+    sonarr,
+    radarr,
+    nzbget,
+    qbittorrent,
+    plex,
+    seerr,
+    tautulli
+  ] = await Promise.all([
+    serviceResult("sonarr", () => arrQueueOverview("sonarr")),
+    serviceResult("radarr", () => arrQueueOverview("radarr")),
+    serviceResult("nzbget", nzbgetOverview),
+    serviceResult("qbittorrent", qbittorrentOverview),
+    serviceResult("plex", plexOverview),
+    serviceResult("seerr", seerrOverview),
+    serviceResult("tautulli", tautulliOverview)
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    sonarr,
+    radarr,
+    nzbget,
+    qbittorrent,
+    plex,
+    seerr,
+    tautulli
+  };
+}
+
 async function serviceStatus(name) {
   try {
     switch (name) {
@@ -612,6 +1113,8 @@ async function serviceStatus(name) {
         return { configured: true, status: await nzbgetRpc("status") };
       case "seerr":
         return { configured: true, status: await seerrApi("status") };
+      case "tautulli":
+        return { configured: true, status: await tautulliApi("server_status") };
       default:
         return { configured: false };
     }
@@ -628,7 +1131,7 @@ function createServer() {
 
   server.registerTool("media_services_status", {
     title: "Media Services Status",
-    description: "Check configured Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family services."
+    description: "Check configured Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, Seerr-family, and Tautulli services."
   }, async () => {
     const entries = await Promise.all(Object.entries(configuredServices).map(async ([name, config]) => {
       if (!config) {
@@ -638,6 +1141,11 @@ function createServer() {
     }));
     return jsonText(Object.fromEntries(entries));
   });
+
+  server.registerTool("media_admin_overview", {
+    title: "Media Admin Overview",
+    description: "Return compact actionable counts for queues, download clients, Plex streams, and Seerr issues/requests."
+  }, async () => jsonText(await mediaAdminOverview()));
 
   server.registerTool("plex_status", {
     title: "Plex Status",
@@ -686,6 +1194,64 @@ function createServer() {
     title: "Plex Active Sessions",
     description: "List active Plex playback sessions."
   }, async () => jsonText(await plexApi("status/sessions")));
+
+  server.registerTool("plex_reported_issues", {
+    title: "Plex Reported Issues",
+    description: "List normalized user-reported Plex/media issues from configured issue sources.",
+    inputSchema: {
+      status: z.enum(["open", "resolved", "all"]).default("open"),
+      source: z.enum(["all", "seerr"]).default("all"),
+      take: z.number().int().min(1).max(100).default(50),
+      skip: z.number().int().min(0).default(0),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await plexReportedIssues({ ...input, mediaType: "all" })));
+
+  server.registerTool("plex_recent_user_reports", {
+    title: "Plex Recent User Reports",
+    description: "List recent normalized user issue reports across configured issue sources.",
+    inputSchema: {
+      take: z.number().int().min(1).max(100).default(50),
+      skip: z.number().int().min(0).default(0),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await plexReportedIssues({
+    ...input,
+    status: "all",
+    source: "all",
+    mediaType: "all",
+    sort: "modified"
+  })));
+
+  server.registerTool("plex_issue_details", {
+    title: "Plex Issue Details",
+    description: "Get normalized issue details and optional Tautulli playback context for a reported Plex/media issue.",
+    inputSchema: {
+      source: z.enum(["seerr"]).default("seerr"),
+      issueId: z.number().int().positive(),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await plexIssueDetails(input)));
+
+  server.registerTool("tautulli_activity", {
+    title: "Tautulli Activity",
+    description: "Summarize current Tautulli/Plex activity when Tautulli is configured.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async ({ limit }) => jsonText(summarizeTautulliActivity(await tautulliApi("get_activity"), limit)));
+
+  server.registerTool("tautulli_history", {
+    title: "Tautulli History",
+    description: "Summarize recent Tautulli playback history when Tautulli is configured.",
+    inputSchema: {
+      start: z.number().int().min(0).default(0),
+      length: z.number().int().min(1).max(100).default(25),
+      search: z.string().optional()
+    }
+  }, async ({ start, length, search }) => jsonText(summarizeTautulliHistory(await tautulliApi("get_history", {
+    query: { start, length, search }
+  }), length)));
 
   server.registerTool("bazarr_status", {
     title: "Bazarr Status",
@@ -854,20 +1420,21 @@ function createServer() {
       dryRun: z.boolean().default(true)
     }
   }, async ({ files, importMode, dryRun }) => {
-    const command = {
-      name: "ManualImport",
-      importMode,
-      files: files.map(manualImportFile)
-    };
+    const command = manualImportCommand(files, importMode);
+    const warnings = manualImportWarnings("sonarr", files);
     if (dryRun) {
       return jsonText({
         dryRun: true,
+        service: "sonarr",
         command,
+        warnings,
         note: "Set dryRun to false to queue this Sonarr ManualImport command."
       });
     }
     return jsonText({
       dryRun: false,
+      service: "sonarr",
+      warnings,
       command: await arrApi("sonarr", "v3", "command", { method: "POST", body: command })
     });
   });
@@ -959,6 +1526,65 @@ function createServer() {
     }
   }, async (input) => {
     return jsonText(await removeArrQueueItems("radarr", input.ids, input));
+  });
+
+  server.registerTool("radarr_manual_import_candidates", {
+    title: "Radarr Manual Import Candidates",
+    description: "Find Radarr manual import candidates for an exact queue item ID or path.",
+    inputSchema: {
+      queueId: z.number().int().positive().optional(),
+      path: z.string().min(1).optional(),
+      downloadId: z.string().min(1).optional(),
+      movieId: z.number().int().positive().optional(),
+      filterExistingFiles: z.boolean().default(true),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async (input) => {
+    if (!input.queueId && !input.path) {
+      throw new Error("queueId or path is required");
+    }
+    return jsonText(await radarrManualImportCandidates(input));
+  });
+
+  server.registerTool("radarr_manual_import", {
+    title: "Radarr Manual Import",
+    description: "Import exact Radarr manual import candidate files. Dry-run is enabled by default and returns the command that would be queued.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      files: z.array(z.object({
+        id: z.number().int().positive().optional(),
+        path: z.string().min(1),
+        movieId: z.number().int().positive(),
+        quality: z.any().optional(),
+        languages: z.array(z.any()).optional(),
+        releaseGroup: z.string().optional(),
+        downloadId: z.string().optional(),
+        customFormats: z.array(z.any()).optional(),
+        customFormatScore: z.number().int().optional(),
+        indexerFlags: z.number().int().optional(),
+        releaseType: z.string().optional()
+      })).min(1),
+      importMode: z.string().min(1).default("move"),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ files, importMode, dryRun }) => {
+    const command = manualImportCommand(files, importMode);
+    const warnings = manualImportWarnings("radarr", files);
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        service: "radarr",
+        command,
+        warnings,
+        note: "Set dryRun to false to queue this Radarr ManualImport command."
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      service: "radarr",
+      warnings,
+      command: await arrApi("radarr", "v3", "command", { method: "POST", body: command })
+    });
   });
 
   server.registerTool("radarr_profiles", {
@@ -1054,6 +1680,19 @@ function createServer() {
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => jsonText(limitList(await nzbgetRpc("history"), limit)));
 
+  server.registerTool("nzbget_remove_history_items", {
+    title: "NZBGet Remove History Items",
+    description: "Remove exact NZBGet history NZBID values. Dry-run is enabled by default and reports the matched history records.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      ids: z.array(z.number().int().positive()).min(1),
+      deleteFiles: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ ids, deleteFiles, dryRun }) => {
+    return jsonText(await removeNzbgetHistory(ids, { deleteFiles, dryRun }));
+  });
+
   server.registerTool("download_client_remove_history", {
     title: "Download Client Remove History",
     description: "Remove exact NZBGet history NZBID values. Dry-run is enabled by default and reports the matched history records.",
@@ -1091,6 +1730,146 @@ function createServer() {
       page: z.number().int().min(1).default(1)
     }
   }, async ({ query, page }) => jsonText(await seerrApi("search", { query: { query, page } })));
+
+  server.registerTool("seerr_list_issues", {
+    title: "Seerr List Issues",
+    description: "List Seerr-family user-reported issues without exposing user emails by default.",
+    inputSchema: {
+      take: z.number().int().min(1).max(100).default(50),
+      skip: z.number().int().min(0).default(0),
+      status: z.enum(["open", "resolved", "all"]).default("open"),
+      mediaType: z.enum(["movie", "tv", "all"]).default("all"),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await listSeerrIssues(input)));
+
+  server.registerTool("seerr_issue_details", {
+    title: "Seerr Issue Details",
+    description: "Get normalized Seerr-family issue details by exact issue ID.",
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, verbose }) => jsonText(await getSeerrIssue(issueId, verbose)));
+
+  server.registerTool("seerr_add_issue_comment", {
+    title: "Seerr Add Issue Comment",
+    description: "Add a comment to an exact Seerr-family issue ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      message: z.string().min(1),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, message, dryRun, verbose }) => {
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        wouldAddComment: { issueId, message },
+        issue: await getSeerrIssue(issueId, verbose)
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      issue: summarizeSeerrIssue(await seerrApi(`issue/${issueId}/comment`, { method: "POST", body: { message } }), verbose)
+    });
+  });
+
+  server.registerTool("seerr_update_issue_comment", {
+    title: "Seerr Update Issue Comment",
+    description: "Update an exact Seerr-family issue comment ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      commentId: z.number().int().positive(),
+      message: z.string().min(1),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ commentId, message, dryRun, verbose }) => {
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        wouldUpdateComment: { commentId, message },
+        currentComment: summarizeIssueComment(await seerrApi(`issueComment/${commentId}`), verbose)
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      comment: summarizeIssueComment(await seerrApi(`issueComment/${commentId}`, { method: "PUT", body: { message } }), verbose)
+    });
+  });
+
+  server.registerTool("seerr_resolve_issue", {
+    title: "Seerr Resolve Issue",
+    description: "Resolve an exact Seerr-family issue ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, dryRun, verbose }) => {
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        wouldSetStatus: "resolved",
+        issue: await getSeerrIssue(issueId, verbose)
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      issue: summarizeSeerrIssue(await seerrApi(`issue/${issueId}/resolved`, { method: "POST" }), verbose)
+    });
+  });
+
+  server.registerTool("seerr_reopen_issue", {
+    title: "Seerr Reopen Issue",
+    description: "Reopen an exact Seerr-family issue ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, dryRun, verbose }) => {
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        wouldSetStatus: "open",
+        issue: await getSeerrIssue(issueId, verbose)
+      });
+    }
+    return jsonText({
+      dryRun: false,
+      issue: summarizeSeerrIssue(await seerrApi(`issue/${issueId}/open`, { method: "POST" }), verbose)
+    });
+  });
+
+  server.registerTool("seerr_delete_issue", {
+    title: "Seerr Delete Issue",
+    description: "Delete an exact Seerr-family issue ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, dryRun, verbose }) => {
+    if (dryRun) {
+      return jsonText({
+        dryRun: true,
+        wouldDeleteIssueId: issueId,
+        issue: await getSeerrIssue(issueId, verbose)
+      });
+    }
+    await seerrApi(`issue/${issueId}`, { method: "DELETE" });
+    return jsonText({
+      dryRun: false,
+      deletedIssueId: issueId,
+      deleted: true
+    });
+  });
 
   server.registerTool("seerr_list_requests", {
     title: "Seerr List Requests",

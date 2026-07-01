@@ -30,7 +30,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
-- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
 - `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
 
@@ -179,15 +179,16 @@ ssh -t unraid-codex codex login
 
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
-- Shared: configured service status.
-- Sonarr: list, lookup, add series, queue, quality profiles, and root folders.
-- Radarr: list, lookup, add movies, queue, quality profiles, and root folders.
-- Plex: server status, libraries, library items, search, metadata, and active sessions.
+- Shared: configured service status and compact media admin overview.
+- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, quality profiles, and root folders.
+- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, quality profiles, and root folders.
+- Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
+- Tautulli: current activity and playback history diagnostics.
 - Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, and subtitle history.
 - Prowlarr: list indexers and search.
 - qBittorrent: list torrents, pause or resume selected hashes, and delete selected hashes with explicit optional file deletion.
-- NZBGet: status, queue, history, pause or resume downloads, and set rate limits.
-- Seerr, Overseerr, or Jellyseerr: search media, list requests, request media, and approve, decline, or delete requests.
+- NZBGet: status, queue, history, guarded history removal, pause or resume downloads, and set rate limits.
+- Seerr, Overseerr, or Jellyseerr: search media, list/manage requests, and list/comment/resolve/reopen/delete reported issues.
 
 Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories.
 
@@ -311,7 +312,7 @@ Unraid acceptance:
 - Never mount `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Use only narrow read-only diagnostic mounts.
 - Keep the Unraid API key only in the MCP sidecar.
-- Keep Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
+- Keep Sonarr, Radarr, Plex, Tautulli, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
 - Keep Scrutiny endpoints only in the optional utilities MCP sidecar.
 - MCP sidecars require bearer-token auth; do not add host port mappings for MCP.
 - The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.

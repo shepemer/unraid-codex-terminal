@@ -134,6 +134,8 @@ services:
       SEERR_API_KEY: ${SEERR_API_KEY:-}
       PLEX_URL: ${PLEX_URL:-}
       PLEX_TOKEN: ${PLEX_TOKEN:-}
+      TAUTULLI_URL: ${TAUTULLI_URL:-}
+      TAUTULLI_API_KEY: ${TAUTULLI_API_KEY:-}
       BAZARR_URL: ${BAZARR_URL:-}
       BAZARR_API_KEY: ${BAZARR_API_KEY:-}
     networks:
