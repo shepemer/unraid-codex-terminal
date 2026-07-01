@@ -50,11 +50,14 @@ services:
       CODEX_UPDATE_ON_START: ${CODEX_UPDATE_ON_START:-true}
       CODEX_NPM_VERSION: ${CODEX_NPM_VERSION:-latest}
       CODEX_UPDATE_ON_START_TIMEOUT: ${CODEX_UPDATE_ON_START_TIMEOUT:-180}
+      CODEX_MEDIA_PATH_MAPS: ${CODEX_MEDIA_PATH_MAPS:-}
     volumes:
       - ${CODEX_CONFIG_DIR:-./data/codex-terminal}:/config:rw
       # Optional diagnostic mounts. Keep them read-only and narrow.
       # - /var/log:/mnt/unraid/logs:ro
       # - /boot/config/plugins/dockerMan/templates-user:/mnt/unraid/docker-templates:ro
+      # - ${CODEX_MEDIA_LIBRARY_DIR:-/mnt/user/media}:/mnt/unraid/media:ro
+      # - ${CODEX_DOWNLOADS_DIR:-/mnt/user/downloads}:/mnt/unraid/downloads:ro
     networks:
       - codex-mgmt
     depends_on:
@@ -134,6 +137,10 @@ services:
       SEERR_API_KEY: ${SEERR_API_KEY:-}
       PLEX_URL: ${PLEX_URL:-}
       PLEX_TOKEN: ${PLEX_TOKEN:-}
+      TAUTULLI_URL: ${TAUTULLI_URL:-}
+      TAUTULLI_API_KEY: ${TAUTULLI_API_KEY:-}
+      TRACEARR_URL: ${TRACEARR_URL:-}
+      TRACEARR_API_KEY: ${TRACEARR_API_KEY:-}
       BAZARR_URL: ${BAZARR_URL:-}
       BAZARR_API_KEY: ${BAZARR_API_KEY:-}
     networks:

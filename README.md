@@ -18,7 +18,7 @@ For full configuration, validation, local development, and security notes, see [
 
 - `codex-terminal`: SSH on container port `2222`, WebUI on `7681`, Codex CLI, persistent `/config`, and `/workspace`.
 - `unraid-mcp`: internal HTTP MCP sidecar for Unraid API access.
-- `media-mcp`: optional internal HTTP MCP sidecar for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-mcp`: optional internal HTTP MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
 - `utilities-mcp`: optional internal HTTP MCP sidecar for Scrutiny storage health monitoring.
 - `codex-mgmt`: private Docker bridge network shared by the containers.
 
@@ -51,6 +51,8 @@ For full configuration, validation, local development, and security notes, see [
    - same `UNRAID_MCP_BEARER_TOKEN` used by `unraid-mcp`
    - at least one public key in `SSH_AUTHORIZED_KEYS`
    - strong `WEBUI_PASSWORD`
+
+   Optional: add narrow read-only media/download diagnostics mounts on `codex-terminal` and set `CODEX_MEDIA_PATH_MAPS` so agents can use `media-path-check --json` for path troubleshooting.
 
 5. Optional: install `media-mcp` on the same network.
 
@@ -111,6 +113,7 @@ The WebUI attaches to a persistent `tmux` session and starts Codex automatically
 - Use SSH keys when possible.
 - Keep `WEBUI_AUTH=true` and use a strong `WEBUI_PASSWORD`.
 - Never mount `/var/run/docker.sock`, `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
+- Keep optional media/download diagnostics mounts narrow, read-only, and on `codex-terminal` only.
 - Use a scoped Unraid API key, not an unrestricted admin key.
 - Keep media app API keys only on `media-mcp`, and enable only the services you want Codex to manage.
 - Keep Scrutiny endpoints only on `utilities-mcp`, and do not expose MCP sidecar ports to the host.

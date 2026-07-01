@@ -8,7 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
   <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
-  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
+  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
   <Category>Tools:</Category>
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/media-mcp.xml</TemplateURL>
@@ -27,6 +27,10 @@
   <Config Name="Radarr API Key" Target="RADARR_API_KEY" Default="" Mode="" Description="Radarr Settings &gt; General API key. Required when Radarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="Plex URL" Target="PLEX_URL" Default="" Mode="" Description="Plex base URL. Leave blank to disable Plex tools." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Plex Token" Target="PLEX_TOKEN" Default="" Mode="" Description="Plex token. Required when Plex URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Tautulli URL" Target="TAUTULLI_URL" Default="" Mode="" Description="Tautulli base URL. Leave blank to disable Tautulli diagnostics." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Tautulli API Key" Target="TAUTULLI_API_KEY" Default="" Mode="" Description="Tautulli API key. Required when Tautulli URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Tracearr URL" Target="TRACEARR_URL" Default="" Mode="" Description="Tracearr base URL. Leave blank to disable Tracearr read-only diagnostics." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Tracearr API Key" Target="TRACEARR_API_KEY" Default="" Mode="" Description="Tracearr public API key. Required when Tracearr URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Bazarr URL" Target="BAZARR_URL" Default="" Mode="" Description="Bazarr base URL. Leave blank to disable Bazarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Bazarr API Key" Target="BAZARR_API_KEY" Default="" Mode="" Description="Bazarr API key. Required when Bazarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="Prowlarr URL" Target="PROWLARR_URL" Default="" Mode="" Description="Prowlarr base URL. Leave blank to disable Prowlarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>

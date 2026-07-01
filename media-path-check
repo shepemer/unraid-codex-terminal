@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec node - "$@" <<'NODE'
+const fs = require("fs");
+
+function usage() {
+  console.error("usage: media-path-check [--json] <path...>");
+  process.exit(2);
+}
+
+function normalizeMapPath(value) {
+  if (!value) return "";
+  if (value.length > 1) return value.replace(/\/+$/, "");
+  return value;
+}
+
+function parsePathMaps(value) {
+  const maps = [];
+  const invalid = [];
+  for (const part of String(value || "").split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) {
+      invalid.push(trimmed);
+      continue;
+    }
+    const from = normalizeMapPath(trimmed.slice(0, separator).trim());
+    const to = normalizeMapPath(trimmed.slice(separator + 1).trim());
+    if (!from.startsWith("/") || !to.startsWith("/")) {
+      invalid.push(trimmed);
+      continue;
+    }
+    maps.push({ from, to });
+  }
+  return { maps, invalid };
+}
+
+function mapPath(input, from, to) {
+  if (input === from) return to;
+  if (input.startsWith(`${from}/`)) return `${to}${input.slice(from.length)}`;
+  return null;
+}
+
+function readable(path) {
+  try {
+    fs.accessSync(path, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function statCandidate(kind, path, via) {
+  let lstat;
+  try {
+    lstat = fs.lstatSync(path);
+  } catch (error) {
+    return {
+      kind,
+      path,
+      via,
+      exists: false,
+      readable: false,
+      error: error.code || error.message
+    };
+  }
+
+  let stat = lstat;
+  if (lstat.isSymbolicLink()) {
+    try {
+      stat = fs.statSync(path);
+    } catch {
+      stat = lstat;
+    }
+  }
+
+  let type = "other";
+  if (lstat.isSymbolicLink()) type = "symlink";
+  else if (stat.isDirectory()) type = "directory";
+  else if (stat.isFile()) type = "file";
+
+  return {
+    kind,
+    path,
+    via,
+    exists: true,
+    type,
+    symlink: lstat.isSymbolicLink(),
+    readable: readable(path),
+    size: stat.size,
+    mode: `0${(stat.mode & 0o7777).toString(8)}`,
+    uid: stat.uid,
+    gid: stat.gid,
+    mtime: stat.mtime.toISOString()
+  };
+}
+
+let args = process.argv.slice(2);
+let json = false;
+if (args[0] === "--json") {
+  json = true;
+  args = args.slice(1);
+}
+if (args[0] === "--help" || args[0] === "-h" || args.length === 0) {
+  usage();
+}
+
+const { maps, invalid } = parsePathMaps(process.env.CODEX_MEDIA_PATH_MAPS);
+const results = args.map(input => {
+  const candidates = [{ kind: "input", path: input }];
+  for (const mapping of maps) {
+    const forward = mapPath(input, mapping.from, mapping.to);
+    if (forward) {
+      candidates.push({ kind: "mapped", path: forward, via: `${mapping.from}=${mapping.to}` });
+    }
+    const reverse = mapPath(input, mapping.to, mapping.from);
+    if (reverse) {
+      candidates.push({ kind: "mapped", path: reverse, via: `${mapping.to}=${mapping.from}` });
+    }
+  }
+  const seen = new Set();
+  return {
+    input,
+    candidates: candidates
+      .filter(candidate => {
+        if (seen.has(candidate.path)) return false;
+        seen.add(candidate.path);
+        return true;
+      })
+      .map(candidate => statCandidate(candidate.kind, candidate.path, candidate.via))
+  };
+});
+
+const payload = {
+  generatedAt: new Date().toISOString(),
+  pathMaps: maps,
+  invalidPathMaps: invalid,
+  results
+};
+
+if (json) {
+  console.log(JSON.stringify(payload, null, 2));
+} else {
+  for (const result of payload.results) {
+    console.log(result.input);
+    for (const candidate of result.candidates) {
+      const status = candidate.exists ? `${candidate.type}, readable=${candidate.readable}` : `missing (${candidate.error})`;
+      const via = candidate.via ? ` via ${candidate.via}` : "";
+      console.log(`  ${candidate.kind}: ${candidate.path}${via} - ${status}`);
+    }
+  }
+}
+NODE

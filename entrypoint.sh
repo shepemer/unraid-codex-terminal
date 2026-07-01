@@ -109,6 +109,7 @@ run_as_codex() {
     MEDIA_MCP_BEARER_TOKEN="${MEDIA_MCP_BEARER_TOKEN:-}" \
     UTILITIES_MCP_URL="${UTILITIES_MCP_URL}" \
     UTILITIES_MCP_BEARER_TOKEN="${UTILITIES_MCP_BEARER_TOKEN:-}" \
+    CODEX_MEDIA_PATH_MAPS="${CODEX_MEDIA_PATH_MAPS:-}" \
     PATH="${CODEX_ENV_PATH}" \
     "$@"
 }
@@ -146,6 +147,11 @@ validate_runtime_env() {
   if [ -n "${UTILITIES_MCP_BEARER_TOKEN:-}" ]; then
     case "${UTILITIES_MCP_BEARER_TOKEN}" in
       *[[:space:]]*) die "UTILITIES_MCP_BEARER_TOKEN must not contain whitespace" ;;
+    esac
+  fi
+  if [ -n "${CODEX_MEDIA_PATH_MAPS:-}" ]; then
+    case "${CODEX_MEDIA_PATH_MAPS}" in
+      *$'\n'*|*$'\r'*) die "CODEX_MEDIA_PATH_MAPS must not contain newlines" ;;
     esac
   fi
 }
@@ -233,6 +239,7 @@ export XDG_DATA_HOME=$(shell_quote "${CONFIG_DIR}/local/share")
 export UNRAID_MCP_URL=$(shell_quote "${MCP_URL}")
 export MEDIA_MCP_URL=$(shell_quote "${MEDIA_MCP_URL}")
 export UTILITIES_MCP_URL=$(shell_quote "${UTILITIES_MCP_URL}")
+export CODEX_MEDIA_PATH_MAPS=$(shell_quote "${CODEX_MEDIA_PATH_MAPS:-}")
 export PATH=$(shell_quote "${CODEX_ENV_PATH}")
 EOF
 if [ -n "${UNRAID_MCP_BEARER_TOKEN:-}" ]; then
@@ -266,11 +273,12 @@ if [ ! -s "${CONFIG_DIR}/workspace/AGENTS.md" ]; then
 - Do not request or use SSH access to the Unraid host.
 - Do not request or use access to `/var/run/docker.sock`.
 - Use the configured Unraid MCP server for Unraid management.
-- Use the configured media MCP server for Sonarr, Radarr, Plex, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation when present.
+- Use the configured media MCP server for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation when present.
 - Use the configured utilities MCP server for Scrutiny monitoring when present.
 - Ask for explicit user confirmation before array start or stop, correcting parity checks, VM force stop or reset, container deletes, plugin changes, API key changes, flash backup, network settings changes, and destructive notification archive or delete actions.
 - Summarize logs. Do not print secrets, bearer tokens, API keys, cookies, passwords, or session values.
 - Treat `/mnt/unraid/*` diagnostic mounts as read-only inspection surfaces.
+- Use `media-path-check --json <path...>` for read-only media and download path diagnosis when optional path maps or `/mnt/unraid` mounts are configured.
 EOF
   chown codex:codex "${CONFIG_DIR}/workspace/AGENTS.md"
   chmod 0644 "${CONFIG_DIR}/workspace/AGENTS.md"
