@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { spawn } from "node:child_process";
+import { readdir } from "node:fs/promises";
+import nodePath from "node:path";
 import * as z from "zod/v4";
 
 const env = process.env;
@@ -384,6 +387,62 @@ function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
 }
 
+function decodeHtmlEntities(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&#([0-9]+);/g, (_, code) => String.fromCodePoint(Number.parseInt(code, 10)));
+}
+
+function decodedField(value) {
+  const display = decodeHtmlEntities(value);
+  return compactObject({
+    value: display,
+    raw: typeof value === "string" && value !== display ? value : undefined
+  });
+}
+
+function cleanPath(value) {
+  const decoded = decodeHtmlEntities(value || "");
+  return decoded.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function pathInside(parent, candidate) {
+  const cleanParent = cleanPath(parent);
+  const cleanCandidate = cleanPath(candidate);
+  if (!cleanParent || !cleanCandidate) {
+    return false;
+  }
+  return cleanCandidate === cleanParent || cleanCandidate.startsWith(`${cleanParent}/`);
+}
+
+function likelyLibraryPath(serviceName, pathValue) {
+  const clean = cleanPath(pathValue).toLowerCase();
+  if (serviceName === "sonarr") {
+    return clean === "/tv" || clean.startsWith("/tv/");
+  }
+  if (serviceName === "radarr") {
+    return clean === "/movies" || clean.startsWith("/movies/");
+  }
+  return false;
+}
+
+function pathDisplay(value) {
+  const decoded = decodedField(value);
+  return compactObject({
+    path: decoded.value,
+    pathRaw: decoded.raw,
+    pathDisplay: decoded.value
+  });
+}
+
 async function serviceResult(name, fn) {
   if (!configuredServices[name]) {
     return { configured: false };
@@ -519,9 +578,12 @@ function seerrIssueMatchesMediaType(issue, desired) {
 }
 
 function summarizeQueueRecord(record) {
+  const title = decodedField(record.title);
+  const outputPath = decodedField(record.outputPath);
   return compactObject({
     id: record.id,
-    title: record.title,
+    title: title.value,
+    titleRaw: title.raw,
     seriesId: record.seriesId ?? record.series?.id,
     seriesTitle: record.series?.title,
     movieId: record.movieId ?? record.movie?.id,
@@ -536,21 +598,39 @@ function summarizeQueueRecord(record) {
     protocol: record.protocol,
     downloadClient: record.downloadClient,
     indexer: record.indexer,
-    outputPath: record.outputPath,
+    outputPath: outputPath.value,
+    outputPathRaw: outputPath.raw,
+    outputPathDisplay: outputPath.value,
     size: record.size,
     sizeLeft: record.sizeLeft ?? record.sizeleft,
     timeLeft: record.timeLeft ?? record.timeleft,
     estimatedCompletionTime: record.estimatedCompletionTime,
     statusMessages: Array.isArray(record.statusMessages)
       ? record.statusMessages.map(message => compactObject({
-        title: message.title,
-        messages: message.messages
+        title: decodeHtmlEntities(message.title),
+        titleRaw: message.title !== decodeHtmlEntities(message.title) ? message.title : undefined,
+        messages: Array.isArray(message.messages) ? message.messages.map(decodeHtmlEntities) : message.messages
       }))
       : undefined
   });
 }
 
-function summarizeImportCandidate(candidate) {
+function summarizeQueueList(value, limit) {
+  const max = Math.max(1, Math.min(Number(limit || 50), 250));
+  if (Array.isArray(value)) {
+    return { total: value.length, returned: Math.min(value.length, max), records: value.slice(0, max).map(summarizeQueueRecord) };
+  }
+  if (value && Array.isArray(value.records)) {
+    return {
+      ...value,
+      totalRecords: value.totalRecords ?? value.records.length,
+      records: value.records.slice(0, max).map(summarizeQueueRecord)
+    };
+  }
+  return value;
+}
+
+function summarizeImportCandidate(candidate, options = {}) {
   const rejections = Array.isArray(candidate.rejections)
     ? candidate.rejections.map(rejection => compactObject({
       reason: rejection.reason,
@@ -573,11 +653,19 @@ function summarizeImportCandidate(candidate) {
       warnings.push(rejection.reason);
     }
   }
+  if (options.expectedFolder && candidate.path && !pathInside(options.expectedFolder, candidate.path)) {
+    warnings.push(`candidate path is outside expected queue folder ${decodeHtmlEntities(options.expectedFolder)}`);
+  }
+  const pathInfo = pathDisplay(candidate.path);
+  const relativePath = decodedField(candidate.relativePath);
+  const folderName = decodedField(candidate.folderName);
   return compactObject({
     id: candidate.id,
-    path: candidate.path,
-    relativePath: candidate.relativePath,
-    folderName: candidate.folderName,
+    ...pathInfo,
+    relativePath: relativePath.value,
+    relativePathRaw: relativePath.raw,
+    folderName: folderName.value,
+    folderNameRaw: folderName.raw,
     name: candidate.name,
     size: candidate.size,
     seriesId: candidate.series?.id,
@@ -608,7 +696,7 @@ function summarizeImportCandidate(candidate) {
     customFormatScore: candidate.customFormatScore,
     indexerFlags: candidate.indexerFlags,
     releaseType: candidate.releaseType,
-    safeToImport: Boolean(candidate.path && hasTarget && rejections.length === 0),
+    safeToImport: Boolean(candidate.path && hasTarget && rejections.length === 0 && (!options.expectedFolder || pathInside(options.expectedFolder, candidate.path))),
     warnings,
     rejections
   });
@@ -629,9 +717,391 @@ function summarizeNzbgetHistory(record) {
   });
 }
 
+function nzbgetRecordId(record) {
+  return Number(record?.NZBID ?? record?.ID ?? record?.Id ?? record?.id);
+}
+
+function nzbgetRecordNameCandidates(record) {
+  return [record?.Name, record?.NZBName, record?.NZBNicename, record?.NZBFilename]
+    .filter(value => typeof value === "string" && value.trim())
+    .flatMap(value => {
+      const base = value.split(/[\\/]/).pop();
+      const noNzb = base?.replace(/\.nzb$/i, "");
+      return [value, base, noNzb].filter(Boolean);
+    });
+}
+
+function nzbgetRecordParameter(record, name) {
+  const wanted = name.toLowerCase();
+  const arrays = [
+    record?.Parameters,
+    record?.PPParameters,
+    record?.PostParameters,
+    record?.Params
+  ].filter(Array.isArray);
+  for (const entries of arrays) {
+    for (const entry of entries) {
+      const entryName = String(entry.Name ?? entry.name ?? entry.Key ?? entry.key ?? "").toLowerCase();
+      if (entryName === wanted) {
+        return entry.Value ?? entry.value ?? entry.Val ?? entry.val;
+      }
+    }
+  }
+  return record?.[name] ?? record?.[name.toLowerCase()];
+}
+
+function nzbgetRecordDownloadId(record) {
+  return nzbgetRecordParameter(record, "drone");
+}
+
+function nzbgetRecordDeleted(record) {
+  return record?.Deleted === true || /^deleted/i.test(String(record?.DeleteStatus || record?.Status || ""));
+}
+
+function nzbgetRetryPostprocessCall(nzbId) {
+  return {
+    method: "editqueue",
+    params: ["HistoryProcess", 0, [nzbId]],
+    display: `editqueue("HistoryProcess", 0, [${nzbId}])`
+  };
+}
+
+async function nzbgetHistoryRecords() {
+  const records = await nzbgetRpc("history");
+  return Array.isArray(records) ? records : [];
+}
+
+function matchNzbgetHistoryRecord(records, input) {
+  const selectors = [
+    input.nzbId !== undefined ? "nzbId" : undefined,
+    input.downloadId ? "downloadId" : undefined,
+    input.name ? "name" : undefined
+  ].filter(Boolean);
+  if (!selectors.length) {
+    throw new Error("provide nzbId, downloadId, or exact name");
+  }
+
+  let matches = records;
+  if (input.nzbId !== undefined) {
+    matches = matches.filter(record => nzbgetRecordId(record) === input.nzbId);
+  }
+  if (input.downloadId) {
+    matches = matches.filter(record => nzbgetRecordDownloadId(record) === input.downloadId);
+  }
+  if (input.name) {
+    matches = matches.filter(record => nzbgetRecordNameCandidates(record).includes(input.name));
+  }
+
+  if (!matches.length) {
+    throw new Error(`no NZBGet history item matched ${selectors.join(", ")}`);
+  }
+  if (matches.length > 1) {
+    return {
+      ambiguous: true,
+      selectors,
+      matches: matches.map(summarizeNzbgetHistory)
+    };
+  }
+  return { record: matches[0], selectors };
+}
+
+async function findNzbgetHistoryRecord(input) {
+  const matched = matchNzbgetHistoryRecord(await nzbgetHistoryRecords(), input);
+  if (matched.ambiguous) {
+    throw new Error(`ambiguous NZBGet history match for ${matched.selectors.join(", ")}: ${matched.matches.map(record => record.nzbId).join(", ")}`);
+  }
+  return matched.record;
+}
+
+async function nzbgetHistoryDetail(input) {
+  const record = await findNzbgetHistoryRecord(input);
+  const nzbId = nzbgetRecordId(record);
+  const log = input.includeLog
+    ? await nzbgetRpc("loadlog", [nzbId, 0, input.logLimit]).catch(error => ({ error: error.message }))
+    : undefined;
+  const sanitizedRecord = redactSensitiveObject(record);
+  return compactObject({
+    record: log ? { ...sanitizedRecord, Log: log } : sanitizedRecord,
+    log
+  });
+}
+
+function summarizeNzbgetFile(record) {
+  const filename = decodedField(record.Filename ?? record.Name ?? record.NZBName);
+  const destDir = decodedField(record.DestDir);
+  return compactObject({
+    id: record.ID ?? record.Id ?? record.id,
+    nzbId: record.NZBID,
+    filename: filename.value,
+    filenameRaw: filename.raw,
+    destDir: destDir.value,
+    destDirRaw: destDir.raw,
+    path: destDir.value && filename.value ? `${destDir.value.replace(/\/+$/, "")}/${filename.value}` : undefined,
+    fileSizeMb: record.FileSizeMB,
+    progress: record.Progress,
+    paused: record.Paused,
+    category: record.Category,
+    activeDownloads: record.ActiveDownloads
+  });
+}
+
+function archiveKind(filename) {
+  const lower = String(filename || "").toLowerCase();
+  if (/\.part0*1\.rar$/.test(lower) || /\.rar$/.test(lower) || /\.7z$/.test(lower) || /\.zip$/.test(lower)) {
+    return "root";
+  }
+  if (/\.(r\d{2,3}|7z\.\d{3}|z\d{2}|part\d+\.rar)$/.test(lower)) {
+    return "part";
+  }
+  if (/\.(rar|r\d{2,3}|7z|7z\.\d{3}|zip|z\d{2}|001)$/.test(lower)) {
+    return "archive";
+  }
+  return null;
+}
+
+function archiveRootKey(filename) {
+  return String(filename || "")
+    .replace(/\.part\d+\.rar$/i, "")
+    .replace(/\.(rar|r\d{2,3}|7z|7z\.\d{3}|zip|z\d{2}|001)$/i, "");
+}
+
+function archiveSummary(files) {
+  const archiveFiles = files
+    .map(file => ({ ...file, archiveKind: archiveKind(file.filename), archiveRoot: archiveRootKey(file.filename) }))
+    .filter(file => file.archiveKind);
+  const roots = archiveFiles.filter(file => file.archiveKind === "root");
+  return {
+    hasArchives: archiveFiles.length > 0,
+    archiveCount: archiveFiles.length,
+    rootCount: roots.length,
+    roots,
+    files: archiveFiles
+  };
+}
+
+async function nzbgetDownloadFiles(input) {
+  let record = null;
+  let nzbId = input.nzbId;
+  if (nzbId) {
+    record = (await nzbgetHistoryRecords()).find(entry => nzbgetRecordId(entry) === nzbId) || null;
+  } else {
+    record = await findNzbgetHistoryRecord(input);
+    nzbId = nzbgetRecordId(record);
+  }
+  const files = await nzbgetRpc("listfiles", [0, 0, nzbId]).catch(error => ({ error: error.message }));
+  const records = Array.isArray(files) ? files.map(summarizeNzbgetFile) : [];
+  return {
+    record: record ? summarizeNzbgetHistory(record) : { nzbId },
+    total: records.length,
+    records,
+    archiveSummary: archiveSummary(records),
+    error: Array.isArray(files) ? undefined : files.error
+  };
+}
+
+async function retryNzbgetPostprocess(input) {
+  const record = await findNzbgetHistoryRecord(input);
+  const nzbId = nzbgetRecordId(record);
+  const apiCall = nzbgetRetryPostprocessCall(nzbId);
+  if (nzbgetRecordDeleted(record) && !input.force) {
+    throw new Error(`NZBGet history item ${nzbId} is deleted; pass force: true to retry post-processing anyway`);
+  }
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      matchedRecord: redactSensitiveObject(record),
+      apiCall
+    };
+  }
+  const result = await nzbgetRpc("editqueue", apiCall.params);
+  return {
+    dryRun: false,
+    matchedRecord: summarizeNzbgetHistory(record),
+    apiCall,
+    result
+  };
+}
+
+async function downloadClientArchiveDiagnosis(input) {
+  const queueRecord = await arrQueueRecord(input.service, input.queueId);
+  const selectors = queueRecord.downloadId
+    ? { downloadId: queueRecord.downloadId }
+    : { name: decodeHtmlEntities(queueRecord.title) };
+  const detail = await nzbgetHistoryDetail({ ...selectors, includeLog: true, logLimit: input.logLimit }).catch(error => ({ error: error.message }));
+  const record = detail.record;
+  const files = record ? await nzbgetDownloadFiles({ nzbId: nzbgetRecordId(record) }).catch(error => ({ error: error.message })) : undefined;
+  const archives = files?.archiveSummary;
+  const unpackStatus = record?.UnpackStatus;
+  const blockers = [];
+  if (!record) {
+    blockers.push({ type: "no_nzbget_history_match", message: detail.error || "No NZBGet history record matched the queue item downloadId/name." });
+  }
+  if (archives?.hasArchives && ["NONE", "FAILURE"].includes(String(unpackStatus))) {
+    blockers.push({
+      type: "archives_still_present",
+      message: "NZBGet reports unpack did not complete and archive files are still present; retry post-processing first, then manual/multi-set extraction may be needed if archives remain.",
+      unpackStatus
+    });
+  }
+  if (archives && !archives.hasArchives && ["NONE", "FAILURE"].includes(String(unpackStatus))) {
+    blockers.push({
+      type: "no_archive_files_exposed",
+      message: "NZBGet did not expose archive files through listfiles; inspect the completed folder from the Arr/NZBGet container path if Sonarr/Radarr still reports archive files."
+    });
+  }
+  return {
+    service: input.service,
+    queueRecord: summarizeQueueRecord(queueRecord),
+    nzbget: detail,
+    files,
+    archiveDiagnosis: compactObject({
+      hasArchives: archives?.hasArchives,
+      archiveCount: archives?.archiveCount,
+      rootCount: archives?.rootCount,
+      unpackStatus,
+      parStatus: record?.ParStatus,
+      moveStatus: record?.MoveStatus,
+      status: record?.Status
+    }),
+    blockers
+  };
+}
+
+async function pathExists(pathValue) {
+  try {
+    await readdir(pathValue);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runCommand(command, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", chunk => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", code => {
+      if (code === 0) {
+        resolve({ code, stdout: redactText(stdout), stderr: redactText(stderr) });
+      } else {
+        reject(new Error(`${command} exited ${code}: ${stderr || stdout}`));
+      }
+    });
+  });
+}
+
+function mediaFileName(filename) {
+  return /\.(mkv|mp4|m4v|avi|mov|ts)$/i.test(filename);
+}
+
+async function listMediaFiles(dir, depth = 0) {
+  if (depth > 3) {
+    return [];
+  }
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = nodePath.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await listMediaFiles(fullPath, depth + 1));
+    } else if (mediaFileName(entry.name)) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+async function extractNzbgetArchives(input) {
+  const fileResult = await nzbgetDownloadFiles(input);
+  const record = fileResult.record;
+  const detail = await findNzbgetHistoryRecord(input);
+  if (nzbgetRecordDeleted(detail) && !input.force) {
+    throw new Error(`NZBGet history item ${nzbgetRecordId(detail)} is deleted; pass force: true to extract anyway`);
+  }
+  const destDir = decodeHtmlEntities(detail.DestDir);
+  if (!destDir) {
+    throw new Error("matched NZBGet history item does not expose DestDir");
+  }
+  const roots = (fileResult.archiveSummary.roots || [])
+    .map(file => file.path)
+    .filter(pathValue => pathInside(destDir, pathValue));
+  const outside = (fileResult.archiveSummary.roots || []).filter(file => !pathInside(destDir, file.path));
+  if (outside.length) {
+    throw new Error("refusing extraction because one or more archive roots are outside DestDir");
+  }
+  if (!roots.length) {
+    return {
+      dryRun: input.dryRun,
+      record,
+      destDir,
+      extractedMediaFiles: [],
+      blockers: [{ type: "no_archive_roots", message: "NZBGet did not expose any root archive files to extract." }]
+    };
+  }
+  const plan = roots.map(archivePath => ({
+    command: "unrar",
+    args: ["x", "-o-", archivePath],
+    cwd: destDir
+  }));
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      record,
+      destDir,
+      archiveRoots: roots,
+      plan,
+      note: "Set dryRun to false to run unrar inside the matched history item's DestDir."
+    };
+  }
+  if (!await pathExists(destDir)) {
+    throw new Error(`DestDir is not readable inside media-mcp: ${destDir}`);
+  }
+  const results = [];
+  for (const step of plan) {
+    results.push(await runCommand(step.command, step.args, step.cwd));
+  }
+  const extractedMediaFiles = await listMediaFiles(destDir);
+  let scanCommand;
+  if (input.triggerScanService) {
+    const commandName = input.triggerScanService === "sonarr" ? "DownloadedEpisodesScan" : "DownloadedMoviesScan";
+    const queued = await queueArrCommand(input.triggerScanService, arrCommand(commandName, {
+      path: destDir,
+      downloadClientId: nzbgetRecordDownloadId(detail),
+      importMode: input.importMode
+    }));
+    scanCommand = { commandId: queued?.id, command: queued };
+  }
+  return {
+    dryRun: false,
+    record,
+    destDir,
+    archiveRoots: roots,
+    results,
+    extractedMediaFiles,
+    scanCommand
+  };
+}
+
 async function arrQueueDetails(serviceName) {
   const records = await arrApi(serviceName, "v3", "queue/details");
   return Array.isArray(records) ? records : [];
+}
+
+async function arrQueueRecord(serviceName, queueId) {
+  const records = await arrQueueDetails(serviceName);
+  const queueRecord = records.find(record => record.id === queueId);
+  if (!queueRecord) {
+    throw new Error(`${serviceName} queue item ${queueId} was not found`);
+  }
+  return queueRecord;
 }
 
 function recordsById(records, ids) {
@@ -686,49 +1156,96 @@ async function removeArrQueueItems(serviceName, ids, options) {
   };
 }
 
+function manualImportTargetFields(serviceName, queueRecord, input) {
+  return compactObject({
+    seriesId: serviceName === "sonarr" ? input.seriesId || queueRecord?.seriesId || queueRecord?.series?.id : undefined,
+    movieId: serviceName === "radarr" ? input.movieId || queueRecord?.movieId || queueRecord?.movie?.id : undefined
+  });
+}
+
+function rejectedManualImportCandidate(serviceName, candidate, expectedFolder) {
+  const summary = summarizeImportCandidate(candidate, { expectedFolder });
+  return compactObject({
+    type: "candidate_outside_queue_path",
+    message: `Manual import API returned a candidate outside the expected queue folder ${decodeHtmlEntities(expectedFolder)}`,
+    likelyLibraryPath: likelyLibraryPath(serviceName, candidate.path),
+    expectedFolder: decodeHtmlEntities(expectedFolder),
+    candidate: {
+      id: summary.id,
+      path: summary.path,
+      pathRaw: summary.pathRaw,
+      seriesId: summary.seriesId,
+      episodeIds: summary.episodeIds,
+      movieId: summary.movieId,
+      quality: summary.quality,
+      languages: summary.languages,
+      releaseGroup: summary.releaseGroup,
+      releaseType: summary.releaseType,
+      warnings: summary.warnings,
+      rejections: summary.rejections
+    }
+  });
+}
+
+function classifyManualImportCandidates(serviceName, records, expectedFolder) {
+  if (!expectedFolder) {
+    return { accepted: records, blockers: [] };
+  }
+  const accepted = [];
+  const blockers = [];
+  for (const candidate of records) {
+    if (candidate.path && !pathInside(expectedFolder, candidate.path)) {
+      blockers.push(rejectedManualImportCandidate(serviceName, candidate, expectedFolder));
+    } else {
+      accepted.push(candidate);
+    }
+  }
+  return { accepted, blockers };
+}
+
 async function arrManualImportCandidates(serviceName, input) {
   let folder = input.path;
   let downloadId = input.downloadId;
-  let seriesId = serviceName === "sonarr" ? input.seriesId : undefined;
-  let movieId = serviceName === "radarr" ? input.movieId : undefined;
   let queueRecord = null;
 
   if (input.queueId) {
-    const records = await arrQueueDetails(serviceName);
-    queueRecord = records.find(record => record.id === input.queueId);
-    if (!queueRecord) {
-      throw new Error(`${serviceName} queue item ${input.queueId} was not found`);
-    }
+    queueRecord = await arrQueueRecord(serviceName, input.queueId);
     folder = folder || queueRecord.outputPath;
     downloadId = downloadId || queueRecord.downloadId;
-    seriesId = seriesId || queueRecord.seriesId || queueRecord.series?.id;
-    movieId = movieId || queueRecord.movieId || queueRecord.movie?.id;
   }
 
   if (!folder) {
     throw new Error("path is required when queueId does not provide an outputPath");
   }
 
+  folder = decodeHtmlEntities(folder);
+  const targetFields = manualImportTargetFields(serviceName, queueRecord, input);
   const candidates = await arrApi(serviceName, "v3", "manualimport", {
     query: {
       folder,
       downloadId,
-      seriesId,
-      movieId,
+      ...targetFields,
       filterExistingFiles: input.filterExistingFiles
     }
   });
   const records = Array.isArray(candidates) ? candidates : [];
-  const limited = limitList(records.map(summarizeImportCandidate), input.limit);
+  const classified = classifyManualImportCandidates(serviceName, records, folder);
+  const limited = limitList(classified.accepted.map(candidate => summarizeImportCandidate(candidate, { expectedFolder: folder })), input.limit);
   return {
     queueRecord: queueRecord ? summarizeQueueRecord(queueRecord) : undefined,
     query: compactObject({
       folder,
       downloadId,
-      seriesId,
-      movieId,
+      ...targetFields,
       filterExistingFiles: input.filterExistingFiles
     }),
+    apiBug: classified.blockers.length
+      ? {
+        message: "Manual import API returned one or more candidates outside the requested queue/download folder; they were excluded from valid records.",
+        rejectedCount: classified.blockers.length
+      }
+      : undefined,
+    blockers: classified.blockers.slice(0, input.limit),
     ...limited
   };
 }
@@ -785,6 +1302,155 @@ function manualImportCommand(files, importMode) {
     name: "ManualImport",
     importMode,
     files: files.map(manualImportFile)
+  };
+}
+
+function unsafeImportCandidateBlocker(candidate) {
+  return compactObject({
+    type: "candidate_not_safe_to_import",
+    path: candidate.path,
+    pathRaw: candidate.pathRaw,
+    seriesId: candidate.seriesId,
+    episodeIds: candidate.episodeIds,
+    movieId: candidate.movieId,
+    warnings: candidate.warnings,
+    rejections: candidate.rejections
+  });
+}
+
+async function importArrQueueItem(serviceName, queueId, importMode, dryRun) {
+  const discovery = await arrManualImportCandidates(serviceName, {
+    queueId,
+    filterExistingFiles: true,
+    limit: 250
+  });
+  const records = Array.isArray(discovery.records) ? discovery.records : [];
+  const safeRecords = records.filter(record => record.safeToImport);
+  const blockers = [
+    ...(discovery.blockers || []),
+    ...records.filter(record => !record.safeToImport).map(unsafeImportCandidateBlocker)
+  ];
+
+  if (!safeRecords.length) {
+    return {
+      dryRun,
+      service: serviceName,
+      queueId,
+      queueRecord: discovery.queueRecord,
+      query: discovery.query,
+      imported: [],
+      blockers: blockers.length ? blockers : [{ type: "no_safe_candidates", message: "No safe manual import candidates were returned for this queue item." }],
+      candidates: discovery
+    };
+  }
+
+  const command = manualImportCommand(safeRecords, importMode);
+  const warnings = manualImportWarnings(serviceName, safeRecords);
+  if (dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      queueId,
+      queueRecord: discovery.queueRecord,
+      imported: safeRecords,
+      blockers,
+      warnings,
+      command,
+      note: `Set dryRun to false to queue this ${serviceName} ManualImport command.`
+    };
+  }
+
+  const queued = await queueArrCommand(serviceName, command);
+  return {
+    dryRun: false,
+    service: serviceName,
+    queueId,
+    queueRecord: discovery.queueRecord,
+    imported: safeRecords,
+    blockers,
+    warnings,
+    commandId: queued?.id,
+    command: queued
+  };
+}
+
+function filesystemRecords(body, keys) {
+  if (Array.isArray(body)) {
+    return body;
+  }
+  for (const key of keys) {
+    if (Array.isArray(body?.[key])) {
+      return body[key];
+    }
+  }
+  return [];
+}
+
+function summarizeFilesystemEntry(entry, fallbackType) {
+  const entryPath = entry.path ?? entry.fullPath ?? entry.location;
+  const name = decodedField(entry.name ?? entry.label);
+  return compactObject({
+    type: entry.type ?? fallbackType,
+    name: name.value,
+    nameRaw: name.raw,
+    ...pathDisplay(entryPath),
+    size: entry.size,
+    lastModified: entry.lastModified ?? entry.lastWriteTimeUtc ?? entry.modified,
+    exists: entry.exists
+  });
+}
+
+function summarizeFilesystemListing(body, folder, limit) {
+  const arrayBody = Array.isArray(body);
+  const files = arrayBody ? [] : filesystemRecords(body, ["files", "Files", "fileEntries", "FileEntries"]);
+  const directories = arrayBody ? [] : filesystemRecords(body, ["directories", "Directories", "folderEntries", "FolderEntries"]);
+  const entries = arrayBody ? body : filesystemRecords(body, ["entries", "Entries", "children", "Children"]);
+  const entryFiles = entries.filter(entry => String(entry.type || "").toLowerCase() === "file" || entry.isFile === true);
+  const entryDirectories = entries.filter(entry => String(entry.type || "").toLowerCase() === "folder" || entry.isDirectory === true || entry.isFolder === true);
+  const max = Math.max(1, Math.min(Number(limit || 50), 250));
+  const fileRecords = [...files, ...entryFiles].slice(0, max).map(entry => summarizeFilesystemEntry(entry, "file"));
+  const directoryRecords = [...directories, ...entryDirectories].slice(0, max).map(entry => summarizeFilesystemEntry(entry, "directory"));
+  return {
+    path: decodeHtmlEntities(body?.path ?? folder),
+    pathRaw: body?.path && body.path !== decodeHtmlEntities(body.path) ? body.path : undefined,
+    fileCount: fileRecords.length,
+    directoryCount: directoryRecords.length,
+    files: fileRecords,
+    directories: directoryRecords
+  };
+}
+
+async function arrQueueItemFiles(serviceName, queueId, limit) {
+  const queueRecord = await arrQueueRecord(serviceName, queueId);
+  const folder = decodeHtmlEntities(queueRecord.outputPath);
+  if (!folder) {
+    throw new Error(`${serviceName} queue item ${queueId} does not have an outputPath`);
+  }
+
+  const filesystem = await arrApi(serviceName, "v3", "filesystem", {
+    query: {
+      path: folder,
+      includeFiles: true,
+      allowFoldersWithoutTrailingSlashes: true
+    }
+  }).then(body => summarizeFilesystemListing(body, folder, limit)).catch(error => ({
+    error: error.message,
+    note: "The Arr filesystem API did not return a file listing for this path."
+  }));
+
+  const candidates = await arrManualImportCandidates(serviceName, {
+    queueId,
+    filterExistingFiles: true,
+    limit
+  }).catch(error => ({ error: error.message }));
+
+  return {
+    service: serviceName,
+    queueRecord: summarizeQueueRecord(queueRecord),
+    outputPath: folder,
+    outputPathRaw: queueRecord.outputPath !== folder ? queueRecord.outputPath : undefined,
+    filesystem,
+    manualImportCandidates: candidates
   };
 }
 
@@ -1339,7 +2005,7 @@ function redactSensitiveObject(value) {
     return redactText(value);
   }
   return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
-    if (/api|token|password|passkey|cookie|authorization|downloadurl|magneturl/i.test(key)) {
+    if (/api|token|password|passkey|cookie|authorization|downloadurl|magneturl|^url$/i.test(key)) {
       return [key, "[redacted]"];
     }
     return [key, redactSensitiveObject(entry)];
@@ -1471,10 +2137,12 @@ async function arrCommandAction(serviceName, command, dryRun) {
       note: `Set dryRun to false to queue this ${serviceName} command.`
     };
   }
+  const queued = await queueArrCommand(serviceName, command);
   return {
     dryRun: false,
     service: serviceName,
-    command: await queueArrCommand(serviceName, command)
+    commandId: queued?.id,
+    command: queued
   };
 }
 
@@ -2429,7 +3097,7 @@ function createServer() {
     description: "List current Sonarr queue records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => {
-    return jsonText(limitList(await arrApi("sonarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
+    return jsonText(summarizeQueueList(await arrApi("sonarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
   });
 
   server.registerTool("sonarr_remove_queue_items", {
@@ -2448,7 +3116,7 @@ function createServer() {
 
   server.registerTool("sonarr_manual_import_candidates", {
     title: "Sonarr Manual Import Candidates",
-    description: "Find Sonarr manual import candidates for an exact queue item ID or path.",
+    description: "Find Sonarr manual import candidates for an exact queue item ID or path, excluding library-file rows that are outside the queue/download folder.",
     inputSchema: {
       queueId: z.number().int().positive().optional(),
       path: z.string().min(1).optional(),
@@ -2463,6 +3131,27 @@ function createServer() {
     }
     return jsonText(await sonarrManualImportCandidates(input));
   });
+
+  server.registerTool("sonarr_queue_item_files", {
+    title: "Sonarr Queue Item Files",
+    description: "Inspect files under one Sonarr queue item's outputPath from Sonarr's container/API point of view, plus filtered manual import context.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      queueId: z.number().int().positive(),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async ({ queueId, limit }) => jsonText(await arrQueueItemFiles("sonarr", queueId, limit)));
+
+  server.registerTool("sonarr_import_queue_item", {
+    title: "Sonarr Import Queue Item",
+    description: "Discover safe manual import candidates for one Sonarr queue item and queue ManualImport for the safe rows. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      queueId: z.number().int().positive(),
+      importMode: z.string().min(1).default("move"),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ queueId, importMode, dryRun }) => jsonText(await importArrQueueItem("sonarr", queueId, importMode, dryRun)));
 
   server.registerTool("sonarr_manual_import", {
     title: "Sonarr Manual Import",
@@ -2499,11 +3188,13 @@ function createServer() {
         note: "Set dryRun to false to queue this Sonarr ManualImport command."
       });
     }
+    const queued = await arrApi("sonarr", "v3", "command", { method: "POST", body: command });
     return jsonText({
       dryRun: false,
       service: "sonarr",
       warnings,
-      command: await arrApi("sonarr", "v3", "command", { method: "POST", body: command })
+      commandId: queued?.id,
+      command: queued
     });
   });
 
@@ -2734,7 +3425,7 @@ function createServer() {
     description: "List current Radarr queue records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => {
-    return jsonText(limitList(await arrApi("radarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
+    return jsonText(summarizeQueueList(await arrApi("radarr", "v3", "queue", { query: { page: 1, pageSize: limit } }), limit));
   });
 
   server.registerTool("radarr_remove_queue_items", {
@@ -2753,7 +3444,7 @@ function createServer() {
 
   server.registerTool("radarr_manual_import_candidates", {
     title: "Radarr Manual Import Candidates",
-    description: "Find Radarr manual import candidates for an exact queue item ID or path.",
+    description: "Find Radarr manual import candidates for an exact queue item ID or path, excluding library-file rows that are outside the queue/download folder.",
     inputSchema: {
       queueId: z.number().int().positive().optional(),
       path: z.string().min(1).optional(),
@@ -2768,6 +3459,27 @@ function createServer() {
     }
     return jsonText(await radarrManualImportCandidates(input));
   });
+
+  server.registerTool("radarr_queue_item_files", {
+    title: "Radarr Queue Item Files",
+    description: "Inspect files under one Radarr queue item's outputPath from Radarr's container/API point of view, plus filtered manual import context.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      queueId: z.number().int().positive(),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async ({ queueId, limit }) => jsonText(await arrQueueItemFiles("radarr", queueId, limit)));
+
+  server.registerTool("radarr_import_queue_item", {
+    title: "Radarr Import Queue Item",
+    description: "Discover safe manual import candidates for one Radarr queue item and queue ManualImport for the safe rows. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      queueId: z.number().int().positive(),
+      importMode: z.string().min(1).default("move"),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ queueId, importMode, dryRun }) => jsonText(await importArrQueueItem("radarr", queueId, importMode, dryRun)));
 
   server.registerTool("radarr_manual_import", {
     title: "Radarr Manual Import",
@@ -2802,11 +3514,13 @@ function createServer() {
         note: "Set dryRun to false to queue this Radarr ManualImport command."
       });
     }
+    const queued = await arrApi("radarr", "v3", "command", { method: "POST", body: command });
     return jsonText({
       dryRun: false,
       service: "radarr",
       warnings,
-      command: await arrApi("radarr", "v3", "command", { method: "POST", body: command })
+      commandId: queued?.id,
+      command: queued
     });
   });
 
@@ -3067,6 +3781,66 @@ function createServer() {
     description: "List recent NZBGet history records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
   }, async ({ limit }) => jsonText(limitList(await nzbgetRpc("history"), limit)));
+
+  server.registerTool("nzbget_history_detail", {
+    title: "NZBGet History Detail",
+    description: "Return one exact NZBGet history record by NZBID, Arr downloadId/drone parameter, or exact name, including item log when available.",
+    inputSchema: {
+      nzbId: z.number().int().positive().optional(),
+      downloadId: z.string().min(1).optional(),
+      name: z.string().min(1).optional(),
+      includeLog: z.boolean().default(true),
+      logLimit: z.number().int().min(1).max(500).default(100)
+    }
+  }, async (input) => jsonText(await nzbgetHistoryDetail(input)));
+
+  server.registerTool("nzbget_download_files", {
+    title: "NZBGet Download Files",
+    description: "List files NZBGet exposes for one exact history or queue item, including archive-file detection.",
+    inputSchema: {
+      nzbId: z.number().int().positive().optional(),
+      downloadId: z.string().min(1).optional(),
+      name: z.string().min(1).optional()
+    }
+  }, async (input) => jsonText(await nzbgetDownloadFiles(input)));
+
+  server.registerTool("nzbget_retry_postprocess", {
+    title: "NZBGet Retry Post-Processing",
+    description: "Retry NZBGet post-processing for one exact history item using HistoryProcess. Dry-run is enabled by default and deleted items require force.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      nzbId: z.number().int().positive().optional(),
+      downloadId: z.string().min(1).optional(),
+      name: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true),
+      force: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await retryNzbgetPostprocess(input)));
+
+  server.registerTool("download_client_archive_diagnosis", {
+    title: "Download Client Archive Diagnosis",
+    description: "Diagnose whether a Sonarr/Radarr queue item maps to an NZBGet history item with archive files and unpack statuses that need post-processing or manual extraction.",
+    inputSchema: {
+      service: z.enum(["sonarr", "radarr"]),
+      queueId: z.number().int().positive(),
+      logLimit: z.number().int().min(1).max(500).default(100)
+    }
+  }, async (input) => jsonText(await downloadClientArchiveDiagnosis(input)));
+
+  server.registerTool("nzbget_extract_archives", {
+    title: "NZBGet Extract Archives",
+    description: "Dry-run or run unrar extraction for archive roots inside one NZBGet history item's DestDir. Execution requires media-mcp to see that DestDir and have unrar installed.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      nzbId: z.number().int().positive().optional(),
+      downloadId: z.string().min(1).optional(),
+      name: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true),
+      force: z.boolean().default(false),
+      triggerScanService: z.enum(["sonarr", "radarr"]).optional(),
+      importMode: z.string().min(1).optional()
+    }
+  }, async (input) => jsonText(await extractNzbgetArchives(input)));
 
   server.registerTool("nzbget_remove_history_items", {
     title: "NZBGet Remove History Items",

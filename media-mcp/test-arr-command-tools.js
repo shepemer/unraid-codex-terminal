@@ -43,12 +43,302 @@ function parseSse(text) {
 async function run() {
   const calls = [];
   let commandId = 1000;
+  const sonarrQueue = [
+    {
+      id: 1001,
+      title: "Show.S01E01.1080p-GRP",
+      seriesId: 10,
+      series: { id: 10, title: "Show" },
+      episodeId: 101,
+      outputPath: "/downloads/usenet/completed/Series/Show.S01E01.1080p-GRP",
+      downloadId: "sonarr-single"
+    },
+    {
+      id: 1002,
+      title: "Show.S01.1080p-GRP",
+      seriesId: 10,
+      series: { id: 10, title: "Show" },
+      outputPath: "/downloads/usenet/completed/Series/Show.S01.1080p-GRP",
+      downloadId: "sonarr-pack"
+    },
+    {
+      id: 1003,
+      title: "A &amp; B.Show.S01E02.1080p-GRP",
+      seriesId: 11,
+      series: { id: 11, title: "A & B Show" },
+      episodeId: 111,
+      outputPath: "/downloads/usenet/completed/Series/A &amp; B.Show.S01E02.1080p-GRP",
+      downloadId: "sonarr-amp"
+    },
+    {
+      id: 1004,
+      title: "Show.S01E03.1080p-GRP",
+      seriesId: 10,
+      series: { id: 10, title: "Show" },
+      episodeId: 103,
+      outputPath: "/downloads/usenet/intermediate/Series/Show.S01E03.1080p-GRP",
+      downloadId: "sonarr-intermediate"
+    },
+    {
+      id: 1005,
+      title: "Show.S01E04.1080p-GRP",
+      seriesId: 10,
+      series: { id: 10, title: "Show" },
+      episodeId: 104,
+      outputPath: "/downloads/usenet/completed/Series/Show.S01E04.1080p-GRP",
+      downloadId: "sonarr-library-bug"
+    },
+    {
+      id: 1006,
+      title: "Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+      seriesId: 12,
+      series: { id: 12, title: "Example Archive Series" },
+      outputPath: "/downloads/usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+      downloadId: "example-archive-drone-id",
+      trackedDownloadStatus: "warning",
+      statusMessages: [{ title: "Found archive file, might need to be extracted", messages: ["Found archive file, might need to be extracted"] }]
+    }
+  ];
+  const radarrQueue = [
+    {
+      id: 2001,
+      title: "Movie.2025.1080p-GRP",
+      movieId: 20,
+      movie: { id: 20, title: "Movie" },
+      outputPath: "/downloads/usenet/completed/Movies/Movie.2025.1080p-GRP",
+      downloadId: "radarr-movie"
+    },
+    {
+      id: 2002,
+      title: "Movie.LibraryBug.2025.1080p-GRP",
+      movieId: 21,
+      movie: { id: 21, title: "Movie Library Bug" },
+      outputPath: "/downloads/usenet/completed/Movies/Movie.LibraryBug.2025.1080p-GRP",
+      downloadId: "radarr-library-bug"
+    }
+  ];
+  const manualCandidates = {
+    "sonarr-single": [{
+      id: 1,
+      path: "/downloads/usenet/completed/Series/Show.S01E01.1080p-GRP/Show.S01E01.1080p-GRP.mkv",
+      series: { id: 10, title: "Show" },
+      episodes: [{ id: 101, seasonNumber: 1, episodeNumber: 1, title: "Pilot" }],
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "singleEpisode",
+      rejections: []
+    }],
+    "sonarr-pack": [
+      {
+        id: 2,
+        path: "/downloads/usenet/completed/Series/Show.S01.1080p-GRP/Show.S01E01.1080p-GRP.mkv",
+        series: { id: 10, title: "Show" },
+        episodes: [{ id: 101, seasonNumber: 1, episodeNumber: 1, title: "Pilot" }],
+        quality: { quality: { name: "WEBDL-1080p" } },
+        languages: [{ name: "English" }],
+        releaseGroup: "GRP",
+        releaseType: "seasonPack",
+        rejections: []
+      },
+      {
+        id: 3,
+        path: "/downloads/usenet/completed/Series/Show.S01.1080p-GRP/Show.S01E02.1080p-GRP.mkv",
+        series: { id: 10, title: "Show" },
+        episodes: [{ id: 102, seasonNumber: 1, episodeNumber: 2, title: "Second" }],
+        quality: { quality: { name: "WEBDL-1080p" } },
+        languages: [{ name: "English" }],
+        releaseGroup: "GRP",
+        releaseType: "seasonPack",
+        rejections: []
+      }
+    ],
+    "sonarr-amp": [{
+      id: 4,
+      path: "/downloads/usenet/completed/Series/A & B.Show.S01E02.1080p-GRP/A & B.Show.S01E02.1080p-GRP.mkv",
+      series: { id: 11, title: "A & B Show" },
+      episodes: [{ id: 111, seasonNumber: 1, episodeNumber: 2, title: "Ampersand" }],
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "singleEpisode",
+      rejections: []
+    }],
+    "sonarr-intermediate": [{
+      id: 5,
+      path: "/downloads/usenet/intermediate/Series/Show.S01E03.1080p-GRP/Show.S01E03.1080p-GRP.mkv",
+      series: { id: 10, title: "Show" },
+      episodes: [{ id: 103, seasonNumber: 1, episodeNumber: 3, title: "Third" }],
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "singleEpisode",
+      rejections: []
+    }],
+    "sonarr-library-bug": [{
+      id: 6,
+      path: "/tv/Show/Season 01/Show.S01E04.mkv",
+      series: { id: 10, title: "Show" },
+      episodes: [{ id: 104, seasonNumber: 1, episodeNumber: 4, title: "Fourth" }],
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "singleEpisode",
+      rejections: []
+    }],
+    "radarr-movie": [{
+      id: 7,
+      path: "/downloads/usenet/completed/Movies/Movie.2025.1080p-GRP/Movie.2025.1080p-GRP.mkv",
+      movie: { id: 20, title: "Movie" },
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "movie",
+      rejections: []
+    }],
+    "radarr-library-bug": [{
+      id: 8,
+      path: "/movies/Movie Library Bug (2025)/Movie Library Bug.mkv",
+      movie: { id: 21, title: "Movie Library Bug" },
+      quality: { quality: { name: "WEBDL-1080p" } },
+      languages: [{ name: "English" }],
+      releaseGroup: "GRP",
+      releaseType: "movie",
+      rejections: []
+    }]
+  };
+  const nzbgetHistory = [
+    {
+      NZBID: 70001,
+      ID: 70001,
+      Name: "Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+      NZBName: "Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+      Status: "SUCCESS/PAR",
+      ParStatus: "SUCCESS",
+      UnpackStatus: "NONE",
+      MoveStatus: "SUCCESS",
+      Deleted: false,
+      DeleteStatus: "NONE",
+      DestDir: "/downloads/usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+      Parameters: [{ Name: "drone", Value: "example-archive-drone-id" }],
+      FileSizeMB: 1234,
+      DownloadedSizeMB: 1234
+    },
+    {
+      NZBID: 56573,
+      Name: "Ambiguous.Release",
+      NZBName: "Ambiguous.Release",
+      Status: "SUCCESS/ALL",
+      Deleted: false,
+      DestDir: "/downloads/usenet/completed/Series/Ambiguous.Release"
+    },
+    {
+      NZBID: 56574,
+      Name: "Ambiguous.Release",
+      NZBName: "Ambiguous.Release",
+      Status: "SUCCESS/ALL",
+      Deleted: false,
+      DestDir: "/downloads/usenet/completed/Series/Ambiguous.Release.2"
+    },
+    {
+      NZBID: 56575,
+      Name: "Deleted.Release",
+      NZBName: "Deleted.Release",
+      Status: "DELETED/MANUAL",
+      Deleted: true,
+      DestDir: "/downloads/usenet/completed/Series/Deleted.Release"
+    }
+  ];
+  const nzbgetFiles = {
+    70001: [
+      {
+        ID: 9001,
+        NZBID: 70001,
+        Filename: "Example.Archive.Series.S01E01.part01.rar",
+        DestDir: "/downloads/usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+        FileSizeMB: 500
+      },
+      {
+        ID: 9002,
+        NZBID: 70001,
+        Filename: "Example.Archive.Series.S01E01.r00",
+        DestDir: "/downloads/usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST",
+        FileSizeMB: 500
+      }
+    ]
+  };
+  const nzbgetLog = {
+    70001: [
+      { ID: 1, Kind: "INFO", Time: 1783120000, Text: "Completed download" },
+      { ID: 2, Kind: "WARNING", Time: 1783120001, Text: "Found archive file, might need to be extracted" }
+    ]
+  };
+
+  function queueForService(service) {
+    return service === "sonarr" ? sonarrQueue : radarrQueue;
+  }
+
+  function candidatesFor(service, query) {
+    if (query.downloadId && manualCandidates[query.downloadId]) {
+      return manualCandidates[query.downloadId];
+    }
+    if (service === "sonarr") {
+      return [{
+        id: 99,
+        path: `${query.folder}/episode.mkv`,
+        series: { id: 10, title: "Show" },
+        episodes: [{ id: 101, seasonNumber: 1, episodeNumber: 2, title: "Episode" }],
+        quality: { quality: { name: "HDTV-1080p" } },
+        languages: [{ name: "English" }],
+        rejections: []
+      }];
+    }
+    return [{
+      id: 100,
+      path: `${query.folder}/movie.mkv`,
+      movie: { id: 20, title: "Movie" },
+      quality: { quality: { name: "Bluray-1080p" } },
+      languages: [{ name: "English" }],
+      rejections: []
+    }];
+  }
+
   const mock = http.createServer(async (req, res) => {
+    if (req.url === "/jsonrpc") {
+      const request = await readJson(req);
+      calls.push({ service: "nzbget", method: "RPC", path: request.method, params: request.params });
+      let result;
+      switch (request.method) {
+        case "history":
+          result = nzbgetHistory;
+          break;
+        case "listfiles":
+          result = nzbgetFiles[request.params?.[2]] || [];
+          break;
+        case "loadlog":
+          result = (nzbgetLog[request.params?.[0]] || []).slice(0, request.params?.[2] || 100);
+          break;
+        case "editqueue":
+          result = true;
+          break;
+        case "listgroups":
+          result = [];
+          break;
+        case "status":
+          result = { DownloadPaused: false };
+          break;
+        default:
+          return sendJson(res, 404, { jsonrpc: "2.0", id: request.id, error: { message: `unexpected ${request.method}` } });
+      }
+      return sendJson(res, 200, { jsonrpc: "2.0", id: request.id, result });
+    }
+
     const url = new URL(req.url, "http://127.0.0.1");
     const [service] = url.pathname.split("/").filter(Boolean);
     const path = url.pathname.replace(`/${service}/api/v3/`, "");
     const body = await readJson(req);
-    calls.push({ service, method: req.method, path, query: Object.fromEntries(url.searchParams), body });
+    const query = Object.fromEntries(url.searchParams);
+    calls.push({ service, method: req.method, path, query, body });
 
     if (req.headers["x-api-key"] !== `${service}-key`) {
       return sendJson(res, 401, { error: "bad key" });
@@ -84,25 +374,24 @@ async function run() {
       });
     }
     if (req.method === "GET" && path === "queue/details") {
-      return sendJson(res, 200, []);
+      return sendJson(res, 200, queueForService(service));
+    }
+    if (req.method === "GET" && path === "queue") {
+      return sendJson(res, 200, { page: 1, pageSize: Number(query.pageSize || 50), totalRecords: queueForService(service).length, records: queueForService(service) });
+    }
+    if (req.method === "GET" && path === "filesystem") {
+      return sendJson(res, 200, {
+        path: query.path,
+        files: [{
+          name: `${query.path.split("/").at(-1)}.mkv`,
+          path: `${query.path}/${query.path.split("/").at(-1)}.mkv`,
+          size: 123456
+        }],
+        directories: []
+      });
     }
     if (req.method === "GET" && path === "manualimport") {
-      return sendJson(res, 200, service === "sonarr" ? [{
-        id: 1,
-        path: "/downloads/show/episode.mkv",
-        series: { id: 10, title: "Show" },
-        episodes: [{ id: 101, seasonNumber: 1, episodeNumber: 2, title: "Episode" }],
-        quality: { quality: { name: "HDTV-1080p" } },
-        languages: [{ name: "English" }],
-        rejections: []
-      }] : [{
-        id: 2,
-        path: "/downloads/movie/movie.mkv",
-        movie: { id: 20, title: "Movie" },
-        quality: { quality: { name: "Bluray-1080p" } },
-        languages: [{ name: "English" }],
-        rejections: []
-      }]);
+      return sendJson(res, 200, candidatesFor(service, query));
     }
     return sendJson(res, 404, { error: `unexpected ${req.method} ${url.pathname}` });
   });
@@ -121,7 +410,10 @@ async function run() {
       SONARR_URL: `http://127.0.0.1:${mockPort}/sonarr`,
       SONARR_API_KEY: "sonarr-key",
       RADARR_URL: `http://127.0.0.1:${mockPort}/radarr`,
-      RADARR_API_KEY: "radarr-key"
+      RADARR_API_KEY: "radarr-key",
+      NZBGET_URL: `http://127.0.0.1:${mockPort}`,
+      NZBGET_USERNAME: "nzbget",
+      NZBGET_PASSWORD: "tegbzn6789"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -164,6 +456,12 @@ async function run() {
     return JSON.parse(response.result.content[0].text);
   }
 
+  async function toolError(name, args = {}) {
+    const response = await rpc("tools/call", { name, arguments: args });
+    assert.ok(response.error || response.result?.isError, JSON.stringify(response));
+    return response.error?.message || response.result?.content?.[0]?.text || "";
+  }
+
   function lastCall() {
     return calls.at(-1);
   }
@@ -200,6 +498,8 @@ async function run() {
       "sonarr_rescan_series",
       "sonarr_refresh_series",
       "sonarr_rename_files",
+      "sonarr_queue_item_files",
+      "sonarr_import_queue_item",
       "sonarr_interactive_search_episode",
       "sonarr_grab_release",
       "sonarr_download_client_scan",
@@ -210,10 +510,17 @@ async function run() {
       "radarr_rescan_movie",
       "radarr_refresh_movie",
       "radarr_rename_files",
+      "radarr_queue_item_files",
+      "radarr_import_queue_item",
       "radarr_interactive_search_movie",
       "radarr_grab_release",
       "radarr_download_client_scan",
-      "radarr_command_cancel"
+      "radarr_command_cancel",
+      "nzbget_history_detail",
+      "nzbget_download_files",
+      "nzbget_retry_postprocess",
+      "download_client_archive_diagnosis",
+      "nzbget_extract_archives"
     ]) {
       assert.ok(toolNames.has(name), `missing tool ${name}`);
     }
@@ -263,12 +570,26 @@ async function run() {
       downloadClientId: "abc",
       importMode: "move"
     });
-    await tool("radarr_download_client_scan", {
+    const sonarrScan = await tool("sonarr_download_client_scan", {
+      path: "/downloads/show",
+      downloadClientId: "abc",
+      importMode: "move",
+      dryRun: false
+    });
+    assert.equal(sonarrScan.commandId > 0, true);
+    assert.deepEqual(lastCall().body, {
+      name: "DownloadedEpisodesScan",
+      path: "/downloads/show",
+      downloadClientId: "abc",
+      importMode: "move"
+    });
+    const radarrScan = await tool("radarr_download_client_scan", {
       path: "/downloads/movie",
       downloadClientId: "def",
       sendUpdates: true,
       dryRun: false
     });
+    assert.equal(radarrScan.commandId > 0, true);
     assert.deepEqual(lastCall().body, {
       name: "DownloadedMoviesScan",
       path: "/downloads/movie",
@@ -300,13 +621,128 @@ async function run() {
     assert.equal(lastCall().method, "DELETE");
     assert.equal(lastCall().path, "command/778");
 
+    const historyDetail = await tool("nzbget_history_detail", { nzbId: 70001, includeLog: true, logLimit: 10 });
+    assert.equal(historyDetail.record.NZBID, 70001);
+    assert.equal(historyDetail.record.UnpackStatus, "NONE");
+    assert.equal(historyDetail.record.Log.length, 2);
+    assert.equal(historyDetail.log.length, 2);
+
+    const downloadFiles = await tool("nzbget_download_files", { downloadId: "example-archive-drone-id" });
+    assert.equal(downloadFiles.record.nzbId, 70001);
+    assert.equal(downloadFiles.records.length, 2);
+    assert.equal(downloadFiles.archiveSummary.hasArchives, true);
+    assert.equal(downloadFiles.archiveSummary.rootCount, 1);
+
+    const retryDryRun = await tool("nzbget_retry_postprocess", { nzbId: 70001, dryRun: true });
+    assert.equal(retryDryRun.dryRun, true);
+    assert.equal(retryDryRun.matchedRecord.NZBID, 70001);
+    assert.deepEqual(retryDryRun.apiCall.params, ["HistoryProcess", 0, [70001]]);
+    assert.equal(retryDryRun.apiCall.display, "editqueue(\"HistoryProcess\", 0, [70001])");
+
+    const retryExec = await tool("nzbget_retry_postprocess", { downloadId: "example-archive-drone-id", dryRun: false });
+    assert.equal(retryExec.dryRun, false);
+    assert.equal(retryExec.result, true);
+    assert.equal(lastCall().service, "nzbget");
+    assert.equal(lastCall().path, "editqueue");
+    assert.deepEqual(lastCall().params, ["HistoryProcess", 0, [70001]]);
+
+    const ambiguousMessage = await toolError("nzbget_retry_postprocess", { name: "Ambiguous.Release", dryRun: true });
+    assert.match(ambiguousMessage, /ambiguous/i);
+    const deletedMessage = await toolError("nzbget_retry_postprocess", { name: "Deleted.Release", dryRun: false });
+    assert.match(deletedMessage, /deleted/i);
+
+    const archiveDiagnosis = await tool("download_client_archive_diagnosis", { service: "sonarr", queueId: 1006, logLimit: 10 });
+    assert.equal(archiveDiagnosis.nzbget.record.NZBID, 70001);
+    assert.equal(archiveDiagnosis.archiveDiagnosis.hasArchives, true);
+    assert.equal(archiveDiagnosis.archiveDiagnosis.unpackStatus, "NONE");
+    assert.equal(archiveDiagnosis.blockers[0].type, "archives_still_present");
+
+    const extractDryRun = await tool("nzbget_extract_archives", { nzbId: 70001, dryRun: true });
+    assert.equal(extractDryRun.dryRun, true);
+    assert.equal(extractDryRun.archiveRoots.length, 1);
+    assert.equal(extractDryRun.plan[0].command, "unrar");
+    assert.deepEqual(extractDryRun.plan[0].args.slice(0, 2), ["x", "-o-"]);
+
+    const queue = await tool("sonarr_queue", { limit: 5 });
+    const escapedQueueItem = queue.records.find(record => record.id === 1003);
+    assert.equal(escapedQueueItem.title, "A & B.Show.S01E02.1080p-GRP");
+    assert.equal(escapedQueueItem.titleRaw, "A &amp; B.Show.S01E02.1080p-GRP");
+    assert.equal(escapedQueueItem.outputPath, "/downloads/usenet/completed/Series/A & B.Show.S01E02.1080p-GRP");
+    assert.equal(escapedQueueItem.outputPathRaw, "/downloads/usenet/completed/Series/A &amp; B.Show.S01E02.1080p-GRP");
+
+    const singleEpisode = await tool("sonarr_manual_import_candidates", { queueId: 1001, limit: 5 });
+    assert.equal(singleEpisode.records.length, 1);
+    assert.equal(singleEpisode.records[0].path, "/downloads/usenet/completed/Series/Show.S01E01.1080p-GRP/Show.S01E01.1080p-GRP.mkv");
+    assert.deepEqual(singleEpisode.records[0].episodeIds, [101]);
+    assert.equal(singleEpisode.records[0].seriesId, 10);
+    assert.equal(singleEpisode.records[0].releaseGroup, "GRP");
+    assert.equal(singleEpisode.records[0].releaseType, "singleEpisode");
+    assert.equal(singleEpisode.records[0].safeToImport, true);
+
+    const seasonPack = await tool("sonarr_manual_import_candidates", { queueId: 1002, limit: 5 });
+    assert.equal(seasonPack.records.length, 2);
+    assert.deepEqual(seasonPack.records.map(record => record.episodeIds[0]), [101, 102]);
+    assert.ok(seasonPack.records.every(record => record.safeToImport));
+
+    const ampPath = await tool("sonarr_manual_import_candidates", { queueId: 1003, limit: 5 });
+    assert.equal(ampPath.queueRecord.outputPathRaw, "/downloads/usenet/completed/Series/A &amp; B.Show.S01E02.1080p-GRP");
+    assert.equal(ampPath.queueRecord.outputPath, "/downloads/usenet/completed/Series/A & B.Show.S01E02.1080p-GRP");
+    assert.equal(ampPath.query.folder, "/downloads/usenet/completed/Series/A & B.Show.S01E02.1080p-GRP");
+    assert.equal(ampPath.records[0].path, "/downloads/usenet/completed/Series/A & B.Show.S01E02.1080p-GRP/A & B.Show.S01E02.1080p-GRP.mkv");
+
+    const intermediate = await tool("sonarr_manual_import_candidates", { queueId: 1004, limit: 5 });
+    assert.equal(intermediate.records[0].path, "/downloads/usenet/intermediate/Series/Show.S01E03.1080p-GRP/Show.S01E03.1080p-GRP.mkv");
+    assert.equal(intermediate.records[0].safeToImport, true);
+
+    const libraryBug = await tool("sonarr_manual_import_candidates", { queueId: 1005, limit: 5 });
+    assert.equal(libraryBug.records.length, 0);
+    assert.equal(libraryBug.apiBug.rejectedCount, 1);
+    assert.equal(libraryBug.blockers[0].likelyLibraryPath, true);
+    assert.equal(libraryBug.blockers[0].candidate.path, "/tv/Show/Season 01/Show.S01E04.mkv");
+
+    const movie = await tool("radarr_manual_import_candidates", { queueId: 2001, limit: 5 });
+    assert.equal(movie.records.length, 1);
+    assert.equal(movie.records[0].movieId, 20);
+    assert.equal(movie.records[0].path, "/downloads/usenet/completed/Movies/Movie.2025.1080p-GRP/Movie.2025.1080p-GRP.mkv");
+    assert.equal(movie.records[0].releaseGroup, "GRP");
+    assert.equal(movie.records[0].releaseType, "movie");
+    assert.equal(movie.records[0].safeToImport, true);
+
+    const radarrLibraryBug = await tool("radarr_manual_import_candidates", { queueId: 2002, limit: 5 });
+    assert.equal(radarrLibraryBug.records.length, 0);
+    assert.equal(radarrLibraryBug.blockers[0].likelyLibraryPath, true);
+    assert.equal(radarrLibraryBug.blockers[0].candidate.path, "/movies/Movie Library Bug (2025)/Movie Library Bug.mkv");
+
+    const queueFiles = await tool("sonarr_queue_item_files", { queueId: 1001, limit: 5 });
+    assert.equal(queueFiles.filesystem.files.length, 1);
+    assert.equal(queueFiles.manualImportCandidates.records[0].safeToImport, true);
+
+    const importDryRun = await tool("sonarr_import_queue_item", { queueId: 1001, importMode: "move", dryRun: true });
+    assert.equal(importDryRun.dryRun, true);
+    assert.equal(importDryRun.imported.length, 1);
+    assert.equal(importDryRun.command.name, "ManualImport");
+    assert.equal(importDryRun.command.files[0].path, "/downloads/usenet/completed/Series/Show.S01E01.1080p-GRP/Show.S01E01.1080p-GRP.mkv");
+
+    const beforeLibraryImport = calls.length;
+    const blockedImport = await tool("sonarr_import_queue_item", { queueId: 1005, dryRun: false });
+    assert.equal(blockedImport.imported.length, 0);
+    assert.equal(blockedImport.blockers[0].type, "candidate_outside_queue_path");
+    assert.equal(calls.length, beforeLibraryImport + 2);
+    assert.notEqual(lastCall().path, "command");
+
+    const movieImport = await tool("radarr_import_queue_item", { queueId: 2001, dryRun: false });
+    assert.equal(movieImport.commandId > 0, true);
+    assert.equal(lastCall().path, "command");
+    assert.equal(lastCall().body.name, "ManualImport");
+    assert.equal(lastCall().body.files[0].movieId, 20);
+
     const candidates = await tool("sonarr_manual_import_candidates", { path: "/downloads/show", limit: 5 });
     assert.equal(candidates.records[0].safeToImport, true);
-    const importDryRun = await tool("radarr_manual_import", {
+    const directImportDryRun = await tool("radarr_manual_import", {
       files: [{ path: "/downloads/movie/movie.mkv", movieId: 20 }],
       dryRun: true
     });
-    assert.equal(importDryRun.command.name, "ManualImport");
+    assert.equal(directImportDryRun.command.name, "ManualImport");
   } finally {
     child.kill("SIGTERM");
     mock.close();
@@ -315,7 +751,7 @@ async function run() {
 }
 
 run().then(() => {
-  console.log("arr command tools tests passed");
+  console.log("arr command/manual import tools tests passed");
 }).catch(error => {
   console.error(error);
   process.exit(1);
