@@ -2352,7 +2352,13 @@ function redactSensitiveObject(value) {
   if (!value || typeof value !== "object") {
     return redactText(value);
   }
+  const sensitiveField = [value.name, value.label, value.type]
+    .filter(entry => typeof entry === "string")
+    .some(entry => /api|token|password|passkey|cookie|authorization/i.test(entry));
   return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
+    if (sensitiveField && /^value$/i.test(key)) {
+      return [key, "[redacted]"];
+    }
     if (/api|token|password|passkey|cookie|authorization|downloadurl|magneturl|^url$/i.test(key)) {
       return [key, "[redacted]"];
     }
@@ -2491,6 +2497,807 @@ async function arrCommandAction(serviceName, command, dryRun) {
     service: serviceName,
     commandId: queued?.id,
     command: queued
+  };
+}
+
+function cloneJson(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizedLookupName(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function mergeObjectPatch(target, patch) {
+  const result = cloneJson(target) || {};
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (isPlainObject(value) && isPlainObject(result[key])) {
+      result[key] = mergeObjectPatch(result[key], value);
+    } else {
+      result[key] = cloneJson(value);
+    }
+  }
+  return result;
+}
+
+function omitKeys(value, keys) {
+  return Object.fromEntries(Object.entries(value || {}).filter(([key]) => !keys.has(key)));
+}
+
+function diffValue(value) {
+  if (value === undefined) {
+    return "[missing]";
+  }
+  return redactSensitiveObject(value);
+}
+
+function pushCompactDiff(before, after, pathValue = "$", changes = []) {
+  if (JSON.stringify(before) === JSON.stringify(after)) {
+    return changes;
+  }
+  if (isPlainObject(before) && isPlainObject(after)) {
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+    for (const key of keys) {
+      pushCompactDiff(before[key], after[key], `${pathValue}.${key}`, changes);
+    }
+    return changes;
+  }
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const max = Math.max(before.length, after.length);
+    for (let index = 0; index < max; index += 1) {
+      pushCompactDiff(before[index], after[index], `${pathValue}[${index}]`, changes);
+    }
+    return changes;
+  }
+  changes.push({ path: pathValue, before: diffValue(before), after: diffValue(after) });
+  return changes;
+}
+
+function compactDiff(before, after) {
+  return pushCompactDiff(before, after).slice(0, 250);
+}
+
+function arrEndpoint(method, apiPath) {
+  return {
+    method,
+    apiVersion: "v3",
+    path: `/api/v3/${apiPath.replace(/^\/+/, "")}`
+  };
+}
+
+function exactNameMatches(value, name) {
+  return normalizedLookupName(value) === normalizedLookupName(name);
+}
+
+function resolveRecordByIdOrName(records, input, label, nameGetter = record => record.name) {
+  if (input.id !== undefined) {
+    const matched = records.find(record => record.id === input.id);
+    if (!matched) {
+      throw new Error(`${label} id ${input.id} was not found`);
+    }
+    if (input.name && !exactNameMatches(nameGetter(matched), input.name)) {
+      throw new Error(`${label} id ${input.id} does not match exact name ${input.name}`);
+    }
+    return matched;
+  }
+  if (input.name) {
+    const matches = records.filter(record => exactNameMatches(nameGetter(record), input.name));
+    if (!matches.length) {
+      throw new Error(`${label} named ${input.name} was not found`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`ambiguous ${label} name ${input.name}: matched ids ${matches.map(record => record.id).join(", ")}`);
+    }
+    return matches[0];
+  }
+  return null;
+}
+
+function arrQualityProfileItems(profile) {
+  const roots = Array.isArray(profile?.items)
+    ? profile.items
+    : Array.isArray(profile?.qualities)
+      ? profile.qualities
+      : [];
+  const entries = [];
+  function visit(item, pathValue, groupNames = []) {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const itemName = item.name ?? item.quality?.name;
+    const entry = {
+      item,
+      path: pathValue,
+      type: Array.isArray(item.items) ? "group" : "quality",
+      id: Number.isInteger(item.id) ? item.id : undefined,
+      qualityId: Number.isInteger(item.quality?.id) ? item.quality.id : undefined,
+      name: itemName,
+      groupNames
+    };
+    entries.push(entry);
+    if (Array.isArray(item.items)) {
+      const nextGroups = itemName ? [...groupNames, itemName] : groupNames;
+      item.items.forEach((child, index) => visit(child, `${pathValue}.items[${index}]`, nextGroups));
+    }
+  }
+  roots.forEach((item, index) => visit(item, `items[${index}]`));
+  return entries;
+}
+
+function qualityProfileItemId(entry) {
+  return entry.id ?? entry.qualityId;
+}
+
+function formatItemId(item) {
+  const raw = item?.format ?? item?.formatId ?? item?.customFormatId ?? item?.customFormat?.id ?? item?.id;
+  return Number.isInteger(raw) ? raw : Number(raw) || undefined;
+}
+
+function formatItemName(item) {
+  return item?.name ?? item?.customFormat?.name;
+}
+
+function qualityDefinitionQualityId(record) {
+  const raw = record?.quality?.id ?? record?.qualityId;
+  return Number.isInteger(raw) ? raw : Number(raw) || undefined;
+}
+
+function qualityDefinitionName(record) {
+  return record?.quality?.name ?? record?.title ?? record?.name;
+}
+
+function resolveQualityDefinition(records, input, label) {
+  if (input.qualityId !== undefined) {
+    const matches = records.filter(record => qualityDefinitionQualityId(record) === input.qualityId || record.id === input.qualityId);
+    if (!matches.length) {
+      throw new Error(`${label} quality id ${input.qualityId} was not found`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`ambiguous ${label} quality id ${input.qualityId}: matched definition ids ${matches.map(record => record.id).join(", ")}`);
+    }
+    if (input.qualityName && !exactNameMatches(qualityDefinitionName(matches[0]), input.qualityName)) {
+      throw new Error(`${label} quality id ${input.qualityId} does not match exact name ${input.qualityName}`);
+    }
+    return matches[0];
+  }
+  if (input.qualityName) {
+    const matches = records.filter(record => exactNameMatches(qualityDefinitionName(record), input.qualityName));
+    if (!matches.length) {
+      throw new Error(`${label} quality named ${input.qualityName} was not found`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`ambiguous ${label} quality name ${input.qualityName}: matched definition ids ${matches.map(record => record.id).join(", ")}`);
+    }
+    return matches[0];
+  }
+  return null;
+}
+
+function summarizeQualityProfile(profile) {
+  const entries = arrQualityProfileItems(profile);
+  const qualityItems = entries.filter(entry => entry.type === "quality");
+  const groups = entries.filter(entry => entry.type === "group");
+  return compactObject({
+    id: profile.id,
+    name: profile.name,
+    upgradeAllowed: profile.upgradeAllowed,
+    cutoff: profile.cutoff,
+    minFormatScore: profile.minFormatScore,
+    cutoffFormatScore: profile.cutoffFormatScore,
+    minUpgradeFormatScore: profile.minUpgradeFormatScore,
+    qualityItemCount: qualityItems.length,
+    allowedQualityItemCount: qualityItems.filter(entry => entry.item.allowed === true).length,
+    blockedQualityItemCount: qualityItems.filter(entry => entry.item.allowed === false).length,
+    groups: groups.map(entry => compactObject({
+      id: entry.id,
+      name: entry.name,
+      allowed: entry.item.allowed,
+      itemCount: Array.isArray(entry.item.items) ? entry.item.items.length : undefined
+    })),
+    qualities: qualityItems.map(entry => compactObject({
+      id: entry.id,
+      qualityId: entry.qualityId,
+      name: entry.name,
+      allowed: entry.item.allowed,
+      groups: entry.groupNames.length ? entry.groupNames : undefined
+    })),
+    customFormatScores: Array.isArray(profile.formatItems)
+      ? profile.formatItems.map(item => compactObject({
+        formatId: formatItemId(item),
+        name: formatItemName(item),
+        score: item.score
+      }))
+      : undefined
+  });
+}
+
+function summarizeCustomFormat(format) {
+  return compactObject({
+    id: format.id,
+    name: format.name,
+    includeCustomFormatWhenRenaming: format.includeCustomFormatWhenRenaming,
+    specificationCount: Array.isArray(format.specifications) ? format.specifications.length : undefined,
+    specifications: Array.isArray(format.specifications)
+      ? format.specifications.map(specification => compactObject({
+        name: specification.name,
+        implementation: specification.implementation,
+        implementationName: specification.implementationName,
+        negate: specification.negate,
+        required: specification.required
+      }))
+      : undefined
+  });
+}
+
+function summarizeQualityDefinition(record) {
+  return compactObject({
+    id: record.id,
+    qualityId: qualityDefinitionQualityId(record),
+    qualityName: qualityDefinitionName(record),
+    title: record.title,
+    minSize: record.minSize,
+    maxSize: record.maxSize,
+    preferredSize: record.preferredSize
+  });
+}
+
+async function servarrRecords(serviceName, pathValue) {
+  const records = await arrApi(serviceName, "v3", pathValue);
+  return Array.isArray(records) ? records : [];
+}
+
+async function arrQualityProfiles(serviceName, input = {}) {
+  const records = await servarrRecords(serviceName, "qualityprofile");
+  const selected = resolveRecordByIdOrName(records, input, `${serviceName} quality profile`);
+  const returnedRecords = selected ? [selected] : records;
+  return {
+    service: serviceName,
+    total: records.length,
+    returned: returnedRecords.length,
+    records: input.includeRaw
+      ? redactSensitiveObject(returnedRecords)
+      : returnedRecords.map(summarizeQualityProfile)
+  };
+}
+
+async function arrCustomFormats(serviceName, input = {}) {
+  const records = await servarrRecords(serviceName, "customformat");
+  const selected = resolveRecordByIdOrName(records, input, `${serviceName} custom format`);
+  const returnedRecords = selected ? [selected] : records;
+  return {
+    service: serviceName,
+    total: records.length,
+    returned: returnedRecords.length,
+    records: input.includeRaw
+      ? redactSensitiveObject(returnedRecords)
+      : returnedRecords.map(summarizeCustomFormat)
+  };
+}
+
+async function arrQualityDefinitions(serviceName, input = {}) {
+  const records = await servarrRecords(serviceName, "qualitydefinition");
+  const selected = resolveQualityDefinition(records, input, `${serviceName} quality definition`);
+  const returnedRecords = selected ? [selected] : records;
+  return {
+    service: serviceName,
+    total: records.length,
+    returned: returnedRecords.length,
+    records: input.includeRaw
+      ? redactSensitiveObject(returnedRecords)
+      : returnedRecords.map(summarizeQualityDefinition)
+  };
+}
+
+function parseQualityAllowedOps(patch) {
+  const values = [
+    patch.qualityAllowed,
+    patch.qualityItemAllowed,
+    patch.allowedQualities,
+    patch.allowedQualityItems
+  ].filter(value => value !== undefined);
+  const ops = [];
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      ops.push(...value);
+    } else if (isPlainObject(value)) {
+      for (const [selector, allowed] of Object.entries(value)) {
+        ops.push({ selector, allowed });
+      }
+    } else {
+      ops.push({ invalid: value });
+    }
+  }
+  return ops;
+}
+
+function parseCustomFormatScoreOps(patch) {
+  const values = [
+    patch.customFormatScores,
+    patch.formatScores,
+    patch.customFormatScoreChanges,
+    patch.formatItemScores
+  ].filter(value => value !== undefined);
+  const ops = [];
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      ops.push(...value);
+    } else if (isPlainObject(value)) {
+      for (const [selector, score] of Object.entries(value)) {
+        ops.push({ selector, score });
+      }
+    } else {
+      ops.push({ invalid: value });
+    }
+  }
+  return ops;
+}
+
+function numericSelector(value) {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    return Number(value);
+  }
+  return undefined;
+}
+
+function qualityAllowedMatches(profile, op) {
+  const entries = arrQualityProfileItems(profile);
+  const id = op.qualityId ?? op.id ?? numericSelector(op.selector);
+  const groupName = op.groupName;
+  const name = op.qualityName ?? op.name ?? (id === undefined ? op.selector : undefined);
+
+  if (groupName) {
+    return entries.filter(entry => entry.type === "group" && exactNameMatches(entry.name, groupName));
+  }
+  if (id !== undefined) {
+    return entries.filter(entry => entry.id === id || entry.qualityId === id);
+  }
+  if (name) {
+    return entries.filter(entry => exactNameMatches(entry.name, name));
+  }
+  return [];
+}
+
+function applyQualityAllowedOperation(profile, op, errors) {
+  if (!isPlainObject(op)) {
+    errors.push("quality allowed operation must be an object");
+    return;
+  }
+  if (typeof op.allowed !== "boolean") {
+    errors.push(`quality allowed operation ${JSON.stringify(op)} must include boolean allowed`);
+    return;
+  }
+  const matches = qualityAllowedMatches(profile, op);
+  if (!matches.length) {
+    errors.push(`quality allowed operation ${JSON.stringify(op)} did not match any profile item`);
+    return;
+  }
+  if (matches.length > 1) {
+    errors.push(`quality allowed operation ${JSON.stringify(op)} matched multiple items: ${matches.map(match => match.name || match.id || match.qualityId).join(", ")}`);
+    return;
+  }
+  matches[0].item.allowed = op.allowed;
+  if (matches[0].type === "group" && op.includeItems === true && Array.isArray(matches[0].item.items)) {
+    for (const child of matches[0].item.items) {
+      child.allowed = op.allowed;
+    }
+  }
+}
+
+function resolveQualityCutoff(profile, cutoff, errors) {
+  if (typeof cutoff === "number" && Number.isInteger(cutoff)) {
+    return cutoff;
+  }
+  const op = isPlainObject(cutoff) ? cutoff : { selector: cutoff };
+  const matches = qualityAllowedMatches(profile, op);
+  if (!matches.length) {
+    errors.push(`cutoff ${JSON.stringify(cutoff)} did not match any profile item`);
+    return profile.cutoff;
+  }
+  if (matches.length > 1) {
+    errors.push(`cutoff ${JSON.stringify(cutoff)} matched multiple items: ${matches.map(match => match.name || match.id || match.qualityId).join(", ")}`);
+    return profile.cutoff;
+  }
+  const id = qualityProfileItemId(matches[0]);
+  if (!Number.isInteger(id)) {
+    errors.push(`cutoff ${JSON.stringify(cutoff)} matched an item without a numeric id`);
+    return profile.cutoff;
+  }
+  return id;
+}
+
+function customFormatMatches(records, op) {
+  const id = op.formatId ?? op.customFormatId ?? op.id ?? op.format ?? numericSelector(op.selector);
+  const name = op.formatName ?? op.customFormatName ?? op.name ?? (id === undefined ? op.selector : undefined);
+  if (id !== undefined) {
+    return records.filter(record => record.id === id || formatItemId(record) === id);
+  }
+  if (name) {
+    return records.filter(record => exactNameMatches(record.name ?? formatItemName(record), name));
+  }
+  return [];
+}
+
+function applyCustomFormatScoreOperation(profile, op, customFormats, errors) {
+  if (!isPlainObject(op)) {
+    errors.push("custom format score operation must be an object");
+    return;
+  }
+  const score = op.score;
+  if (!Number.isInteger(score)) {
+    errors.push(`custom format score operation ${JSON.stringify(op)} must include integer score`);
+    return;
+  }
+  if (!Array.isArray(profile.formatItems)) {
+    profile.formatItems = [];
+  }
+
+  const existingMatches = customFormatMatches(profile.formatItems, op);
+  if (existingMatches.length > 1) {
+    errors.push(`custom format score operation ${JSON.stringify(op)} matched multiple profile format items`);
+    return;
+  }
+  if (existingMatches.length === 1) {
+    existingMatches[0].score = score;
+    return;
+  }
+
+  const formatMatches = customFormatMatches(customFormats, op);
+  if (!formatMatches.length) {
+    errors.push(`custom format score operation ${JSON.stringify(op)} did not match an existing profile format item or custom format`);
+    return;
+  }
+  if (formatMatches.length > 1) {
+    errors.push(`custom format score operation ${JSON.stringify(op)} matched multiple custom formats: ${formatMatches.map(format => format.id).join(", ")}`);
+    return;
+  }
+  profile.formatItems.push(compactObject({
+    format: formatMatches[0].id,
+    name: formatMatches[0].name,
+    score
+  }));
+}
+
+function validateQualityProfile(profile, original) {
+  const errors = [];
+  if (!isPlainObject(profile)) {
+    return ["quality profile must be an object"];
+  }
+  if (!Number.isInteger(profile.id) || profile.id <= 0) {
+    errors.push("quality profile id must be a positive integer");
+  }
+  if (original && profile.id !== original.id) {
+    errors.push("quality profile id cannot be changed");
+  }
+  if (typeof profile.name !== "string" || !profile.name.trim()) {
+    errors.push("quality profile name is required");
+  }
+  if (profile.upgradeAllowed !== undefined && typeof profile.upgradeAllowed !== "boolean") {
+    errors.push("upgradeAllowed must be boolean when provided");
+  }
+  for (const key of ["cutoff", "minFormatScore", "cutoffFormatScore", "minUpgradeFormatScore"]) {
+    if (profile[key] !== undefined && !Number.isInteger(profile[key])) {
+      errors.push(`${key} must be an integer when provided`);
+    }
+  }
+  const items = Array.isArray(profile.items)
+    ? profile.items
+    : Array.isArray(profile.qualities)
+      ? profile.qualities
+      : null;
+  if (!items) {
+    errors.push("quality profile must include an items array");
+  } else {
+    const entries = arrQualityProfileItems(profile);
+    if (!entries.length) {
+      errors.push("quality profile items array cannot be empty");
+    }
+    for (const entry of entries) {
+      if (entry.item.allowed !== undefined && typeof entry.item.allowed !== "boolean") {
+        errors.push(`${entry.path}.allowed must be boolean`);
+      }
+      if (entry.type === "quality" && !Number.isInteger(entry.qualityId)) {
+        errors.push(`${entry.path} must include quality.id`);
+      }
+    }
+  }
+  if (profile.formatItems !== undefined) {
+    if (!Array.isArray(profile.formatItems)) {
+      errors.push("formatItems must be an array when provided");
+    } else {
+      for (const [index, item] of profile.formatItems.entries()) {
+        if (!Number.isInteger(formatItemId(item))) {
+          errors.push(`formatItems[${index}] must include a numeric format id`);
+        }
+        if (!Number.isInteger(item.score)) {
+          errors.push(`formatItems[${index}].score must be an integer`);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
+function applyQualityProfilePatch(current, patch, customFormats) {
+  const specialKeys = new Set([
+    "qualityAllowed",
+    "qualityItemAllowed",
+    "allowedQualities",
+    "allowedQualityItems",
+    "customFormatScores",
+    "formatScores",
+    "customFormatScoreChanges",
+    "formatItemScores",
+    "cutoff"
+  ]);
+  const errors = [];
+  let proposed = mergeObjectPatch(current, omitKeys(patch, specialKeys));
+  if (Object.hasOwn(patch, "cutoff")) {
+    proposed.cutoff = resolveQualityCutoff(proposed, patch.cutoff, errors);
+  }
+  for (const op of parseQualityAllowedOps(patch)) {
+    applyQualityAllowedOperation(proposed, op, errors);
+  }
+  for (const op of parseCustomFormatScoreOps(patch)) {
+    applyCustomFormatScoreOperation(proposed, op, customFormats, errors);
+  }
+  return { proposed, patchErrors: errors };
+}
+
+async function updateQualityProfile(serviceName, input) {
+  const records = await servarrRecords(serviceName, "qualityprofile");
+  const current = resolveRecordByIdOrName(records, input, `${serviceName} quality profile`);
+  const scoreOps = parseCustomFormatScoreOps(input.patch);
+  const customFormats = scoreOps.length ? await servarrRecords(serviceName, "customformat").catch(() => []) : [];
+  const { proposed, patchErrors } = applyQualityProfilePatch(current, input.patch, customFormats);
+  const validationErrors = [...patchErrors, ...validateQualityProfile(proposed, current)];
+  const diff = compactDiff(current, proposed);
+  const endpoint = arrEndpoint("PUT", `qualityprofile/${current.id}`);
+  const response = {
+    dryRun: input.dryRun,
+    service: serviceName,
+    endpoint,
+    currentObject: redactSensitiveObject(current),
+    proposedObject: redactSensitiveObject(proposed),
+    diff,
+    validationErrors
+  };
+  if (validationErrors.length) {
+    return { ...response, applied: false, note: "Validation errors prevented the profile update." };
+  }
+  if (input.dryRun) {
+    return { ...response, applied: false, note: `Set dryRun to false to PUT this full ${serviceName} quality profile.` };
+  }
+  if (!diff.length) {
+    return { ...response, applied: false, note: "No changes detected; no API call was made." };
+  }
+  return {
+    ...response,
+    applied: true,
+    result: redactSensitiveObject(await arrApi(serviceName, "v3", `qualityprofile/${current.id}`, { method: "PUT", body: proposed }))
+  };
+}
+
+function validateCustomFormat(format, original) {
+  const errors = [];
+  if (!isPlainObject(format)) {
+    return ["custom format must be an object"];
+  }
+  if (original && format.id !== original.id) {
+    errors.push("custom format id cannot be changed");
+  }
+  if (format.id !== undefined && (!Number.isInteger(format.id) || format.id <= 0)) {
+    errors.push("custom format id must be a positive integer when provided");
+  }
+  if (typeof format.name !== "string" || !format.name.trim()) {
+    errors.push("custom format name is required");
+  }
+  if (format.specifications !== undefined) {
+    if (!Array.isArray(format.specifications)) {
+      errors.push("specifications must be an array when provided");
+    } else {
+      for (const [index, specification] of format.specifications.entries()) {
+        if (!isPlainObject(specification)) {
+          errors.push(`specifications[${index}] must be an object`);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
+function regexFieldsForSpecification(specification) {
+  const kind = [
+    specification?.implementation,
+    specification?.implementationName,
+    specification?.name
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (!/title|regex|release/.test(kind)) {
+    return [];
+  }
+  return (Array.isArray(specification.fields) ? specification.fields : [])
+    .filter(field => typeof field?.value === "string" && field.value.trim())
+    .map(field => ({
+      specification: specification.name,
+      implementation: specification.implementation,
+      field: field.name,
+      pattern: field.value,
+      negate: specification.negate === true,
+      required: specification.required === true
+    }));
+}
+
+function compileRegexPattern(pattern) {
+  let source = String(pattern);
+  let flags = "i";
+  source = source.replace(/^\(\?i\)/i, "");
+  return new RegExp(source, flags);
+}
+
+function customFormatTitleTests(format, titles = []) {
+  if (!titles.length) {
+    return undefined;
+  }
+  const regexSpecs = (Array.isArray(format.specifications) ? format.specifications : [])
+    .flatMap(regexFieldsForSpecification);
+  return {
+    regexSpecificationCount: regexSpecs.length,
+    records: titles.map(title => {
+      const specifications = regexSpecs.map(spec => {
+        try {
+          const regex = compileRegexPattern(spec.pattern);
+          const regexMatched = regex.test(title);
+          return {
+            ...spec,
+            regexMatched,
+            effectiveMatch: spec.negate ? !regexMatched : regexMatched
+          };
+        } catch (error) {
+          return {
+            ...spec,
+            regexMatched: false,
+            effectiveMatch: false,
+            error: error.message
+          };
+        }
+      });
+      const required = specifications.filter(spec => spec.required);
+      const optional = specifications.filter(spec => !spec.required);
+      return {
+        title,
+        matches: specifications.length > 0
+          && required.every(spec => spec.effectiveMatch)
+          && (optional.length ? optional.some(spec => spec.effectiveMatch) : true),
+        specifications
+      };
+    })
+  };
+}
+
+async function updateCustomFormat(serviceName, input) {
+  const records = await servarrRecords(serviceName, "customformat");
+  const selector = compactObject({
+    id: input.id ?? input.definition?.id ?? input.patch?.id,
+    name: input.name ?? input.definition?.name ?? input.patch?.name
+  });
+  let current = null;
+  if (selector.id !== undefined || selector.name) {
+    try {
+      current = resolveRecordByIdOrName(records, selector, `${serviceName} custom format`);
+    } catch (error) {
+      if (!input.definition || !/was not found/.test(error.message)) {
+        throw error;
+      }
+    }
+  }
+  const creating = !current;
+  if (creating && !input.definition) {
+    throw new Error(`custom format was not found; provide definition to create it`);
+  }
+  const base = current ? mergeObjectPatch(current, input.definition || {}) : cloneJson(input.definition);
+  const proposed = mergeObjectPatch(base, input.patch || {});
+  const validationErrors = validateCustomFormat(proposed, current);
+  const apiPath = current ? `customformat/${current.id}` : "customformat";
+  const endpoint = arrEndpoint(current ? "PUT" : "POST", apiPath);
+  const diff = compactDiff(current || {}, proposed);
+  const response = {
+    dryRun: input.dryRun,
+    service: serviceName,
+    action: current ? "update" : "create",
+    endpoint,
+    currentObject: current ? redactSensitiveObject(current) : null,
+    proposedObject: redactSensitiveObject(proposed),
+    apiPayload: redactSensitiveObject(proposed),
+    diff,
+    validationErrors,
+    titleTests: customFormatTitleTests(proposed, input.testTitles)
+  };
+  if (validationErrors.length) {
+    return { ...response, applied: false, note: "Validation errors prevented the custom format update." };
+  }
+  if (input.dryRun) {
+    return { ...response, applied: false, note: `Set dryRun to false to ${current ? "PUT" : "POST"} this ${serviceName} custom format.` };
+  }
+  if (current && !diff.length) {
+    return { ...response, applied: false, note: "No changes detected; no API call was made." };
+  }
+  return {
+    ...response,
+    applied: true,
+    result: redactSensitiveObject(await arrApi(serviceName, "v3", apiPath, { method: current ? "PUT" : "POST", body: proposed }))
+  };
+}
+
+function validateQualityDefinition(definition, original) {
+  const errors = [];
+  if (!isPlainObject(definition)) {
+    return ["quality definition must be an object"];
+  }
+  if (!Number.isInteger(definition.id) || definition.id <= 0) {
+    errors.push("quality definition id must be a positive integer");
+  }
+  if (original && definition.id !== original.id) {
+    errors.push("quality definition id cannot be changed");
+  }
+  for (const key of ["minSize", "maxSize", "preferredSize"]) {
+    if (definition[key] !== undefined && (typeof definition[key] !== "number" || definition[key] < 0)) {
+      errors.push(`${key} must be a non-negative number when provided`);
+    }
+  }
+  if (typeof definition.minSize === "number" && typeof definition.maxSize === "number" && definition.minSize > definition.maxSize) {
+    errors.push("minSize cannot be greater than maxSize");
+  }
+  if (typeof definition.preferredSize === "number") {
+    if (typeof definition.minSize === "number" && definition.preferredSize < definition.minSize) {
+      errors.push("preferredSize cannot be less than minSize");
+    }
+    if (typeof definition.maxSize === "number" && definition.preferredSize > definition.maxSize) {
+      errors.push("preferredSize cannot be greater than maxSize");
+    }
+  }
+  return errors;
+}
+
+async function updateQualityDefinition(serviceName, input) {
+  const records = await servarrRecords(serviceName, "qualitydefinition");
+  const current = resolveQualityDefinition(records, input, `${serviceName} quality definition`);
+  const proposed = mergeObjectPatch(current, input.patch);
+  const validationErrors = validateQualityDefinition(proposed, current);
+  const endpointId = current.id ?? qualityDefinitionQualityId(current);
+  const endpoint = arrEndpoint("PUT", `qualitydefinition/${endpointId}`);
+  const diff = compactDiff(current, proposed);
+  const response = {
+    dryRun: input.dryRun,
+    service: serviceName,
+    endpoint,
+    currentObject: redactSensitiveObject(current),
+    proposedObject: redactSensitiveObject(proposed),
+    diff,
+    validationErrors
+  };
+  if (validationErrors.length) {
+    return { ...response, applied: false, note: "Validation errors prevented the quality definition update." };
+  }
+  if (input.dryRun) {
+    return { ...response, applied: false, note: `Set dryRun to false to PUT this full ${serviceName} quality definition.` };
+  }
+  if (!diff.length) {
+    return { ...response, applied: false, note: "No changes detected; no API call was made." };
+  }
+  return {
+    ...response,
+    applied: true,
+    result: redactSensitiveObject(await arrApi(serviceName, "v3", `qualitydefinition/${endpointId}`, { method: "PUT", body: proposed }))
   };
 }
 
@@ -3042,6 +3849,76 @@ async function serviceStatus(name) {
   }
 }
 
+function registerServarrConfigTools(server, serviceName, displayName) {
+  server.registerTool(`${serviceName}_quality_profiles`, {
+    title: `${displayName} Quality Profiles`,
+    description: `List or get ${displayName} quality profiles by id or exact name. Set includeRaw for the full Servarr profile object, including nested qualities, cutoff, upgradeAllowed, formatItems, and format score thresholds.`,
+    inputSchema: {
+      id: z.number().int().positive().optional(),
+      name: z.string().min(1).optional(),
+      includeRaw: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await arrQualityProfiles(serviceName, input)));
+
+  server.registerTool(`${serviceName}_update_quality_profile`, {
+    title: `${displayName} Update Quality Profile`,
+    description: `Patch a ${displayName} quality profile by id or exact name. Dry-run is enabled by default and returns current object, proposed object, compact diff, validation errors, and the PUT endpoint. Use qualityAllowed or allowedQualities for quality/group allowed changes, and customFormatScores or formatScores for custom format scoring by id or exact name.`,
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      id: z.number().int().positive().optional(),
+      name: z.string().min(1).optional(),
+      patch: z.object({}).catchall(z.any()),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await updateQualityProfile(serviceName, input)));
+
+  server.registerTool(`${serviceName}_custom_formats`, {
+    title: `${displayName} Custom Formats`,
+    description: `List or get ${displayName} custom formats by id or exact name. Set includeRaw for the full Servarr custom format object.`,
+    inputSchema: {
+      id: z.number().int().positive().optional(),
+      name: z.string().min(1).optional(),
+      includeRaw: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await arrCustomFormats(serviceName, input)));
+
+  server.registerTool(`${serviceName}_update_custom_format`, {
+    title: `${displayName} Update Custom Format`,
+    description: `Create or update a ${displayName} custom format. Dry-run is enabled by default and returns current object, proposed object, compact diff, API payload, validation errors, and regex title test results when testTitles is provided.`,
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      id: z.number().int().positive().optional(),
+      name: z.string().min(1).optional(),
+      definition: z.object({}).catchall(z.any()).optional(),
+      patch: z.object({}).catchall(z.any()).optional(),
+      testTitles: z.array(z.string().min(1)).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await updateCustomFormat(serviceName, input)));
+
+  server.registerTool(`${serviceName}_quality_definitions`, {
+    title: `${displayName} Quality Definitions`,
+    description: `List or get ${displayName} quality definitions by qualityId or exact qualityName. Set includeRaw for the full Servarr quality definition object.`,
+    inputSchema: {
+      qualityId: z.number().int().positive().optional(),
+      qualityName: z.string().min(1).optional(),
+      includeRaw: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await arrQualityDefinitions(serviceName, input)));
+
+  server.registerTool(`${serviceName}_update_quality_definition`, {
+    title: `${displayName} Update Quality Definition`,
+    description: `Patch ${displayName} quality size settings by qualityId or exact qualityName. Dry-run is enabled by default and returns current object, proposed object, compact diff, validation errors, and the PUT endpoint.`,
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      qualityId: z.number().int().positive().optional(),
+      qualityName: z.string().min(1).optional(),
+      patch: z.object({}).catchall(z.any()),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await updateQualityDefinition(serviceName, input)));
+}
+
 function createServer() {
   const server = new McpServer({
     name: "unraid-codex-media-mcp",
@@ -3391,6 +4268,9 @@ function createServer() {
       limit: z.number().int().min(1).max(100).default(25)
     }
   }, async ({ limit }) => jsonText(await bazarrSubtitleOverview(limit)));
+
+  registerServarrConfigTools(server, "sonarr", "Sonarr");
+  registerServarrConfigTools(server, "radarr", "Radarr");
 
   server.registerTool("sonarr_list_series", {
     title: "Sonarr List Series",
