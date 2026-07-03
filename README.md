@@ -52,7 +52,7 @@ For full configuration, validation, local development, and security notes, see [
    - at least one public key in `SSH_AUTHORIZED_KEYS`
    - strong `WEBUI_PASSWORD`
 
-   Optional: add narrow read-only media/download diagnostics mounts on `codex-terminal` and set `CODEX_MEDIA_PATH_MAPS` so agents can use `media-path-check --json` for path troubleshooting.
+   Optional: add narrow media/download diagnostics mounts on `codex-terminal` and set `CODEX_MEDIA_PATH_MAPS` so agents can use `media-path-check --json` for path troubleshooting. Keep downloads read-only unless you intentionally need shell-side archive extraction.
 
 5. Optional: install `media-mcp` on the same network.
 
@@ -63,7 +63,7 @@ For full configuration, validation, local development, and security notes, see [
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `media` MCP server to Codex config.
 
-   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, command trigger, interactive search, and release-grab tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first.
+   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, archive extraction with filesystem fallback, command trigger, interactive search, and release-grab tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first. For archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports another path.
 
 6. Optional: install `utilities-mcp` on the same network.
 
@@ -115,7 +115,7 @@ The WebUI attaches to a persistent `tmux` session and starts Codex automatically
 - Use SSH keys when possible.
 - Keep `WEBUI_AUTH=true` and use a strong `WEBUI_PASSWORD`.
 - Never mount `/var/run/docker.sock`, `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
-- Keep optional media/download diagnostics mounts narrow, read-only, and on `codex-terminal` only.
+- Keep optional media/download mounts narrow. Use read/write downloads mounts only when you intentionally enable archive extraction.
 - Use a scoped Unraid API key, not an unrestricted admin key.
 - Keep media app API keys only on `media-mcp`, and enable only the services you want Codex to manage.
 - Keep Scrutiny endpoints only on `utilities-mcp`, and do not expose MCP sidecar ports to the host.

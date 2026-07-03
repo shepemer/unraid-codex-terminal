@@ -16,9 +16,14 @@ WORKDIR /app
 RUN groupmod -n mcp node \
     && usermod -l mcp -d /home/mcp -m node \
     && usermod -s /usr/sbin/nologin mcp \
+    && sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get upgrade -y --no-install-recommends \
-    && apt-get install -y --no-install-recommends ca-certificates libgnutls30 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgnutls30 \
+        p7zip-full \
+        unrar \
     && rm -rf /var/lib/apt/lists/*
 
 COPY media-mcp/package.json media-mcp/package-lock.json ./
@@ -38,14 +43,17 @@ RUN set -e; \
     && npm cache clean --force
 
 COPY media-mcp/server.js ./server.js
+COPY archive-tools-check /usr/local/bin/archive-tools-check
 
-RUN chown -R mcp:mcp /app /home/mcp
+RUN chmod 0755 /usr/local/bin/archive-tools-check \
+    && archive-tools-check --skip-write \
+    && chown -R mcp:mcp /app /home/mcp
 
 USER mcp
 
 EXPOSE 6971
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD node -e "const port=process.env.MEDIA_MCP_PORT||'6971'; const token=process.env.MEDIA_MCP_BEARER_TOKEN||''; fetch('http://127.0.0.1:'+port+'/health',{headers:{Authorization:'Bearer '+token}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+    CMD archive-tools-check --skip-write >/tmp/archive-tools-check.log && node -e "const port=process.env.MEDIA_MCP_PORT||'6971'; const token=process.env.MEDIA_MCP_BEARER_TOKEN||''; fetch('http://127.0.0.1:'+port+'/health',{headers:{Authorization:'Bearer '+token}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
 CMD ["node", "server.js"]

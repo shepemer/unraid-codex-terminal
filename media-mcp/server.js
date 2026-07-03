@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { spawn } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, readdir, rm, stat, writeFile } from "node:fs/promises";
 import nodePath from "node:path";
 import * as z from "zod/v4";
 
@@ -12,6 +13,7 @@ const host = env.MEDIA_MCP_HOST || "0.0.0.0";
 const bearerToken = env.MEDIA_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.MEDIA_MCP_REQUEST_TIMEOUT_MS || 30000);
 const allowedHosts = allowedHostnames(env.MEDIA_MCP_ALLOWED_HOSTS, "media-mcp", host);
+const mediaPathMaps = parsePathMaps(env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "/downloads=/mnt/unraid/downloads");
 
 if (!bearerToken) {
   console.error("media-mcp: MEDIA_MCP_BEARER_TOKEN is required");
@@ -412,6 +414,47 @@ function decodedField(value) {
 function cleanPath(value) {
   const decoded = decodeHtmlEntities(value || "");
   return decoded.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function parsePathMaps(value) {
+  return String(value || "")
+    .split(",")
+    .map(entry => entry.trim())
+    .filter(Boolean)
+    .map(entry => {
+      const separator = entry.indexOf("=");
+      if (separator <= 0) {
+        return null;
+      }
+      const source = cleanPath(entry.slice(0, separator));
+      const target = cleanPath(entry.slice(separator + 1));
+      if (!source || !target) {
+        return null;
+      }
+      return { source, target };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.source.length - a.source.length);
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function mediaPathCandidates(pathValue) {
+  const clean = cleanPath(pathValue);
+  if (!clean) {
+    return [];
+  }
+  const candidates = [clean];
+  for (const map of mediaPathMaps) {
+    if (!pathInside(map.source, clean)) {
+      continue;
+    }
+    const suffix = clean === map.source ? "" : clean.slice(map.source.length + 1);
+    candidates.push(suffix ? `${map.target}/${suffix}` : map.target);
+  }
+  return uniqueValues(candidates);
 }
 
 function pathInside(parent, candidate) {
@@ -847,7 +890,7 @@ function summarizeNzbgetFile(record) {
 
 function archiveKind(filename) {
   const lower = String(filename || "").toLowerCase();
-  if (/\.part0*1\.rar$/.test(lower) || /\.rar$/.test(lower) || /\.7z$/.test(lower) || /\.zip$/.test(lower)) {
+  if (/\.part0*1\.rar$/.test(lower) || (/\.rar$/.test(lower) && !/\.part\d+\.rar$/.test(lower)) || /\.7z(\.001)?$/.test(lower) || /\.zip$/.test(lower)) {
     return "root";
   }
   if (/\.(r\d{2,3}|7z\.\d{3}|z\d{2}|part\d+\.rar)$/.test(lower)) {
@@ -877,6 +920,183 @@ function archiveSummary(files) {
     roots,
     files: archiveFiles
   };
+}
+
+async function pathInfo(pathValue) {
+  try {
+    const details = await stat(pathValue);
+    return {
+      path: pathValue,
+      exists: true,
+      directory: details.isDirectory(),
+      readable: await access(pathValue, fsConstants.R_OK).then(() => true, () => false)
+    };
+  } catch (error) {
+    return {
+      path: pathValue,
+      exists: false,
+      directory: false,
+      readable: false,
+      error: error.message
+    };
+  }
+}
+
+async function resolveReadableDirectory(pathValue) {
+  const candidates = mediaPathCandidates(pathValue);
+  const checked = [];
+  for (const candidate of candidates) {
+    const info = await pathInfo(candidate);
+    checked.push(info);
+    if (info.directory && info.readable) {
+      return { path: candidate, candidates, checked };
+    }
+  }
+  return { path: null, candidates, checked };
+}
+
+async function findExecutable(names) {
+  const pathDirs = String(env.PATH || "").split(":").filter(Boolean);
+  for (const name of names) {
+    const candidates = name.includes("/") ? [name] : pathDirs.map(dir => nodePath.join(dir, name));
+    for (const candidate of candidates) {
+      try {
+        await access(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+  }
+  return null;
+}
+
+async function archiveToolAvailability() {
+  const [unrar, sevenZip] = await Promise.all([
+    findExecutable(["unrar"]),
+    findExecutable(["7z", "7zz"])
+  ]);
+  return {
+    unrar: { available: Boolean(unrar), path: unrar || undefined },
+    sevenZip: { available: Boolean(sevenZip), path: sevenZip || undefined }
+  };
+}
+
+function firstOutputLine(result) {
+  return `${result.stdout || ""}\n${result.stderr || ""}`
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean);
+}
+
+async function commandVersion(pathValue) {
+  if (!pathValue) {
+    return undefined;
+  }
+  const result = await runCommandResult(pathValue, [], undefined);
+  return compactObject({
+    command: pathValue,
+    code: result.code,
+    version: firstOutputLine(result),
+    error: result.error
+  });
+}
+
+async function writeAccessProbe(dir) {
+  const probePath = nodePath.join(dir, `.codex-archive-write-test-${process.pid}-${Date.now()}`);
+  try {
+    await writeFile(probePath, "ok\n", { flag: "wx" });
+    await rm(probePath, { force: true });
+    return { writable: true, path: probePath };
+  } catch (error) {
+    await rm(probePath, { force: true }).catch(() => {});
+    return { writable: false, path: probePath, error: error.message };
+  }
+}
+
+async function archiveEnvironmentCheck(input = {}) {
+  const downloadsPath = input.downloadsPath || "/mnt/unraid/downloads";
+  const [tools, pathResolution] = await Promise.all([
+    archiveToolAvailability(),
+    resolveReadableDirectory(downloadsPath)
+  ]);
+  const versions = {
+    unrar: await commandVersion(tools.unrar.path),
+    sevenZip: await commandVersion(tools.sevenZip.path)
+  };
+  const writeCheck = input.writeTest === false || !pathResolution.path
+    ? { skipped: true, reason: pathResolution.path ? "writeTest is false" : "downloads path is not visible" }
+    : await writeAccessProbe(pathResolution.path);
+  const blockers = [];
+  if (!tools.unrar.available) {
+    blockers.push({ type: "missing_tool", tool: "unrar", message: "unrar is not available on PATH." });
+  }
+  if (!tools.sevenZip.available) {
+    blockers.push({ type: "missing_tool", tool: "7z_or_7zz", message: "Neither 7z nor 7zz is available on PATH." });
+  }
+  if (!pathResolution.path) {
+    blockers.push({ type: "path_not_visible", path: downloadsPath, candidates: pathResolution.candidates });
+  } else if (writeCheck.writable === false) {
+    blockers.push({ type: "path_read_only", path: pathResolution.path, message: writeCheck.error });
+  }
+  return {
+    tools,
+    versions,
+    downloadsPath,
+    mediaPathMaps,
+    pathCandidates: pathResolution.candidates,
+    visiblePath: pathResolution.path || undefined,
+    checkedPaths: pathResolution.checked,
+    writeCheck,
+    blockers
+  };
+}
+
+async function discoverFilesystemArchiveRoots(dir, depth = 0) {
+  if (depth > 3) {
+    return [];
+  }
+  const entries = await readdir(dir, { withFileTypes: true });
+  const roots = [];
+  for (const entry of entries) {
+    const fullPath = nodePath.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      roots.push(...await discoverFilesystemArchiveRoots(fullPath, depth + 1));
+      continue;
+    }
+    const kind = archiveKind(entry.name);
+    if (kind === "root") {
+      roots.push({
+        filename: entry.name,
+        path: fullPath,
+        archiveKind: kind,
+        archiveRoot: archiveRootKey(entry.name),
+        source: "filesystem"
+      });
+    }
+  }
+  return roots.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function rootArchivePathFromListfile(file, localDestDir, originalDestDir) {
+  const candidates = mediaPathCandidates(file.path);
+  return candidates.find(candidate => pathInside(localDestDir, candidate))
+    || candidates.find(candidate => pathInside(originalDestDir, candidate));
+}
+
+function archiveExtractionStep(archivePath, cwd, tools) {
+  const lower = archivePath.toLowerCase();
+  const useUnrar = /\.rar$/.test(lower);
+  const requiredTool = useUnrar ? "unrar" : "7z_or_7zz";
+  const command = useUnrar ? tools?.unrar?.path : tools?.sevenZip?.path;
+  return compactObject({
+    command: command || (useUnrar ? "unrar" : "7z"),
+    args: useUnrar ? ["x", "-o-", archivePath] : ["x", "-aos", archivePath],
+    cwd,
+    archivePath,
+    requiredTool,
+    missingTool: tools && !command ? requiredTool : undefined
+  });
 }
 
 async function nzbgetDownloadFiles(input) {
@@ -967,17 +1187,8 @@ async function downloadClientArchiveDiagnosis(input) {
   };
 }
 
-async function pathExists(pathValue) {
-  try {
-    await readdir(pathValue);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function runCommand(command, args, cwd) {
-  return new Promise((resolve, reject) => {
+async function runCommandResult(command, args, cwd) {
+  return new Promise(resolve => {
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -987,13 +1198,11 @@ async function runCommand(command, args, cwd) {
     child.stderr.on("data", chunk => {
       stderr += chunk;
     });
-    child.on("error", reject);
+    child.on("error", error => {
+      resolve({ code: null, stdout: redactText(stdout), stderr: redactText(stderr), error: error.message });
+    });
     child.on("close", code => {
-      if (code === 0) {
-        resolve({ code, stdout: redactText(stdout), stderr: redactText(stderr) });
-      } else {
-        reject(new Error(`${command} exited ${code}: ${stderr || stdout}`));
-      }
+      resolve({ code, stdout: redactText(stdout), stderr: redactText(stderr) });
     });
   });
 }
@@ -1030,45 +1239,177 @@ async function extractNzbgetArchives(input) {
   if (!destDir) {
     throw new Error("matched NZBGet history item does not expose DestDir");
   }
-  const roots = (fileResult.archiveSummary.roots || [])
-    .map(file => file.path)
-    .filter(pathValue => pathInside(destDir, pathValue));
-  const outside = (fileResult.archiveSummary.roots || []).filter(file => !pathInside(destDir, file.path));
+  const listfileRoots = fileResult.archiveSummary.roots || [];
+  const outside = listfileRoots.filter(file => !pathInside(destDir, file.path));
   if (outside.length) {
-    throw new Error("refusing extraction because one or more archive roots are outside DestDir");
-  }
-  if (!roots.length) {
     return {
       dryRun: input.dryRun,
       record,
       destDir,
       extractedMediaFiles: [],
-      blockers: [{ type: "no_archive_roots", message: "NZBGet did not expose any root archive files to extract." }]
+      blockers: [{
+        type: "archive_outside_destdir",
+        message: "Refusing extraction because one or more archive roots are outside the NZBGet DestDir.",
+        archives: outside.map(file => file.path)
+      }]
     };
   }
-  const plan = roots.map(archivePath => ({
-    command: "unrar",
-    args: ["x", "-o-", archivePath],
-    cwd: destDir
-  }));
+
+  const pathResolution = await resolveReadableDirectory(destDir);
+  const localDestDir = pathResolution.path || destDir;
+  let archiveSource = "nzbget_listfiles";
+  let discoveredArchiveRoots = [];
+  let roots = uniqueValues(listfileRoots
+    .map(file => rootArchivePathFromListfile(file, localDestDir, destDir))
+    .filter(Boolean));
+
+  if (!roots.length && pathResolution.path) {
+    archiveSource = "filesystem";
+    discoveredArchiveRoots = await discoverFilesystemArchiveRoots(pathResolution.path);
+    roots = discoveredArchiveRoots.map(file => file.path);
+  }
+
+  if (!roots.length) {
+    const blockers = [];
+    if (!pathResolution.path) {
+      blockers.push({
+        type: "path_not_visible",
+        path: destDir,
+        candidates: pathResolution.candidates,
+        message: "NZBGet DestDir is not readable inside media-mcp, so filesystem archive discovery cannot run."
+      });
+    }
+    blockers.push({
+      type: "no_archive_roots",
+      message: listfileRoots.length
+        ? "NZBGet exposed archive roots, but none resolved inside DestDir after path mapping."
+        : "NZBGet did not expose root archive files and filesystem discovery found none."
+    });
+    return {
+      dryRun: input.dryRun,
+      record,
+      destDir,
+      localDestDir,
+      pathCandidates: pathResolution.candidates,
+      checkedPaths: pathResolution.checked,
+      archiveSource,
+      discoveredArchiveRoots,
+      extractedMediaFiles: [],
+      blockers
+    };
+  }
+
+  const tools = input.dryRun ? null : await archiveToolAvailability();
+  const plan = roots.map(archivePath => archiveExtractionStep(archivePath, localDestDir, tools));
+
   if (input.dryRun) {
     return {
       dryRun: true,
       record,
       destDir,
+      localDestDir,
+      pathCandidates: pathResolution.candidates,
+      checkedPaths: pathResolution.checked,
+      archiveSource,
       archiveRoots: roots,
+      discoveredArchiveRoots,
       plan,
-      note: "Set dryRun to false to run unrar inside the matched history item's DestDir."
+      note: "Set dryRun to false to extract archive roots inside the matched history item's DestDir."
     };
   }
-  if (!await pathExists(destDir)) {
-    throw new Error(`DestDir is not readable inside media-mcp: ${destDir}`);
+
+  const blockers = [];
+  if (!pathResolution.path) {
+    blockers.push({
+      type: "path_not_visible",
+      path: destDir,
+      candidates: pathResolution.candidates,
+      message: "NZBGet DestDir is not readable inside media-mcp."
+    });
   }
+  for (const step of plan) {
+    if (step.missingTool) {
+      blockers.push({
+        type: "missing_tool",
+        tool: step.missingTool,
+        archivePath: step.archivePath,
+        message: `${step.missingTool} is required for this archive root and is not available on PATH.`
+      });
+    }
+  }
+  for (const archivePath of roots) {
+    try {
+      await access(archivePath, fsConstants.R_OK);
+    } catch (error) {
+      blockers.push({
+        type: "archive_not_readable",
+        archivePath,
+        message: error.message
+      });
+    }
+  }
+  const writeCheck = pathResolution.path ? await writeAccessProbe(localDestDir) : { skipped: true, reason: "path is not visible" };
+  if (writeCheck.writable === false) {
+    blockers.push({
+      type: "path_read_only",
+      path: localDestDir,
+      message: writeCheck.error
+    });
+  }
+  if (blockers.length) {
+    return {
+      dryRun: false,
+      record,
+      destDir,
+      localDestDir,
+      pathCandidates: pathResolution.candidates,
+      checkedPaths: pathResolution.checked,
+      archiveSource,
+      archiveRoots: roots,
+      discoveredArchiveRoots,
+      tools,
+      writeCheck,
+      plan,
+      extractedMediaFiles: [],
+      blockers
+    };
+  }
+
   const results = [];
   for (const step of plan) {
-    results.push(await runCommand(step.command, step.args, step.cwd));
+    const result = await runCommandResult(step.command, step.args, step.cwd);
+    results.push({ ...step, ...result });
+    if (result.code !== 0) {
+      blockers.push({
+        type: "extraction_failed",
+        archivePath: step.archivePath,
+        command: step.command,
+        code: result.code,
+        message: result.stderr || result.stdout || result.error || "archive extraction failed"
+      });
+    }
   }
-  const extractedMediaFiles = await listMediaFiles(destDir);
+
+  if (blockers.length) {
+    return {
+      dryRun: false,
+      record,
+      destDir,
+      localDestDir,
+      pathCandidates: pathResolution.candidates,
+      checkedPaths: pathResolution.checked,
+      archiveSource,
+      archiveRoots: roots,
+      discoveredArchiveRoots,
+      tools,
+      writeCheck,
+      results,
+      extractedMediaFiles: [],
+      blockers
+    };
+  }
+
+  const extractedMediaFiles = await listMediaFiles(localDestDir);
   let scanCommand;
   if (input.triggerScanService) {
     const commandName = input.triggerScanService === "sonarr" ? "DownloadedEpisodesScan" : "DownloadedMoviesScan";
@@ -1083,7 +1424,14 @@ async function extractNzbgetArchives(input) {
     dryRun: false,
     record,
     destDir,
+    localDestDir,
+    pathCandidates: pathResolution.candidates,
+    checkedPaths: pathResolution.checked,
+    archiveSource,
     archiveRoots: roots,
+    discoveredArchiveRoots,
+    tools,
+    writeCheck,
     results,
     extractedMediaFiles,
     scanCommand
@@ -2713,6 +3061,15 @@ function createServer() {
     return jsonText(Object.fromEntries(entries));
   });
 
+  server.registerTool("media_archive_environment_check", {
+    title: "Media Archive Environment Check",
+    description: "Verify archive extraction binaries and optional downloads write access inside media-mcp.",
+    inputSchema: {
+      downloadsPath: z.string().min(1).default("/mnt/unraid/downloads"),
+      writeTest: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await archiveEnvironmentCheck(input)));
+
   server.registerTool("media_admin_overview", {
     title: "Media Admin Overview",
     description: "Return compact actionable counts for queues, download clients, Plex streams, and Seerr issues/requests."
@@ -3829,7 +4186,7 @@ function createServer() {
 
   server.registerTool("nzbget_extract_archives", {
     title: "NZBGet Extract Archives",
-    description: "Dry-run or run unrar extraction for archive roots inside one NZBGet history item's DestDir. Execution requires media-mcp to see that DestDir and have unrar installed.",
+    description: "Dry-run or run archive extraction for roots inside one NZBGet history item's DestDir, falling back to filesystem discovery when NZBGet listfiles is empty.",
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
       nzbId: z.number().int().positive().optional(),

@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -43,6 +46,13 @@ function parseSse(text) {
 async function run() {
   const calls = [];
   let commandId = 1000;
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "media-mcp-archives-"));
+  const mappedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Archive.Bundle.S01.1080p-GRP");
+  await mkdir(mappedArchiveDir, { recursive: true });
+  await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.rar"), "placeholder\n");
+  await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.r00"), "placeholder\n");
+  await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e02.part01.rar"), "placeholder\n");
+  await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e02.part02.rar"), "placeholder\n");
   const sonarrQueue = [
     {
       id: 1001,
@@ -223,6 +233,22 @@ async function run() {
       Parameters: [{ Name: "drone", Value: "example-archive-drone-id" }],
       FileSizeMB: 1234,
       DownloadedSizeMB: 1234
+    },
+    {
+      NZBID: 70002,
+      ID: 70002,
+      Name: "Archive.Bundle.S01.1080p-GRP",
+      NZBName: "Archive.Bundle.S01.1080p-GRP",
+      Status: "SUCCESS/PAR",
+      ParStatus: "SUCCESS",
+      UnpackStatus: "NONE",
+      MoveStatus: "SUCCESS",
+      Deleted: false,
+      DeleteStatus: "NONE",
+      DestDir: "/downloads/usenet/completed/Series/Archive.Bundle.S01.1080p-GRP",
+      Parameters: [{ Name: "drone", Value: "filesystem-archive-drone-id" }],
+      FileSizeMB: 4321,
+      DownloadedSizeMB: 4321
     },
     {
       NZBID: 56573,
@@ -413,7 +439,8 @@ async function run() {
       RADARR_API_KEY: "radarr-key",
       NZBGET_URL: `http://127.0.0.1:${mockPort}`,
       NZBGET_USERNAME: "nzbget",
-      NZBGET_PASSWORD: "tegbzn6789"
+      NZBGET_PASSWORD: "tegbzn6789",
+      MEDIA_MCP_PATH_MAPS: `/downloads=${tempRoot}`
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -504,6 +531,7 @@ async function run() {
       "sonarr_grab_release",
       "sonarr_download_client_scan",
       "sonarr_command_cancel",
+      "media_archive_environment_check",
       "radarr_search_missing",
       "radarr_search_cutoff_unmet",
       "radarr_search_movie",
@@ -663,6 +691,21 @@ async function run() {
     assert.equal(extractDryRun.plan[0].command, "unrar");
     assert.deepEqual(extractDryRun.plan[0].args.slice(0, 2), ["x", "-o-"]);
 
+    const filesystemExtractDryRun = await tool("nzbget_extract_archives", { nzbId: 70002, dryRun: true });
+    assert.equal(filesystemExtractDryRun.dryRun, true);
+    assert.equal(filesystemExtractDryRun.archiveSource, "filesystem");
+    assert.equal(filesystemExtractDryRun.localDestDir, mappedArchiveDir);
+    assert.deepEqual(filesystemExtractDryRun.archiveRoots.map(root => path.basename(root)).sort(), [
+      "archive.bundle.s01e01.rar",
+      "archive.bundle.s01e02.part01.rar"
+    ]);
+    assert.ok(!filesystemExtractDryRun.archiveRoots.some(root => root.endsWith(".r00") || root.endsWith(".part02.rar")));
+
+    const archiveEnvironment = await tool("media_archive_environment_check", { downloadsPath: "/downloads", writeTest: false });
+    assert.equal(archiveEnvironment.visiblePath, tempRoot);
+    assert.equal(archiveEnvironment.writeCheck.skipped, true);
+    assert.ok(Array.isArray(archiveEnvironment.blockers));
+
     const queue = await tool("sonarr_queue", { limit: 5 });
     const escapedQueueItem = queue.records.find(record => record.id === 1003);
     assert.equal(escapedQueueItem.title, "A & B.Show.S01E02.1080p-GRP");
@@ -747,6 +790,7 @@ async function run() {
     child.kill("SIGTERM");
     mock.close();
     await once(mock, "close");
+    await rm(tempRoot, { recursive: true, force: true });
   }
 }
 
