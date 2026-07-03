@@ -299,6 +299,83 @@ async function run() {
       { ID: 2, Kind: "WARNING", Time: 1783120001, Text: "Found archive file, might need to be extracted" }
     ]
   };
+  const badTermsSpecification = {
+    name: "Bad release terms",
+    implementation: "ReleaseTitleSpecification",
+    implementationName: "Release Title",
+    negate: false,
+    required: false,
+    fields: [{ name: "value", value: "\\b(CAM|HDRip|DCPRip|HDSCR)\\b" }]
+  };
+  const secretSpecification = {
+    name: "Secret setting fixture",
+    implementation: "ExampleSpecification",
+    implementationName: "Example",
+    negate: false,
+    required: false,
+    fields: [{ name: "apiKey", value: "should-not-leak" }]
+  };
+  const qualityProfiles = {
+    sonarr: [{
+      id: 1,
+      name: "Best Available",
+      upgradeAllowed: true,
+      cutoff: 3,
+      minFormatScore: 0,
+      cutoffFormatScore: 0,
+      minUpgradeFormatScore: 0,
+      items: [
+        { quality: { id: 1, name: "CAM" }, allowed: true },
+        {
+          id: 1000,
+          name: "WEB 1080p",
+          allowed: true,
+          items: [
+            { quality: { id: 3, name: "WEBDL-1080p" }, allowed: true },
+            { quality: { id: 4, name: "WEBRip-1080p" }, allowed: true }
+          ]
+        }
+      ],
+      formatItems: [{ format: 10, name: "Bad Release Source", score: 0 }]
+    }],
+    radarr: [{
+      id: 2,
+      name: "Best Available",
+      upgradeAllowed: true,
+      cutoff: 3,
+      minFormatScore: 0,
+      cutoffFormatScore: 0,
+      minUpgradeFormatScore: 0,
+      items: [
+        { quality: { id: 1, name: "CAM" }, allowed: true },
+        { quality: { id: 2, name: "TELESYNC" }, allowed: true },
+        {
+          id: 1000,
+          name: "WEB 1080p",
+          allowed: true,
+          items: [
+            { quality: { id: 3, name: "WEBDL-1080p" }, allowed: true },
+            { quality: { id: 4, name: "WEBRip-1080p" }, allowed: true }
+          ]
+        }
+      ],
+      formatItems: [{ format: 10, name: "Bad Release Source", score: 0 }]
+    }]
+  };
+  const customFormats = {
+    sonarr: [{ id: 10, name: "Bad Release Source", includeCustomFormatWhenRenaming: false, specifications: [badTermsSpecification] }],
+    radarr: [{ id: 10, name: "Bad Release Source", includeCustomFormatWhenRenaming: false, specifications: [badTermsSpecification] }]
+  };
+  const qualityDefinitions = {
+    sonarr: [
+      { id: 101, quality: { id: 1, name: "CAM" }, title: "CAM", minSize: 0, maxSize: 10, preferredSize: 5 },
+      { id: 103, quality: { id: 3, name: "WEBDL-1080p" }, title: "WEBDL-1080p", minSize: 1, maxSize: 100, preferredSize: 50 }
+    ],
+    radarr: [
+      { id: 201, quality: { id: 1, name: "CAM" }, title: "CAM", minSize: 0, maxSize: 10, preferredSize: 5 },
+      { id: 203, quality: { id: 3, name: "WEBDL-1080p" }, title: "WEBDL-1080p", minSize: 1, maxSize: 100, preferredSize: 50 }
+    ]
+  };
 
   function queueForService(service) {
     return service === "sonarr" ? sonarrQueue : radarrQueue;
@@ -399,6 +476,47 @@ async function run() {
         downloadUrl: "https://example.invalid/grab?token=secret"
       });
     }
+    if (req.method === "GET" && path === "qualityprofile") {
+      return sendJson(res, 200, qualityProfiles[service]);
+    }
+    if (req.method === "PUT" && path.startsWith("qualityprofile/")) {
+      const id = Number(path.split("/")[1]);
+      const index = qualityProfiles[service].findIndex(profile => profile.id === id);
+      if (index === -1) {
+        return sendJson(res, 404, { error: "missing profile" });
+      }
+      qualityProfiles[service][index] = body;
+      return sendJson(res, 200, body);
+    }
+    if (req.method === "GET" && path === "customformat") {
+      return sendJson(res, 200, customFormats[service]);
+    }
+    if (req.method === "POST" && path === "customformat") {
+      const created = { id: Math.max(0, ...customFormats[service].map(format => format.id)) + 1, ...body };
+      customFormats[service].push(created);
+      return sendJson(res, 200, created);
+    }
+    if (req.method === "PUT" && path.startsWith("customformat/")) {
+      const id = Number(path.split("/")[1]);
+      const index = customFormats[service].findIndex(format => format.id === id);
+      if (index === -1) {
+        return sendJson(res, 404, { error: "missing custom format" });
+      }
+      customFormats[service][index] = body;
+      return sendJson(res, 200, body);
+    }
+    if (req.method === "GET" && path === "qualitydefinition") {
+      return sendJson(res, 200, qualityDefinitions[service]);
+    }
+    if (req.method === "PUT" && path.startsWith("qualitydefinition/")) {
+      const id = Number(path.split("/")[1]);
+      const index = qualityDefinitions[service].findIndex(definition => definition.id === id);
+      if (index === -1) {
+        return sendJson(res, 404, { error: "missing quality definition" });
+      }
+      qualityDefinitions[service][index] = body;
+      return sendJson(res, 200, body);
+    }
     if (req.method === "GET" && path === "queue/details") {
       return sendJson(res, 200, queueForService(service));
     }
@@ -497,6 +615,10 @@ async function run() {
     return calls.filter(call => call.method === "POST" && call.path === "release").length;
   }
 
+  function arrCallCount(method, pathValue) {
+    return calls.filter(call => call.method === method && call.path === pathValue).length;
+  }
+
   try {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       try {
@@ -531,6 +653,12 @@ async function run() {
       "sonarr_grab_release",
       "sonarr_download_client_scan",
       "sonarr_command_cancel",
+      "sonarr_quality_profiles",
+      "sonarr_update_quality_profile",
+      "sonarr_custom_formats",
+      "sonarr_update_custom_format",
+      "sonarr_quality_definitions",
+      "sonarr_update_quality_definition",
       "media_archive_environment_check",
       "radarr_search_missing",
       "radarr_search_cutoff_unmet",
@@ -544,6 +672,12 @@ async function run() {
       "radarr_grab_release",
       "radarr_download_client_scan",
       "radarr_command_cancel",
+      "radarr_quality_profiles",
+      "radarr_update_quality_profile",
+      "radarr_custom_formats",
+      "radarr_update_custom_format",
+      "radarr_quality_definitions",
+      "radarr_update_quality_definition",
       "nzbget_history_detail",
       "nzbget_download_files",
       "nzbget_retry_postprocess",
@@ -552,6 +686,109 @@ async function run() {
     ]) {
       assert.ok(toolNames.has(name), `missing tool ${name}`);
     }
+
+    const profileRaw = await tool("radarr_quality_profiles", { name: "Best Available", includeRaw: true });
+    assert.equal(profileRaw.records.length, 1);
+    assert.equal(profileRaw.records[0].formatItems[0].score, 0);
+
+    const profileDryPutCount = arrCallCount("PUT", "qualityprofile/2");
+    const profileDryRun = await tool("radarr_update_quality_profile", {
+      name: "Best Available",
+      patch: {
+        upgradeAllowed: false,
+        cutoff: "WEBDL-1080p",
+        qualityAllowed: { CAM: false },
+        customFormatScores: { "Bad Release Source": -10000 },
+        minFormatScore: -10000,
+        cutoffFormatScore: 0,
+        minUpgradeFormatScore: 0
+      }
+    });
+    assert.equal(profileDryRun.dryRun, true);
+    assert.equal(profileDryRun.applied, false);
+    assert.equal(profileDryRun.endpoint.method, "PUT");
+    assert.equal(profileDryRun.endpoint.path, "/api/v3/qualityprofile/2");
+    assert.equal(profileDryRun.proposedObject.upgradeAllowed, false);
+    assert.equal(profileDryRun.proposedObject.items[0].allowed, false);
+    assert.equal(profileDryRun.proposedObject.formatItems[0].score, -10000);
+    assert.equal(profileDryRun.validationErrors.length, 0);
+    assert.ok(profileDryRun.diff.some(change => change.path === "$.items[0].allowed"));
+    assert.equal(arrCallCount("PUT", "qualityprofile/2"), profileDryPutCount);
+
+    const profileApply = await tool("radarr_update_quality_profile", {
+      id: 2,
+      patch: {
+        qualityAllowed: [{ qualityId: 2, allowed: false }],
+        customFormatScores: [{ id: 10, score: -10000 }]
+      },
+      dryRun: false
+    });
+    assert.equal(profileApply.applied, true);
+    assert.equal(lastCall().method, "PUT");
+    assert.equal(lastCall().path, "qualityprofile/2");
+    assert.equal(lastCall().body.items[1].allowed, false);
+    assert.equal(lastCall().body.formatItems[0].score, -10000);
+
+    const customFormatSummary = await tool("radarr_custom_formats", { name: "Bad Release Source" });
+    assert.equal(customFormatSummary.records[0].name, "Bad Release Source");
+    const customFormatDryRun = await tool("radarr_update_custom_format", {
+      name: "Bad Release Source",
+      patch: { includeCustomFormatWhenRenaming: true },
+      testTitles: ["Movie.2026.CAM-GRP", "Movie.2026.1080p.BluRay-GRP"]
+    });
+    assert.equal(customFormatDryRun.dryRun, true);
+    assert.equal(customFormatDryRun.applied, false);
+    assert.equal(customFormatDryRun.endpoint.path, "/api/v3/customformat/10");
+    assert.equal(customFormatDryRun.titleTests.records[0].matches, true);
+    assert.equal(customFormatDryRun.titleTests.records[1].matches, false);
+
+    const customFormatApply = await tool("radarr_update_custom_format", {
+      id: 10,
+      patch: { includeCustomFormatWhenRenaming: true },
+      dryRun: false
+    });
+    assert.equal(customFormatApply.applied, true);
+    assert.equal(lastCall().method, "PUT");
+    assert.equal(lastCall().path, "customformat/10");
+    assert.equal(lastCall().body.includeCustomFormatWhenRenaming, true);
+
+    const customFormatCreateDryRun = await tool("sonarr_update_custom_format", {
+      name: "New Bad Terms",
+      definition: {
+        name: "New Bad Terms",
+        includeCustomFormatWhenRenaming: false,
+        specifications: [badTermsSpecification, secretSpecification]
+      },
+      testTitles: ["Show.S01E01.HDRip-GRP", "Show.S01E01.WEBDL-GRP"]
+    });
+    assert.equal(customFormatCreateDryRun.action, "create");
+    assert.equal(customFormatCreateDryRun.endpoint.method, "POST");
+    assert.equal(customFormatCreateDryRun.endpoint.path, "/api/v3/customformat");
+    assert.equal(customFormatCreateDryRun.proposedObject.specifications[1].fields[0].value, "[redacted]");
+    assert.equal(customFormatCreateDryRun.apiPayload.specifications[1].fields[0].value, "[redacted]");
+    assert.equal(customFormatCreateDryRun.titleTests.records[0].matches, true);
+    assert.equal(customFormatCreateDryRun.titleTests.records[1].matches, false);
+
+    const definitions = await tool("sonarr_quality_definitions", { qualityName: "WEBDL-1080p" });
+    assert.equal(definitions.records[0].qualityId, 3);
+    const definitionDryRun = await tool("sonarr_update_quality_definition", {
+      qualityName: "WEBDL-1080p",
+      patch: { minSize: 2, preferredSize: 60, maxSize: 110 }
+    });
+    assert.equal(definitionDryRun.dryRun, true);
+    assert.equal(definitionDryRun.endpoint.path, "/api/v3/qualitydefinition/103");
+    assert.equal(definitionDryRun.proposedObject.preferredSize, 60);
+    assert.equal(definitionDryRun.validationErrors.length, 0);
+
+    const definitionApply = await tool("sonarr_update_quality_definition", {
+      qualityId: 3,
+      patch: { preferredSize: 65 },
+      dryRun: false
+    });
+    assert.equal(definitionApply.applied, true);
+    assert.equal(lastCall().method, "PUT");
+    assert.equal(lastCall().path, "qualitydefinition/103");
+    assert.equal(lastCall().body.preferredSize, 65);
 
     assert.equal((await tool("sonarr_search_missing")).name, "MissingEpisodeSearch");
     assert.deepEqual(lastCall().body, { name: "MissingEpisodeSearch" });
