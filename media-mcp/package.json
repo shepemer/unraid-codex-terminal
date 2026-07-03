@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Optional media automation MCP sidecar for Unraid Codex Terminal.",
   "scripts": {
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "test:arr-commands": "node test-arr-command-tools.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
