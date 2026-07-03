@@ -184,15 +184,15 @@ ssh -t unraid-codex codex login
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
 - Shared: configured service status, compact media admin overview, diagnostics bundles, exact queue-item diagnosis, exact queue repair plans, issue diagnosis, and request triage.
-- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/episode/series/season searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
-- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/movie searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
+- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/episode/series/season searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
+- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/movie searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
 - Tautulli: current activity and playback history diagnostics.
 - Tracearr: health, OpenAPI, stats, today stats, activity trends, active streams, users, violations, and playback history diagnostics.
 - Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, subtitle history, and subtitle overview.
 - Prowlarr: list indexers, search, and indexer health/history summary.
 - qBittorrent: list torrents, pause or resume selected hashes, recheck/reannounce exact hashes, and delete selected hashes with explicit optional file deletion.
-- NZBGet: status, queue, history, guarded history removal, pause or resume downloads, and set rate limits.
+- NZBGet: status, queue, history/detail, exposed download files, archive diagnosis, dry-run-first post-processing retry, guarded history removal, optional local archive extraction, pause or resume downloads, and set rate limits.
 - Seerr, Overseerr, or Jellyseerr: search media, list/request details, guarded request status updates, and list/comment/resolve/reopen/delete reported issues.
 
 Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories. Tracearr support is read-only and does not expose stream termination.
@@ -200,6 +200,10 @@ Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API
 Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
 
 Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr command immediately and return the queued command record. Missing and cutoff searches can fan out into many indexer searches and may grab releases depending on each app's own settings. File-changing actions such as rename, downloaded scan, manual import, release grab, queue removal, and download-client cleanup are guarded with exact IDs/paths and dry-run-first behavior.
+
+Queue-based manual import tools use the queue item's decoded `outputPath`, `downloadId`, and target `seriesId` or `movieId` when calling the Arr manual import API. If the API returns rows from library roots such as `/tv/...` or `/movies/...` instead of the queue/download folder, those rows are excluded from valid candidates and reported as blockers. Queue summaries expose decoded display paths and include raw values when upstream fields arrive HTML-escaped.
+
+NZBGet post-processing retry tools are dry-run-first and never remove history or files. Use `download_client_archive_diagnosis` with a Sonarr/Radarr queue item to match the NZBGet history record by Arr `downloadId`/NZBGet `drone` parameter, inspect `UnpackStatus`, and report archive files exposed by NZBGet. Use `nzbget_retry_postprocess` with `dryRun=false` to call `editqueue("HistoryProcess", 0, [NZBID])` for one exact history item. Deleted history items require `force=true`. `nzbget_extract_archives` only operates inside the matched history item's `DestDir`, requires `dryRun=false`, and requires the media MCP container to be able to read that path and run `unrar`.
 
 Example media MCP payloads:
 
@@ -256,6 +260,47 @@ Example media MCP payloads:
     "seriesId": 55,
     "files": [9876],
     "dryRun": true
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_queue_item_files",
+  "arguments": {
+    "queueId": 1309106746,
+    "limit": 50
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_import_queue_item",
+  "arguments": {
+    "queueId": 1309106746,
+    "importMode": "move",
+    "dryRun": true
+  }
+}
+```
+
+```json
+{
+  "tool": "nzbget_retry_postprocess",
+  "arguments": {
+    "nzbId": 70001,
+    "dryRun": true
+  }
+}
+```
+
+```json
+{
+  "tool": "download_client_archive_diagnosis",
+  "arguments": {
+    "service": "sonarr",
+    "queueId": 1309106746
   }
 }
 ```

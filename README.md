@@ -63,7 +63,7 @@ For full configuration, validation, local development, and security notes, see [
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `media` MCP server to Codex config.
 
-   The media MCP includes guarded Sonarr/Radarr queue, manual import, diagnostics, command trigger, interactive search, and release-grab tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first.
+   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, command trigger, interactive search, and release-grab tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first.
 
 6. Optional: install `utilities-mcp` on the same network.
 
