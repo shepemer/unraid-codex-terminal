@@ -1331,6 +1331,21 @@ function redactText(value) {
     .replace(/\b(X-Api-Key|X-Plex-Token):\s*\S+/gi, "$1: [redacted]");
 }
 
+function redactSensitiveObject(value) {
+  if (Array.isArray(value)) {
+    return value.map(redactSensitiveObject);
+  }
+  if (!value || typeof value !== "object") {
+    return redactText(value);
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
+    if (/api|token|password|passkey|cookie|authorization|downloadurl|magneturl/i.test(key)) {
+      return [key, "[redacted]"];
+    }
+    return [key, redactSensitiveObject(entry)];
+  }));
+}
+
 function summarizeArrLogRecord(record) {
   return compactObject({
     id: record.id,
@@ -1429,6 +1444,124 @@ async function arrBlocklist(serviceName, limit) {
 
 async function arrCommandStatus(serviceName, commandId) {
   return arrApi(serviceName, "v3", commandId ? `command/${commandId}` : "command");
+}
+
+async function queueArrCommand(serviceName, command) {
+  return arrApi(serviceName, "v3", "command", { method: "POST", body: command });
+}
+
+async function cancelArrCommand(serviceName, commandId, dryRun) {
+  if (dryRun) {
+    return { dryRun: true, service: serviceName, wouldCancelCommandId: commandId };
+  }
+  const response = await arrApi(serviceName, "v3", `command/${commandId}`, { method: "DELETE" });
+  return { dryRun: false, service: serviceName, cancelledCommandId: commandId, response };
+}
+
+function arrCommand(name, fields = {}) {
+  return compactObject({ name, ...fields });
+}
+
+async function arrCommandAction(serviceName, command, dryRun) {
+  if (dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      command,
+      note: `Set dryRun to false to queue this ${serviceName} command.`
+    };
+  }
+  return {
+    dryRun: false,
+    service: serviceName,
+    command: await queueArrCommand(serviceName, command)
+  };
+}
+
+function summarizeArrReleaseCandidate(record) {
+  const rejections = Array.isArray(record.rejections)
+    ? record.rejections.map(rejection => typeof rejection === "string" ? rejection : compactObject({
+      reason: rejection.reason,
+      type: rejection.type
+    }))
+    : Array.isArray(record.rejectionReasons)
+      ? record.rejectionReasons
+      : [];
+  return compactObject({
+    guid: record.guid,
+    indexerId: record.indexerId,
+    indexer: record.indexer,
+    title: record.title,
+    sortTitle: record.sortTitle,
+    protocol: record.protocol,
+    size: record.size,
+    age: record.age,
+    ageHours: record.ageHours,
+    seeders: record.seeders,
+    leechers: record.leechers,
+    quality: record.quality,
+    languages: record.languages,
+    customFormats: record.customFormats,
+    customFormatScore: record.customFormatScore,
+    indexerFlags: record.indexerFlags,
+    releaseWeight: record.releaseWeight,
+    downloadAllowed: record.downloadAllowed,
+    rejected: record.rejected,
+    rejections,
+    grab: compactObject({
+      guid: record.guid,
+      indexerId: record.indexerId,
+      title: record.title,
+      indexer: record.indexer
+    })
+  });
+}
+
+async function arrInteractiveSearch(serviceName, query, limit) {
+  const body = await arrApi(serviceName, "v3", "release", { query });
+  const records = Array.isArray(body) ? body : [];
+  return {
+    service: serviceName,
+    query,
+    total: records.length,
+    returned: Math.min(records.length, limit),
+    records: records.slice(0, limit).map(summarizeArrReleaseCandidate),
+    note: "Use the exact guid and indexerId from a candidate with the matching grab object when calling the grab tool. Full release objects are accepted when needed, but raw download URLs are not returned here."
+  };
+}
+
+function buildArrReleasePayload(input) {
+  const release = input.release && typeof input.release === "object" ? input.release : {};
+  const payload = compactObject({
+    ...release,
+    guid: input.guid ?? release.guid,
+    indexerId: input.indexerId ?? release.indexerId,
+    title: input.title ?? release.title,
+    indexer: input.indexer ?? release.indexer
+  });
+  if (!payload.guid || !payload.indexerId) {
+    throw new Error("grab release requires an exact guid and indexerId, or a release object containing both");
+  }
+  return payload;
+}
+
+async function grabArrRelease(serviceName, input) {
+  const payload = buildArrReleasePayload(input);
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      release: summarizeArrReleaseCandidate(payload),
+      note: `Set dryRun to false to ask ${serviceName} to grab this exact release.`
+    };
+  }
+  const result = await arrApi(serviceName, "v3", "release", { method: "POST", body: payload });
+  return {
+    dryRun: false,
+    service: serviceName,
+    release: summarizeArrReleaseCandidate(payload),
+    result: redactSensitiveObject(result)
+  };
 }
 
 async function arrRecentLogs(serviceName, limit) {
@@ -2414,6 +2547,125 @@ function createServer() {
     inputSchema: { commandId: z.number().int().positive().optional() }
   }, async ({ commandId }) => jsonText(await arrCommandStatus("sonarr", commandId)));
 
+  server.registerTool("sonarr_search_missing", {
+    title: "Sonarr Search Missing",
+    description: "Queue Sonarr MissingEpisodeSearch for all missing monitored episodes. This can enqueue many indexer searches and may grab releases depending on Sonarr settings.",
+    annotations: { destructiveHint: false, idempotentHint: false }
+  }, async () => jsonText(await queueArrCommand("sonarr", arrCommand("MissingEpisodeSearch"))));
+
+  server.registerTool("sonarr_search_cutoff_unmet", {
+    title: "Sonarr Search Cutoff Unmet",
+    description: "Queue Sonarr CutoffUnmetEpisodeSearch for all cutoff-unmet monitored episodes. This can enqueue many indexer searches and may grab releases depending on Sonarr settings.",
+    annotations: { destructiveHint: false, idempotentHint: false }
+  }, async () => jsonText(await queueArrCommand("sonarr", arrCommand("CutoffUnmetEpisodeSearch"))));
+
+  server.registerTool("sonarr_search_episode", {
+    title: "Sonarr Search Episode",
+    description: "Queue Sonarr EpisodeSearch for exact episode IDs only.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      episodeIds: z.array(z.number().int().positive()).min(1)
+    }
+  }, async ({ episodeIds }) => jsonText(await queueArrCommand("sonarr", arrCommand("EpisodeSearch", { episodeIds }))));
+
+  server.registerTool("sonarr_search_series", {
+    title: "Sonarr Search Series",
+    description: "Queue Sonarr SeriesSearch for one exact series ID.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      seriesId: z.number().int().positive()
+    }
+  }, async ({ seriesId }) => jsonText(await queueArrCommand("sonarr", arrCommand("SeriesSearch", { seriesId }))));
+
+  server.registerTool("sonarr_search_season", {
+    title: "Sonarr Search Season",
+    description: "Queue Sonarr SeasonSearch for one exact series ID and season number.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      seriesId: z.number().int().positive(),
+      seasonNumber: z.number().int().min(0)
+    }
+  }, async ({ seriesId, seasonNumber }) => jsonText(await queueArrCommand("sonarr", arrCommand("SeasonSearch", { seriesId, seasonNumber }))));
+
+  server.registerTool("sonarr_rescan_series", {
+    title: "Sonarr Rescan Series",
+    description: "Queue Sonarr RescanSeries globally or for one exact series ID.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      seriesId: z.number().int().positive().optional()
+    }
+  }, async ({ seriesId }) => jsonText(await queueArrCommand("sonarr", arrCommand("RescanSeries", { seriesId }))));
+
+  server.registerTool("sonarr_refresh_series", {
+    title: "Sonarr Refresh Series",
+    description: "Queue Sonarr RefreshSeries globally or for one exact series ID.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      seriesId: z.number().int().positive().optional()
+    }
+  }, async ({ seriesId }) => jsonText(await queueArrCommand("sonarr", arrCommand("RefreshSeries", { seriesId }))));
+
+  server.registerTool("sonarr_rename_files", {
+    title: "Sonarr Rename Files",
+    description: "Queue Sonarr RenameFiles for one exact series ID and optional exact episode file IDs. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      seriesId: z.number().int().positive(),
+      files: z.array(z.number().int().positive()).min(1).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ seriesId, files, dryRun }) => {
+    return jsonText(await arrCommandAction("sonarr", arrCommand("RenameFiles", { seriesId, files }), dryRun));
+  });
+
+  server.registerTool("sonarr_interactive_search_episode", {
+    title: "Sonarr Interactive Search Episode",
+    description: "List Sonarr release candidates for one exact episode ID without grabbing a release.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      episodeId: z.number().int().positive(),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async ({ episodeId, limit }) => jsonText(await arrInteractiveSearch("sonarr", { episodeId }, limit)));
+
+  server.registerTool("sonarr_grab_release", {
+    title: "Sonarr Grab Release",
+    description: "Ask Sonarr to grab one exact release from interactive search. Dry-run is enabled by default; provide guid and indexerId or a full exact release object.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await grabArrRelease("sonarr", input)));
+
+  server.registerTool("sonarr_download_client_scan", {
+    title: "Sonarr Download Client Scan",
+    description: "Queue Sonarr DownloadedEpisodesScan globally or for an exact path/downloadClientId. Dry-run is enabled by default because scans can import files.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      path: z.string().min(1).optional(),
+      downloadClientId: z.string().min(1).optional(),
+      importMode: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ path, downloadClientId, importMode, dryRun }) => {
+    return jsonText(await arrCommandAction("sonarr", arrCommand("DownloadedEpisodesScan", { path, downloadClientId, importMode }), dryRun));
+  });
+
+  server.registerTool("sonarr_command_cancel", {
+    title: "Sonarr Command Cancel",
+    description: "Cancel one exact Sonarr command ID if the Sonarr API accepts cancellation. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      commandId: z.number().int().positive(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ commandId, dryRun }) => jsonText(await cancelArrCommand("sonarr", commandId, dryRun)));
+
   server.registerTool("sonarr_recent_logs", {
     title: "Sonarr Recent Logs",
     description: "List recent Sonarr logs with token-like values redacted.",
@@ -2597,6 +2849,107 @@ function createServer() {
     description: "List Radarr command status records or one exact command ID.",
     inputSchema: { commandId: z.number().int().positive().optional() }
   }, async ({ commandId }) => jsonText(await arrCommandStatus("radarr", commandId)));
+
+  server.registerTool("radarr_search_missing", {
+    title: "Radarr Search Missing",
+    description: "Queue Radarr MissingMoviesSearch for all missing monitored movies. This can enqueue many indexer searches and may grab releases depending on Radarr settings.",
+    annotations: { destructiveHint: false, idempotentHint: false }
+  }, async () => jsonText(await queueArrCommand("radarr", arrCommand("MissingMoviesSearch"))));
+
+  server.registerTool("radarr_search_cutoff_unmet", {
+    title: "Radarr Search Cutoff Unmet",
+    description: "Queue Radarr CutoffUnmetMoviesSearch for all cutoff-unmet monitored movies. This can enqueue many indexer searches and may grab releases depending on Radarr settings.",
+    annotations: { destructiveHint: false, idempotentHint: false }
+  }, async () => jsonText(await queueArrCommand("radarr", arrCommand("CutoffUnmetMoviesSearch"))));
+
+  server.registerTool("radarr_search_movie", {
+    title: "Radarr Search Movie",
+    description: "Queue Radarr MoviesSearch for exact movie IDs only.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      movieIds: z.array(z.number().int().positive()).min(1)
+    }
+  }, async ({ movieIds }) => jsonText(await queueArrCommand("radarr", arrCommand("MoviesSearch", { movieIds }))));
+
+  server.registerTool("radarr_rescan_movie", {
+    title: "Radarr Rescan Movie",
+    description: "Queue Radarr RescanMovie globally or for one exact movie ID.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      movieId: z.number().int().positive().optional()
+    }
+  }, async ({ movieId }) => jsonText(await queueArrCommand("radarr", arrCommand("RescanMovie", { movieId }))));
+
+  server.registerTool("radarr_refresh_movie", {
+    title: "Radarr Refresh Movie",
+    description: "Queue Radarr RefreshMovie globally or for one exact movie ID.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      movieId: z.number().int().positive().optional()
+    }
+  }, async ({ movieId }) => jsonText(await queueArrCommand("radarr", arrCommand("RefreshMovie", { movieId }))));
+
+  server.registerTool("radarr_rename_files", {
+    title: "Radarr Rename Files",
+    description: "Queue Radarr RenameFiles for one exact movie ID and optional exact movie file IDs. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      movieId: z.number().int().positive(),
+      files: z.array(z.number().int().positive()).min(1).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ movieId, files, dryRun }) => {
+    return jsonText(await arrCommandAction("radarr", arrCommand("RenameFiles", { movieId, files }), dryRun));
+  });
+
+  server.registerTool("radarr_interactive_search_movie", {
+    title: "Radarr Interactive Search Movie",
+    description: "List Radarr release candidates for one exact movie ID without grabbing a release.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      movieId: z.number().int().positive(),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async ({ movieId, limit }) => jsonText(await arrInteractiveSearch("radarr", { movieId }, limit)));
+
+  server.registerTool("radarr_grab_release", {
+    title: "Radarr Grab Release",
+    description: "Ask Radarr to grab one exact release from interactive search. Dry-run is enabled by default; provide guid and indexerId or a full exact release object.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await grabArrRelease("radarr", input)));
+
+  server.registerTool("radarr_download_client_scan", {
+    title: "Radarr Download Client Scan",
+    description: "Queue Radarr DownloadedMoviesScan globally or for an exact path/downloadClientId. Dry-run is enabled by default because scans can import files.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      path: z.string().min(1).optional(),
+      downloadClientId: z.string().min(1).optional(),
+      importMode: z.string().min(1).optional(),
+      sendUpdates: z.boolean().optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ path, downloadClientId, importMode, sendUpdates, dryRun }) => {
+    return jsonText(await arrCommandAction("radarr", arrCommand("DownloadedMoviesScan", { path, downloadClientId, importMode, sendUpdates }), dryRun));
+  });
+
+  server.registerTool("radarr_command_cancel", {
+    title: "Radarr Command Cancel",
+    description: "Cancel one exact Radarr command ID if the Radarr API accepts cancellation. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      commandId: z.number().int().positive(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ commandId, dryRun }) => jsonText(await cancelArrCommand("radarr", commandId, dryRun)));
 
   server.registerTool("radarr_recent_logs", {
     title: "Radarr Recent Logs",

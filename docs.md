@@ -184,8 +184,8 @@ ssh -t unraid-codex codex login
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
 - Shared: configured service status, compact media admin overview, diagnostics bundles, exact queue-item diagnosis, exact queue repair plans, issue diagnosis, and request triage.
-- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status, recent logs, quality profiles, and root folders.
-- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status, recent logs, quality profiles, and root folders.
+- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/episode/series/season searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
+- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/movie searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, and root folders.
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
 - Tautulli: current activity and playback history diagnostics.
 - Tracearr: health, OpenAPI, stats, today stats, activity trends, active streams, users, violations, and playback history diagnostics.
@@ -197,7 +197,68 @@ ssh -t unraid-codex codex login
 
 Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories. Tracearr support is read-only and does not expose stream termination.
 
-Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and the new admin tools default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
+Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
+
+Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr command immediately and return the queued command record. Missing and cutoff searches can fan out into many indexer searches and may grab releases depending on each app's own settings. File-changing actions such as rename, downloaded scan, manual import, release grab, queue removal, and download-client cleanup are guarded with exact IDs/paths and dry-run-first behavior.
+
+Example media MCP payloads:
+
+```json
+{
+  "tool": "sonarr_search_missing",
+  "arguments": {}
+}
+```
+
+```json
+{
+  "tool": "sonarr_search_episode",
+  "arguments": {
+    "episodeIds": [12345]
+  }
+}
+```
+
+```json
+{
+  "tool": "radarr_search_movie",
+  "arguments": {
+    "movieIds": [6789]
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_interactive_search_episode",
+  "arguments": {
+    "episodeId": 12345,
+    "limit": 10
+  }
+}
+```
+
+```json
+{
+  "tool": "radarr_grab_release",
+  "arguments": {
+    "guid": "exact-guid-from-interactive-search",
+    "indexerId": 4,
+    "dryRun": true
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_rename_files",
+  "arguments": {
+    "seriesId": 55,
+    "files": [9876],
+    "dryRun": true
+  }
+}
+```
 
 ## Codex-Terminal Path Diagnostics
 
