@@ -63,9 +63,9 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
-   Optional media/download path diagnostics belong on `codex-terminal` only. If you want agents to compare media-service paths with host files, configure the advanced read-only mounts for narrow shares such as `/mnt/user/media` and `/mnt/user/downloads`, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`.
+   Optional media/download path diagnostics belong on `codex-terminal` unless you intentionally need write access for archive extraction. If you want agents to compare media-service paths with host files, configure narrow mounts such as `/mnt/user/media` and `/mnt/user/downloads`, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`. Keep downloads read-only unless you are deliberately doing shell-side extraction.
 
-6. Optional: install `media-mcp` on `codex-mgmt`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
+6. Optional: install `media-mcp` on `codex-mgmt`. For guarded archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports a different container path. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
 
    - Sonarr: `SONARR_URL` and `SONARR_API_KEY`
    - Radarr: `RADARR_URL` and `RADARR_API_KEY`
@@ -192,10 +192,10 @@ ssh -t unraid-codex codex login
 - Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, subtitle history, and subtitle overview.
 - Prowlarr: list indexers, search, and indexer health/history summary.
 - qBittorrent: list torrents, pause or resume selected hashes, recheck/reannounce exact hashes, and delete selected hashes with explicit optional file deletion.
-- NZBGet: status, queue, history/detail, exposed download files, archive diagnosis, dry-run-first post-processing retry, guarded history removal, optional local archive extraction, pause or resume downloads, and set rate limits.
+- NZBGet: status, queue, history/detail, exposed download files, archive diagnosis, dry-run-first post-processing retry, guarded history removal, optional local archive extraction with filesystem fallback, pause or resume downloads, and set rate limits.
 - Seerr, Overseerr, or Jellyseerr: search media, list/request details, guarded request status updates, and list/comment/resolve/reopen/delete reported issues.
 
-Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, media shares, or appdata directories. Tracearr support is read-only and does not expose stream termination.
+Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, library media shares, or appdata directories; the optional downloads mount is only for guarded archive extraction. Tracearr support is read-only and does not expose stream termination.
 
 Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
 
@@ -203,7 +203,13 @@ Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr com
 
 Queue-based manual import tools use the queue item's decoded `outputPath`, `downloadId`, and target `seriesId` or `movieId` when calling the Arr manual import API. If the API returns rows from library roots such as `/tv/...` or `/movies/...` instead of the queue/download folder, those rows are excluded from valid candidates and reported as blockers. Queue summaries expose decoded display paths and include raw values when upstream fields arrive HTML-escaped.
 
-NZBGet post-processing retry tools are dry-run-first and never remove history or files. Use `download_client_archive_diagnosis` with a Sonarr/Radarr queue item to match the NZBGet history record by Arr `downloadId`/NZBGet `drone` parameter, inspect `UnpackStatus`, and report archive files exposed by NZBGet. Use `nzbget_retry_postprocess` with `dryRun=false` to call `editqueue("HistoryProcess", 0, [NZBID])` for one exact history item. Deleted history items require `force=true`. `nzbget_extract_archives` only operates inside the matched history item's `DestDir`, requires `dryRun=false`, and requires the media MCP container to be able to read that path and run `unrar`.
+NZBGet post-processing retry tools are dry-run-first and never remove history or files. Use `download_client_archive_diagnosis` with a Sonarr/Radarr queue item to match the NZBGet history record by Arr `downloadId`/NZBGet `drone` parameter, inspect `UnpackStatus`, and report archive files exposed by NZBGet. Use `nzbget_retry_postprocess` with `dryRun=false` to call `editqueue("HistoryProcess", 0, [NZBID])` for one exact history item. Deleted history items require `force=true`. `nzbget_extract_archives` only operates inside the matched history item's `DestDir`, requires `dryRun=false`, and requires the media MCP container to see that path, write to it, and run `unrar` or `7z`/`7zz`. If NZBGet exposes no `listfiles` archive roots for a completed history item, the tool maps `DestDir` with `MEDIA_MCP_PATH_MAPS`, finds root archives directly on disk, skips volume-only files such as `.r00`, extracts the roots, and can queue the matching Sonarr/Radarr downloaded scan for the original download path and download ID.
+
+Use `media_archive_environment_check` or the container command below to verify the archive environment. The command reports `unrar`, `7z` or `7zz`, and a safe temporary write probe under the downloads mount when it is present:
+
+```sh
+archive-tools-check --downloads-dir /mnt/unraid/downloads
+```
 
 Example media MCP payloads:
 
@@ -310,10 +316,10 @@ Example media MCP payloads:
 The `media-path-check` command runs inside `codex-terminal`, not the MCP sidecars. It only performs `stat` and readability checks:
 
 ```sh
-media-path-check --json /downloads/example.mkv /media/Movie
+media-path-check --json /downloads/example.mkv /media/library-item
 ```
 
-When `CODEX_MEDIA_PATH_MAPS=/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`, the command reports both the original service path and the mapped read-only mount alternative. Keep mounts narrow and read-only. Do not mount `/mnt/user`, `/`, `/boot`, appdata, or the Docker socket for this workflow.
+When `CODEX_MEDIA_PATH_MAPS=/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`, the command reports both the original service path and the mapped mount alternative. Keep mounts narrow. Do not mount `/mnt/user`, `/`, `/boot`, appdata, or the Docker socket for this workflow.
 
 ## Optional Utilities MCP
 
@@ -393,8 +399,10 @@ bash -n entrypoint.sh
 bash -n media-path-check
 bash -n web-terminal.sh
 bash -n codex-terminal-shell
+bash -n archive-tools-check
 sh -n codex-terminal-profile.sh
 npm --prefix media-mcp run check
+npm --prefix media-mcp run test:arr-commands
 npm --prefix utilities-mcp run check
 python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml", "templates/media-mcp.xml", "templates/utilities-mcp.xml")]'
 docker compose config

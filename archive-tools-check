@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+downloads_dir="/mnt/unraid/downloads"
+write_mode="auto"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --downloads-dir)
+      shift
+      downloads_dir="${1:-}"
+      ;;
+    --require-write)
+      write_mode="require"
+      ;;
+    --skip-write)
+      write_mode="skip"
+      ;;
+    *)
+      echo "usage: archive-tools-check [--downloads-dir PATH] [--require-write|--skip-write]" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+status=0
+
+if command -v unrar >/dev/null 2>&1; then
+  printf 'unrar: '
+  unrar | sed -n '1p'
+else
+  echo "unrar: missing"
+  status=1
+fi
+
+sevenzip="$(command -v 7z 2>/dev/null || command -v 7zz 2>/dev/null || true)"
+if [ -n "$sevenzip" ]; then
+  printf '7zip: '
+  "$sevenzip" | sed -n '2p'
+else
+  echo "7zip: missing"
+  status=1
+fi
+
+if [ "$write_mode" = "skip" ]; then
+  echo "downloads-write: skipped"
+  exit "$status"
+fi
+
+if [ -z "$downloads_dir" ] || [ ! -d "$downloads_dir" ]; then
+  echo "downloads-write: skipped (${downloads_dir:-unset} is not mounted)"
+  [ "$write_mode" = "require" ] && status=1
+  exit "$status"
+fi
+
+probe_dir="${downloads_dir%/}/.codex-archive-tools-check"
+if mkdir -p "$probe_dir"; then
+  probe_file="$(mktemp "$probe_dir/write-test.XXXXXX" 2>/dev/null || true)"
+  if [ -n "$probe_file" ]; then
+    printf 'ok\n' > "$probe_file" && rm -f "$probe_file"
+    rmdir "$probe_dir" 2>/dev/null || true
+    echo "downloads-write: ok ($downloads_dir)"
+  else
+    echo "downloads-write: failed ($downloads_dir)"
+    status=1
+  fi
+else
+  echo "downloads-write: failed ($downloads_dir)"
+  status=1
+fi
+
+exit "$status"
