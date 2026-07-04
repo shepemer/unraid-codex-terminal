@@ -43,6 +43,46 @@ const configuredServices = {
   tracearr: serviceConfig("TRACEARR", "apiKey")
 };
 
+const arrWantedDefaultPageSize = 25;
+const arrWantedMaxPageSize = 250;
+const arrWantedMaxLimit = 5000;
+const arrWantedInternalPageSize = 250;
+const arrExactSearchDefaultBatchSize = 100;
+const arrExactSearchMaxBatchSize = 250;
+
+const arrWantedPaginationSchema = {
+  page: z.number().int().min(1).optional(),
+  pageSize: z.number().int().min(1).optional(),
+  limit: z.number().int().min(1).optional(),
+  offset: z.number().int().min(0).optional()
+};
+
+const sonarrWantedMissingIdsSchema = {
+  monitoredOnly: z.boolean().default(true),
+  airedOnly: z.boolean().default(true),
+  includeSpecials: z.boolean().default(false)
+};
+
+const radarrWantedMissingIdsSchema = {
+  monitoredOnly: z.boolean().default(true),
+  availableOnly: z.boolean().default(true)
+};
+
+const sonarrSearchMissingExactSchema = {
+  batchSize: z.number().int().min(1).default(arrExactSearchDefaultBatchSize),
+  monitoredOnly: z.boolean().default(true),
+  airedOnly: z.boolean().default(true),
+  includeSpecials: z.boolean().default(false),
+  dryRun: z.boolean().default(true)
+};
+
+const radarrSearchMissingExactSchema = {
+  batchSize: z.number().int().min(1).default(arrExactSearchDefaultBatchSize),
+  monitoredOnly: z.boolean().default(true),
+  availableOnly: z.boolean().default(true),
+  dryRun: z.boolean().default(true)
+};
+
 if (!Object.values(configuredServices).some(Boolean)) {
   console.error("media-mcp: configure at least one supported media service");
   process.exit(1);
@@ -2414,19 +2454,73 @@ function summarizeArrBlocklistRecord(record) {
 }
 
 function summarizeArrWantedRecord(record) {
+  const looksLikeEpisode = record.episodeId !== undefined || record.seasonNumber !== undefined || record.episodeNumber !== undefined;
   return compactObject({
     id: record.id,
     title: record.title,
     seriesId: record.seriesId ?? record.series?.id,
     seriesTitle: record.series?.title,
-    movieId: record.movieId ?? record.movie?.id,
+    movieId: record.movieId ?? record.movie?.id ?? (looksLikeEpisode ? undefined : record.id),
     movieTitle: record.movie?.title,
-    episodeId: record.episodeId ?? record.id,
+    episodeId: looksLikeEpisode ? record.episodeId ?? record.id : undefined,
     seasonNumber: record.seasonNumber,
     episodeNumber: record.episodeNumber,
     airDateUtc: record.airDateUtc,
     quality: record.quality,
     monitored: record.monitored
+  });
+}
+
+function summarizeSonarrWantedMissingRecord(record) {
+  const episodeId = Number(record.episodeId ?? record.id);
+  return compactObject({
+    episodeId: Number.isInteger(episodeId) && episodeId > 0 ? episodeId : undefined,
+    seriesId: record.seriesId ?? record.series?.id,
+    seriesTitle: record.series?.title,
+    seasonNumber: record.seasonNumber,
+    episodeNumber: record.episodeNumber,
+    title: record.title,
+    airDateUtc: record.airDateUtc,
+    monitored: record.monitored,
+    seriesMonitored: record.series?.monitored
+  });
+}
+
+function summarizeRadarrWantedMissingRecord(record) {
+  const movieId = Number(record.movieId ?? record.id);
+  return compactObject({
+    movieId: Number.isInteger(movieId) && movieId > 0 ? movieId : undefined,
+    title: record.title ?? record.movie?.title,
+    movieTitle: record.movie?.title,
+    year: record.year ?? record.movie?.year,
+    tmdbId: record.tmdbId ?? record.movie?.tmdbId,
+    monitored: record.monitored ?? record.movie?.monitored,
+    isAvailable: record.isAvailable ?? record.movie?.isAvailable,
+    inCinemas: record.inCinemas ?? record.movie?.inCinemas,
+    digitalRelease: record.digitalRelease ?? record.movie?.digitalRelease,
+    physicalRelease: record.physicalRelease ?? record.movie?.physicalRelease
+  });
+}
+
+function summarizeArrCommandRecord(record) {
+  const body = record?.body || {};
+  return compactObject({
+    id: record?.id,
+    name: record?.name ?? body.name,
+    status: record?.status,
+    stateChangeTime: record?.stateChangeTime,
+    queued: record?.queued,
+    started: record?.started,
+    ended: record?.ended,
+    duration: record?.duration,
+    trigger: record?.trigger,
+    message: record?.message,
+    exception: record?.exception,
+    episodeIdCount: Array.isArray(body.episodeIds) ? body.episodeIds.length : undefined,
+    movieIdCount: Array.isArray(body.movieIds) ? body.movieIds.length : undefined,
+    seriesId: body.seriesId,
+    movieId: body.movieId,
+    seasonNumber: body.seasonNumber
   });
 }
 
@@ -2441,11 +2535,294 @@ function arrRecordsPage(body, mapper, limit) {
   };
 }
 
-async function arrWanted(serviceName, kind, limit) {
-  const body = await arrApi(serviceName, "v3", `wanted/${kind}`, {
-    query: { page: 1, pageSize: limit }
-  });
-  return arrRecordsPage(body, summarizeArrWantedRecord, limit);
+function normalizeArrWantedPagination(input = {}) {
+  const pagination = typeof input === "number" ? { limit: input } : { ...input };
+  if (pagination.page !== undefined && pagination.offset !== undefined) {
+    throw new Error("Use either page/pageSize or offset/limit for wanted pagination, not both page and offset.");
+  }
+  const limit = Number(pagination.limit ?? pagination.pageSize ?? arrWantedDefaultPageSize);
+  const pageSize = Number(pagination.pageSize ?? Math.min(limit, arrWantedMaxPageSize));
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error("limit must be a positive integer.");
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1) {
+    throw new Error("pageSize must be a positive integer.");
+  }
+  if (limit > arrWantedMaxLimit) {
+    throw new Error(`limit is capped at ${arrWantedMaxLimit}; use page/pageSize or offset/limit windows for larger traversals.`);
+  }
+  if (pageSize > arrWantedMaxPageSize) {
+    throw new Error(`pageSize is capped at ${arrWantedMaxPageSize}; use page/pageSize or offset/limit windows for larger traversals.`);
+  }
+  const offset = Number(pagination.offset ?? ((pagination.page ?? 1) - 1) * pageSize);
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error("offset must be a non-negative integer.");
+  }
+  const page = Math.floor(offset / pageSize) + 1;
+  return { page, pageSize, limit, offset };
+}
+
+function recordsFromArrPage(body) {
+  return Array.isArray(body?.records) ? body.records : Array.isArray(body) ? body : [];
+}
+
+async function arrPagedRecordWindow(serviceName, path, pagination) {
+  const records = [];
+  let totalRecords;
+  let page = Math.floor(pagination.offset / pagination.pageSize) + 1;
+  let skip = pagination.offset % pagination.pageSize;
+  let pagesFetched = 0;
+  while (records.length < pagination.limit && pagesFetched < 1000) {
+    const body = await arrApi(serviceName, "v3", path, {
+      query: { page, pageSize: pagination.pageSize }
+    });
+    const pageRecords = recordsFromArrPage(body);
+    totalRecords = body?.totalRecords ?? totalRecords ?? pageRecords.length;
+    const usable = skip ? pageRecords.slice(skip) : pageRecords;
+    records.push(...usable.slice(0, pagination.limit - records.length));
+    pagesFetched += 1;
+    if (!pageRecords.length || pageRecords.length < pagination.pageSize) {
+      break;
+    }
+    if (Number.isInteger(totalRecords) && page * pagination.pageSize >= totalRecords) {
+      break;
+    }
+    page += 1;
+    skip = 0;
+  }
+  return {
+    totalRecords: totalRecords ?? records.length,
+    pagesFetched,
+    records
+  };
+}
+
+async function arrWanted(serviceName, kind, input = {}) {
+  const pagination = normalizeArrWantedPagination(input);
+  const page = await arrPagedRecordWindow(serviceName, `wanted/${kind}`, pagination);
+  return {
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    totalRecords: page.totalRecords,
+    returned: page.records.length,
+    records: page.records.map(summarizeArrWantedRecord)
+  };
+}
+
+async function arrAllWantedRecords(serviceName, kind) {
+  const records = [];
+  let totalRecords;
+  let page = 1;
+  let pagesFetched = 0;
+  while (page <= 1000) {
+    const body = await arrApi(serviceName, "v3", `wanted/${kind}`, {
+      query: { page, pageSize: arrWantedInternalPageSize }
+    });
+    const pageRecords = recordsFromArrPage(body);
+    totalRecords = body?.totalRecords ?? totalRecords ?? pageRecords.length;
+    records.push(...pageRecords);
+    pagesFetched += 1;
+    if (!pageRecords.length || pageRecords.length < arrWantedInternalPageSize) {
+      break;
+    }
+    if (Number.isInteger(totalRecords) && page * arrWantedInternalPageSize >= totalRecords) {
+      break;
+    }
+    page += 1;
+  }
+  return {
+    pageSize: arrWantedInternalPageSize,
+    totalRecords: totalRecords ?? records.length,
+    pagesFetched,
+    records
+  };
+}
+
+function addSkippedReason(skipped, reason) {
+  skipped.total += 1;
+  skipped.reasons[reason] = (skipped.reasons[reason] || 0) + 1;
+}
+
+function sonarrWantedMissingSkipReason(record, options, nowMs) {
+  const episodeId = Number(record.episodeId ?? record.id);
+  if (!Number.isInteger(episodeId) || episodeId < 1) {
+    return "missingEpisodeId";
+  }
+  if (options.monitoredOnly && (record.monitored === false || record.series?.monitored === false)) {
+    return "unmonitored";
+  }
+  if (!options.includeSpecials && Number(record.seasonNumber) === 0) {
+    return "special";
+  }
+  if (options.airedOnly) {
+    const airDateMs = Date.parse(record.airDateUtc || "");
+    if (!Number.isFinite(airDateMs) || airDateMs > nowMs) {
+      return "unaired";
+    }
+  }
+  return null;
+}
+
+function radarrWantedMissingSkipReason(record, options) {
+  const movieId = Number(record.movieId ?? record.id);
+  if (!Number.isInteger(movieId) || movieId < 1) {
+    return "missingMovieId";
+  }
+  if (options.monitoredOnly && (record.monitored === false || record.movie?.monitored === false)) {
+    return "unmonitored";
+  }
+  if (options.availableOnly && (record.isAvailable ?? record.movie?.isAvailable) !== true) {
+    return "unavailable";
+  }
+  return null;
+}
+
+async function sonarrWantedMissingIds(input = {}) {
+  const options = {
+    monitoredOnly: input.monitoredOnly ?? true,
+    airedOnly: input.airedOnly ?? true,
+    includeSpecials: input.includeSpecials ?? false
+  };
+  const raw = await arrAllWantedRecords("sonarr", "missing");
+  const skipped = { total: 0, reasons: {} };
+  const seen = new Set();
+  const records = [];
+  const nowMs = Date.now();
+  for (const record of raw.records) {
+    const reason = sonarrWantedMissingSkipReason(record, options, nowMs);
+    if (reason) {
+      addSkippedReason(skipped, reason);
+      continue;
+    }
+    const episodeId = Number(record.episodeId ?? record.id);
+    if (seen.has(episodeId)) {
+      addSkippedReason(skipped, "duplicateEpisodeId");
+      continue;
+    }
+    seen.add(episodeId);
+    records.push(summarizeSonarrWantedMissingRecord(record));
+  }
+  return {
+    service: "sonarr",
+    filters: {
+      monitoredOnly: options.monitoredOnly,
+      airedOnly: options.airedOnly,
+      includeSpecials: options.includeSpecials
+    },
+    pageSize: raw.pageSize,
+    pagesFetched: raw.pagesFetched,
+    totalRecords: raw.totalRecords,
+    scanned: raw.records.length,
+    returned: records.length,
+    skipped,
+    episodeIds: records.map(record => record.episodeId),
+    records
+  };
+}
+
+async function radarrWantedMissingIds(input = {}) {
+  const options = {
+    monitoredOnly: input.monitoredOnly ?? true,
+    availableOnly: input.availableOnly ?? true
+  };
+  const raw = await arrAllWantedRecords("radarr", "missing");
+  const skipped = { total: 0, reasons: {} };
+  const seen = new Set();
+  const records = [];
+  for (const record of raw.records) {
+    const reason = radarrWantedMissingSkipReason(record, options);
+    if (reason) {
+      addSkippedReason(skipped, reason);
+      continue;
+    }
+    const movieId = Number(record.movieId ?? record.id);
+    if (seen.has(movieId)) {
+      addSkippedReason(skipped, "duplicateMovieId");
+      continue;
+    }
+    seen.add(movieId);
+    records.push(summarizeRadarrWantedMissingRecord(record));
+  }
+  return {
+    service: "radarr",
+    filters: {
+      monitoredOnly: options.monitoredOnly,
+      availableOnly: options.availableOnly
+    },
+    pageSize: raw.pageSize,
+    pagesFetched: raw.pagesFetched,
+    totalRecords: raw.totalRecords,
+    scanned: raw.records.length,
+    returned: records.length,
+    skipped,
+    movieIds: records.map(record => record.movieId),
+    records
+  };
+}
+
+function chunkList(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function exactSearchPlan(commandName, idField, ids, batchSize) {
+  return chunkList(ids, batchSize).map((batch, index) => ({
+    batch: index + 1,
+    count: batch.length,
+    command: arrCommand(commandName, { [idField]: batch })
+  }));
+}
+
+async function arrSearchMissingExact(serviceName, input = {}) {
+  const options = {
+    ...input,
+    batchSize: input.batchSize ?? arrExactSearchDefaultBatchSize,
+    dryRun: input.dryRun ?? true
+  };
+  if (options.batchSize > arrExactSearchMaxBatchSize) {
+    throw new Error(`batchSize is capped at ${arrExactSearchMaxBatchSize} for safe exact searches.`);
+  }
+  const isSonarr = serviceName === "sonarr";
+  const commandName = isSonarr ? "EpisodeSearch" : "MoviesSearch";
+  const idField = isSonarr ? "episodeIds" : "movieIds";
+  const idResult = isSonarr ? await sonarrWantedMissingIds(options) : await radarrWantedMissingIds(options);
+  const ids = idResult[idField];
+  const plannedCommands = exactSearchPlan(commandName, idField, ids, options.batchSize);
+  if (options.dryRun) {
+    return {
+      dryRun: true,
+      service: serviceName,
+      filters: idResult.filters,
+      batchSize: options.batchSize,
+      batchCount: plannedCommands.length,
+      totalIds: ids.length,
+      skipped: idResult.skipped,
+      [idField]: ids,
+      plannedCommands: plannedCommands.map(plan => ({ batch: plan.batch, count: plan.count, ...plan.command })),
+      note: `Set dryRun to false to queue ${commandName} commands for exact ${idField}.`
+    };
+  }
+  const queued = [];
+  for (const plan of plannedCommands) {
+    queued.push(await queueArrCommand(serviceName, plan.command));
+  }
+  const commandIds = queued.map(command => command?.id).filter(id => Number.isInteger(id));
+  return {
+    dryRun: false,
+    service: serviceName,
+    filters: idResult.filters,
+    batchSize: options.batchSize,
+    batchCount: plannedCommands.length,
+    totalIds: ids.length,
+    skipped: idResult.skipped,
+    queuedCommandIds: commandIds,
+    commands: Object.fromEntries(queued
+      .filter(command => Number.isInteger(command?.id))
+      .map(command => [String(command.id), summarizeArrCommandRecord(command)]))
+  };
 }
 
 async function arrRecentHistory(serviceName, limit) {
@@ -2462,8 +2839,31 @@ async function arrBlocklist(serviceName, limit) {
   return arrRecordsPage(body, summarizeArrBlocklistRecord, limit);
 }
 
-async function arrCommandStatus(serviceName, commandId) {
-  return arrApi(serviceName, "v3", commandId ? `command/${commandId}` : "command");
+async function arrCommandStatus(serviceName, input = {}) {
+  const options = typeof input === "number" ? { commandId: input } : input;
+  if (options.commandId && options.commandIds?.length) {
+    throw new Error("Use either commandId or commandIds, not both.");
+  }
+  if (options.commandIds?.length) {
+    const statuses = await Promise.all(options.commandIds.map(commandId => arrApi(serviceName, "v3", `command/${commandId}`)));
+    return {
+      service: serviceName,
+      total: statuses.length,
+      commands: Object.fromEntries(statuses.map((status, index) => [
+        String(options.commandIds[index]),
+        summarizeArrCommandRecord(status)
+      ]))
+    };
+  }
+  const body = await arrApi(serviceName, "v3", options.commandId ? `command/${options.commandId}` : "command");
+  if (Array.isArray(body)) {
+    return {
+      service: serviceName,
+      total: body.length,
+      records: body.map(summarizeArrCommandRecord)
+    };
+  }
+  return options.commandId ? summarizeArrCommandRecord(body) : body;
 }
 
 async function queueArrCommand(serviceName, command) {
@@ -4447,9 +4847,16 @@ function createServer() {
 
   server.registerTool("sonarr_wanted_missing", {
     title: "Sonarr Wanted Missing",
-    description: "List Sonarr wanted missing episode records.",
-    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
-  }, async ({ limit }) => jsonText(await arrWanted("sonarr", "missing", limit)));
+    description: "List Sonarr wanted missing episode records with safe page/pageSize or offset/limit pagination.",
+    inputSchema: arrWantedPaginationSchema
+  }, async (input) => jsonText(await arrWanted("sonarr", "missing", input)));
+
+  server.registerTool("sonarr_wanted_missing_ids", {
+    title: "Sonarr Wanted Missing IDs",
+    description: "Page through Sonarr wanted missing episodes and return exact episode IDs plus compact metadata without queueing searches.",
+    annotations: { readOnlyHint: true },
+    inputSchema: sonarrWantedMissingIdsSchema
+  }, async (input) => jsonText(await sonarrWantedMissingIds(input)));
 
   server.registerTool("sonarr_cutoff_unmet", {
     title: "Sonarr Cutoff Unmet",
@@ -4471,9 +4878,12 @@ function createServer() {
 
   server.registerTool("sonarr_command_status", {
     title: "Sonarr Command Status",
-    description: "List Sonarr command status records or one exact command ID.",
-    inputSchema: { commandId: z.number().int().positive().optional() }
-  }, async ({ commandId }) => jsonText(await arrCommandStatus("sonarr", commandId)));
+    description: "List Sonarr command status records, one exact command ID, or a compact summary keyed by multiple command IDs.",
+    inputSchema: {
+      commandId: z.number().int().positive().optional(),
+      commandIds: z.array(z.number().int().positive()).min(1).max(100).optional()
+    }
+  }, async (input) => jsonText(await arrCommandStatus("sonarr", input)));
 
   server.registerTool("sonarr_search_missing", {
     title: "Sonarr Search Missing",
@@ -4495,6 +4905,13 @@ function createServer() {
       episodeIds: z.array(z.number().int().positive()).min(1)
     }
   }, async ({ episodeIds }) => jsonText(await queueArrCommand("sonarr", arrCommand("EpisodeSearch", { episodeIds }))));
+
+  server.registerTool("sonarr_search_missing_exact", {
+    title: "Sonarr Search Missing Exact",
+    description: "Collect wanted missing Sonarr episode IDs with safeguards, then dry-run or queue exact EpisodeSearch commands in batches. Never calls MissingEpisodeSearch.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: sonarrSearchMissingExactSchema
+  }, async (input) => jsonText(await arrSearchMissingExact("sonarr", input)));
 
   server.registerTool("sonarr_search_series", {
     title: "Sonarr Search Series",
@@ -4773,9 +5190,16 @@ function createServer() {
 
   server.registerTool("radarr_wanted_missing", {
     title: "Radarr Wanted Missing",
-    description: "List Radarr wanted missing movie records.",
-    inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
-  }, async ({ limit }) => jsonText(await arrWanted("radarr", "missing", limit)));
+    description: "List Radarr wanted missing movie records with safe page/pageSize or offset/limit pagination.",
+    inputSchema: arrWantedPaginationSchema
+  }, async (input) => jsonText(await arrWanted("radarr", "missing", input)));
+
+  server.registerTool("radarr_wanted_missing_ids", {
+    title: "Radarr Wanted Missing IDs",
+    description: "Page through Radarr wanted missing movies and return exact movie IDs plus compact metadata without queueing searches.",
+    annotations: { readOnlyHint: true },
+    inputSchema: radarrWantedMissingIdsSchema
+  }, async (input) => jsonText(await radarrWantedMissingIds(input)));
 
   server.registerTool("radarr_cutoff_unmet", {
     title: "Radarr Cutoff Unmet",
@@ -4797,9 +5221,12 @@ function createServer() {
 
   server.registerTool("radarr_command_status", {
     title: "Radarr Command Status",
-    description: "List Radarr command status records or one exact command ID.",
-    inputSchema: { commandId: z.number().int().positive().optional() }
-  }, async ({ commandId }) => jsonText(await arrCommandStatus("radarr", commandId)));
+    description: "List Radarr command status records, one exact command ID, or a compact summary keyed by multiple command IDs.",
+    inputSchema: {
+      commandId: z.number().int().positive().optional(),
+      commandIds: z.array(z.number().int().positive()).min(1).max(100).optional()
+    }
+  }, async (input) => jsonText(await arrCommandStatus("radarr", input)));
 
   server.registerTool("radarr_search_missing", {
     title: "Radarr Search Missing",
@@ -4821,6 +5248,13 @@ function createServer() {
       movieIds: z.array(z.number().int().positive()).min(1)
     }
   }, async ({ movieIds }) => jsonText(await queueArrCommand("radarr", arrCommand("MoviesSearch", { movieIds }))));
+
+  server.registerTool("radarr_search_missing_exact", {
+    title: "Radarr Search Missing Exact",
+    description: "Collect wanted missing Radarr movie IDs with safeguards, then dry-run or queue exact MoviesSearch commands in batches. Never calls MissingMoviesSearch.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: radarrSearchMissingExactSchema
+  }, async (input) => jsonText(await arrSearchMissingExact("radarr", input)));
 
   server.registerTool("radarr_rescan_movie", {
     title: "Radarr Rescan Movie",

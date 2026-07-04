@@ -184,8 +184,8 @@ ssh -t unraid-codex codex login
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
 - Shared: configured service status, compact media admin overview, diagnostics bundles, exact queue-item diagnosis, exact queue repair plans, issue diagnosis, and request triage.
-- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/episode/series/season searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, generic quality profile/custom format/quality definition management, and root folders.
-- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, wanted missing, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/movie searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, generic quality profile/custom format/quality definition management, and root folders.
+- Sonarr: list, lookup, add series, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, paginated wanted missing, wanted missing exact-ID collection, dry-run-first exact missing episode searches, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/episode/series/season searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, generic quality profile/custom format/quality definition management, and root folders.
+- Radarr: list, lookup, add movies, queue, guarded queue removal, manual import candidates/import, queue-item file inspection, dry-run-first queue-item import, paginated wanted missing, wanted missing exact-ID collection, dry-run-first exact missing movie searches, cutoff unmet, recent history, blocklist, command status/cancel, command triggers for missing/cutoff/movie searches, rescan/refresh, dry-run-first rename/download scans, interactive release search/grab, recent logs, quality profiles, generic quality profile/custom format/quality definition management, and root folders.
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized user-reported issue views.
 - Tautulli: current activity and playback history diagnostics.
 - Tracearr: health, OpenAPI, stats, today stats, activity trends, active streams, users, violations, and playback history diagnostics.
@@ -199,7 +199,7 @@ Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API
 
 Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
 
-Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr command immediately and return the queued command record. Missing and cutoff searches can fan out into many indexer searches and may grab releases depending on each app's own settings. File-changing actions such as rename, downloaded scan, manual import, release grab, queue removal, download-client cleanup, and Servarr profile/custom format/quality definition updates are guarded with exact IDs/names/paths and dry-run-first behavior. Servarr config dry-runs return the current object, proposed object, compact diff, validation errors, and exact API method/path before any PUT or POST is attempted.
+Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr command immediately and return the queued command record. Global missing and cutoff searches can fan out into many indexer searches and may grab releases depending on each app's own settings. Prefer `sonarr_wanted_missing_ids` plus `sonarr_search_missing_exact`, or `radarr_wanted_missing_ids` plus `radarr_search_missing_exact`, when you need controlled missing-media searches: the exact tools page through wanted records, apply monitored/aired/available safeguards, default to `dryRun=true`, and queue only `EpisodeSearch` or `MoviesSearch` batches when explicitly executed. File-changing actions such as rename, downloaded scan, manual import, release grab, queue removal, download-client cleanup, and Servarr profile/custom format/quality definition updates are guarded with exact IDs/names/paths and dry-run-first behavior. Servarr config dry-runs return the current object, proposed object, compact diff, validation errors, and exact API method/path before any PUT or POST is attempted.
 
 Queue-based manual import tools use the queue item's decoded `outputPath`, `downloadId`, and target `seriesId` or `movieId` when calling the Arr manual import API. If the API returns rows from library roots such as `/tv/...` or `/movies/...` instead of the queue/download folder, those rows are excluded from valid candidates and reported as blockers. Queue summaries expose decoded display paths and include raw values when upstream fields arrive HTML-escaped.
 
@@ -215,8 +215,32 @@ Example media MCP payloads:
 
 ```json
 {
-  "tool": "sonarr_search_missing",
-  "arguments": {}
+  "tool": "sonarr_wanted_missing",
+  "arguments": {
+    "page": 2,
+    "pageSize": 100
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_wanted_missing_ids",
+  "arguments": {
+    "monitoredOnly": true,
+    "airedOnly": true,
+    "includeSpecials": false
+  }
+}
+```
+
+```json
+{
+  "tool": "sonarr_search_missing_exact",
+  "arguments": {
+    "batchSize": 100,
+    "dryRun": true
+  }
 }
 ```
 
@@ -234,6 +258,25 @@ Example media MCP payloads:
   "tool": "radarr_search_movie",
   "arguments": {
     "movieIds": [6789]
+  }
+}
+```
+
+```json
+{
+  "tool": "radarr_search_missing_exact",
+  "arguments": {
+    "batchSize": 100,
+    "dryRun": true
+  }
+}
+```
+
+```json
+{
+  "tool": "radarr_command_status",
+  "arguments": {
+    "commandIds": [101, 102, 103]
   }
 }
 ```
