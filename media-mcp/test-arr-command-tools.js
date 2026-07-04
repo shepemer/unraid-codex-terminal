@@ -46,6 +46,7 @@ function parseSse(text) {
 async function run() {
   const calls = [];
   let commandId = 1000;
+  const commandRecords = new Map();
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "media-mcp-archives-"));
   const mappedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Archive.Bundle.S01.1080p-GRP");
   await mkdir(mappedArchiveDir, { recursive: true });
@@ -126,6 +127,43 @@ async function run() {
       outputPath: "/downloads/usenet/completed/Movies/Movie.LibraryBug.2025.1080p-GRP",
       downloadId: "radarr-library-bug"
     }
+  ];
+  function sonarrWantedEpisode(id, overrides = {}) {
+    return {
+      id,
+      title: `Episode ${id}`,
+      seriesId: 10,
+      series: { id: 10, title: "Show", monitored: true },
+      seasonNumber: 1,
+      episodeNumber: id,
+      airDateUtc: "2020-01-01T00:00:00Z",
+      monitored: true,
+      quality: { quality: { name: "Missing" } },
+      ...overrides
+    };
+  }
+  function radarrWantedMovie(id, overrides = {}) {
+    return {
+      id,
+      title: `Movie ${id}`,
+      year: 2020,
+      tmdbId: 100000 + id,
+      monitored: true,
+      isAvailable: true,
+      qualityProfileId: 2,
+      ...overrides
+    };
+  }
+  const sonarrWantedMissing = [
+    ...Array.from({ length: 260 }, (_, index) => sonarrWantedEpisode(index + 1)),
+    sonarrWantedEpisode(1001, { monitored: false }),
+    sonarrWantedEpisode(1002, { airDateUtc: "2999-01-01T00:00:00Z" }),
+    sonarrWantedEpisode(1003, { seasonNumber: 0 })
+  ];
+  const radarrWantedMissing = [
+    ...Array.from({ length: 205 }, (_, index) => radarrWantedMovie(index + 1)),
+    radarrWantedMovie(2001, { monitored: false }),
+    radarrWantedMovie(2002, { isAvailable: false })
   ];
   const manualCandidates = {
     "sonarr-single": [{
@@ -446,13 +484,43 @@ async function run() {
     if (req.headers["x-api-key"] !== `${service}-key`) {
       return sendJson(res, 401, { error: "bad key" });
     }
-    if (req.method === "POST" && path === "command") {
+    if (req.method === "GET" && path.startsWith("wanted/")) {
+      const kind = path.split("/")[1];
+      const wantedRecords = kind === "missing"
+        ? (service === "sonarr" ? sonarrWantedMissing : radarrWantedMissing)
+        : [];
+      const page = Number(query.page || 1);
+      const pageSize = Number(query.pageSize || 50);
+      const start = (page - 1) * pageSize;
       return sendJson(res, 200, {
+        page,
+        pageSize,
+        totalRecords: wantedRecords.length,
+        records: wantedRecords.slice(start, start + pageSize)
+      });
+    }
+    if (req.method === "POST" && path === "command") {
+      const queued = {
         id: ++commandId,
         name: body.name,
         status: "queued",
         queued: "2026-07-02T00:00:00Z",
         body
+      };
+      commandRecords.set(queued.id, queued);
+      return sendJson(res, 200, queued);
+    }
+    if (req.method === "GET" && path === "command") {
+      return sendJson(res, 200, [...commandRecords.values()]);
+    }
+    if (req.method === "GET" && path.startsWith("command/")) {
+      const id = Number(path.split("/")[1]);
+      return sendJson(res, 200, commandRecords.get(id) || {
+        id,
+        name: "Unknown",
+        status: "completed",
+        queued: "2026-07-02T00:00:00Z",
+        body: {}
       });
     }
     if (req.method === "DELETE" && path.startsWith("command/")) {
@@ -619,6 +687,13 @@ async function run() {
     return calls.filter(call => call.method === method && call.path === pathValue).length;
   }
 
+  function commandBodiesSince(index) {
+    return calls
+      .slice(index)
+      .filter(call => call.method === "POST" && call.path === "command")
+      .map(call => call.body);
+  }
+
   try {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       try {
@@ -640,6 +715,9 @@ async function run() {
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     for (const name of [
       "sonarr_search_missing",
+      "sonarr_wanted_missing",
+      "sonarr_wanted_missing_ids",
+      "sonarr_search_missing_exact",
       "sonarr_search_cutoff_unmet",
       "sonarr_search_episode",
       "sonarr_search_series",
@@ -661,6 +739,9 @@ async function run() {
       "sonarr_update_quality_definition",
       "media_archive_environment_check",
       "radarr_search_missing",
+      "radarr_wanted_missing",
+      "radarr_wanted_missing_ids",
+      "radarr_search_missing_exact",
       "radarr_search_cutoff_unmet",
       "radarr_search_movie",
       "radarr_rescan_movie",
@@ -789,6 +870,86 @@ async function run() {
     assert.equal(lastCall().method, "PUT");
     assert.equal(lastCall().path, "qualitydefinition/103");
     assert.equal(lastCall().body.preferredSize, 65);
+
+    const sonarrPage2 = await tool("sonarr_wanted_missing", { page: 2, pageSize: 100 });
+    assert.equal(sonarrPage2.page, 2);
+    assert.equal(sonarrPage2.pageSize, 100);
+    assert.equal(sonarrPage2.totalRecords, 263);
+    assert.equal(sonarrPage2.returned, 100);
+    assert.equal(sonarrPage2.records[0].episodeId, 101);
+    assert.deepEqual(lastCall().query, { page: "2", pageSize: "100" });
+
+    const sonarrLargeLimit = await tool("sonarr_wanted_missing", { limit: 260 });
+    assert.equal(sonarrLargeLimit.page, 1);
+    assert.equal(sonarrLargeLimit.pageSize, 250);
+    assert.equal(sonarrLargeLimit.returned, 260);
+    assert.equal(sonarrLargeLimit.records.at(-1).episodeId, 260);
+
+    const sonarrWantedIds = await tool("sonarr_wanted_missing_ids", {});
+    assert.equal(sonarrWantedIds.returned, 260);
+    assert.equal(sonarrWantedIds.episodeIds.length, 260);
+    assert.equal(sonarrWantedIds.skipped.total, 3);
+    assert.equal(sonarrWantedIds.skipped.reasons.unmonitored, 1);
+    assert.equal(sonarrWantedIds.skipped.reasons.unaired, 1);
+    assert.equal(sonarrWantedIds.skipped.reasons.special, 1);
+
+    const beforeSonarrDryExact = calls.length;
+    const sonarrDryExact = await tool("sonarr_search_missing_exact", { dryRun: true });
+    assert.equal(sonarrDryExact.dryRun, true);
+    assert.equal(sonarrDryExact.totalIds, 260);
+    assert.equal(sonarrDryExact.batchCount, 3);
+    assert.equal(sonarrDryExact.plannedCommands[0].name, "EpisodeSearch");
+    assert.equal(commandBodiesSince(beforeSonarrDryExact).length, 0);
+
+    const beforeSonarrExact = calls.length;
+    const sonarrExact = await tool("sonarr_search_missing_exact", { batchSize: 120, dryRun: false });
+    assert.equal(sonarrExact.dryRun, false);
+    assert.equal(sonarrExact.totalIds, 260);
+    assert.equal(sonarrExact.batchCount, 3);
+    assert.equal(sonarrExact.queuedCommandIds.length, 3);
+    const sonarrExactBodies = commandBodiesSince(beforeSonarrExact);
+    assert.deepEqual(sonarrExactBodies.map(body => body.name), ["EpisodeSearch", "EpisodeSearch", "EpisodeSearch"]);
+    assert.ok(!sonarrExactBodies.some(body => body.name === "MissingEpisodeSearch"));
+    assert.deepEqual(sonarrExactBodies.map(body => body.episodeIds.length), [120, 120, 20]);
+    const sonarrExactStatus = await tool("sonarr_command_status", { commandIds: sonarrExact.queuedCommandIds });
+    assert.equal(sonarrExactStatus.total, 3);
+    assert.equal(sonarrExactStatus.commands[String(sonarrExact.queuedCommandIds[0])].name, "EpisodeSearch");
+    assert.equal(sonarrExactStatus.commands[String(sonarrExact.queuedCommandIds[0])].episodeIdCount, 120);
+
+    const radarrPage2 = await tool("radarr_wanted_missing", { page: 2, pageSize: 100 });
+    assert.equal(radarrPage2.page, 2);
+    assert.equal(radarrPage2.returned, 100);
+    assert.equal(radarrPage2.records[0].movieId, 101);
+
+    const radarrWantedIds = await tool("radarr_wanted_missing_ids", {});
+    assert.equal(radarrWantedIds.returned, 205);
+    assert.equal(radarrWantedIds.movieIds.length, 205);
+    assert.equal(radarrWantedIds.skipped.total, 2);
+    assert.equal(radarrWantedIds.skipped.reasons.unmonitored, 1);
+    assert.equal(radarrWantedIds.skipped.reasons.unavailable, 1);
+
+    const beforeRadarrDryExact = calls.length;
+    const radarrDryExact = await tool("radarr_search_missing_exact", { batchSize: 80, dryRun: true });
+    assert.equal(radarrDryExact.dryRun, true);
+    assert.equal(radarrDryExact.totalIds, 205);
+    assert.equal(radarrDryExact.batchCount, 3);
+    assert.equal(radarrDryExact.plannedCommands[0].name, "MoviesSearch");
+    assert.equal(commandBodiesSince(beforeRadarrDryExact).length, 0);
+
+    const beforeRadarrExact = calls.length;
+    const radarrExact = await tool("radarr_search_missing_exact", { batchSize: 80, dryRun: false });
+    assert.equal(radarrExact.dryRun, false);
+    assert.equal(radarrExact.totalIds, 205);
+    assert.equal(radarrExact.batchCount, 3);
+    assert.equal(radarrExact.queuedCommandIds.length, 3);
+    const radarrExactBodies = commandBodiesSince(beforeRadarrExact);
+    assert.deepEqual(radarrExactBodies.map(body => body.name), ["MoviesSearch", "MoviesSearch", "MoviesSearch"]);
+    assert.ok(!radarrExactBodies.some(body => body.name === "MissingMoviesSearch"));
+    assert.deepEqual(radarrExactBodies.map(body => body.movieIds.length), [80, 80, 45]);
+    const radarrExactStatus = await tool("radarr_command_status", { commandIds: radarrExact.queuedCommandIds });
+    assert.equal(radarrExactStatus.total, 3);
+    assert.equal(radarrExactStatus.commands[String(radarrExact.queuedCommandIds[0])].name, "MoviesSearch");
+    assert.equal(radarrExactStatus.commands[String(radarrExact.queuedCommandIds[0])].movieIdCount, 80);
 
     assert.equal((await tool("sonarr_search_missing")).name, "MissingEpisodeSearch");
     assert.deepEqual(lastCall().body, { name: "MissingEpisodeSearch" });
