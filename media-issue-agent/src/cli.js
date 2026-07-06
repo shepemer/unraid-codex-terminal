@@ -18,6 +18,19 @@ function usage() {
   media-issue-agent status`;
 }
 
+const COMMANDS = new Set([
+  "serve",
+  "web",
+  "poll-once",
+  "list",
+  "investigate",
+  "approve",
+  "reject",
+  "continue",
+  "steer",
+  "status"
+]);
+
 function integerArg(value, name) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
@@ -31,6 +44,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (["help", "-h", "--help"].includes(command)) {
     console.log(usage());
     return 0;
+  }
+  if (!COMMANDS.has(command)) {
+    throw new Error(`Unknown command: ${command}\n${usage()}`);
   }
   const config = await loadConfig(env, {
     requireCodexAuth: command === "investigate",
@@ -101,7 +117,6 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     console.log(redactJson(agent.status()));
     return 0;
   }
-  throw new Error(`Unknown command: ${command}\n${usage()}`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

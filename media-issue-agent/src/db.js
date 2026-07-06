@@ -274,6 +274,26 @@ WHERE id = ${jobId};
   return { ...current, state: toState };
 }
 
+export function setJobState(dbPath, jobId, state, lastError = null) {
+  if (!JOB_STATES.has(state)) {
+    throw new Error(`Unknown job state ${state}`);
+  }
+  const current = sqliteExec(dbPath, sql`
+SELECT id, state FROM jobs WHERE id = ${jobId} LIMIT 1;
+`, { json: true })[0];
+  if (!current) {
+    throw new Error(`Job ${jobId} was not found`);
+  }
+  sqliteExec(dbPath, sql`
+UPDATE jobs
+SET state = ${state},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    last_error = ${lastError}
+WHERE id = ${jobId};
+`);
+  return { ...current, state };
+}
+
 export function createApproval(dbPath, jobId, kind, payload, channel = "cli") {
   const payloadJson = JSON.stringify(payload);
   const tokenHash = stableHash({ jobId, kind, payload });

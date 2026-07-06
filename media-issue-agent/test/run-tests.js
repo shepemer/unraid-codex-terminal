@@ -19,8 +19,8 @@ import {
   transitionJob,
   upsertInvestigation
 } from "../src/db.js";
-import { filterOpenIssues, hasPlexClosedComment, issueTableMarkdown } from "../src/issues.js";
-import { validateDraftComment, AUTOMATED_SUFFIX } from "../src/comments.js";
+import { filterOpenIssues, hasPlexClosedComment, issueLifecycleFromComments, issueQueue, issueTableMarkdown } from "../src/issues.js";
+import { validateDraftComment, AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER } from "../src/comments.js";
 import { redactText, sanitizeValue } from "../src/redact.js";
 import { createWebHandler } from "../src/web.js";
 
@@ -49,6 +49,18 @@ async function fakeCodexBin() {
 async function testPlexClosedFilter() {
   assert.equal(hasPlexClosedComment([{ message: " Closed. " }]), true);
   assert.equal(hasPlexClosedComment([{ message: "Closed but not marker" }]), false);
+  assert.deepEqual(issueLifecycleFromComments([
+    { message: CLOSED_MARKER, createdAt: "2026-01-01T00:00:00Z" },
+    { message: REOPENED_MARKER, createdAt: "2026-01-02T00:00:00Z" }
+  ]), { status: "open", closed: false, marker: REOPENED_MARKER });
+  assert.deepEqual(issueLifecycleFromComments([
+    { message: REOPENED_MARKER, createdAt: "2026-01-01T00:00:00Z" },
+    { message: CLOSED_MARKER, createdAt: "2026-01-02T00:00:00Z" }
+  ]), { status: "closed", closed: true, marker: CLOSED_MARKER });
+  assert.deepEqual(issueLifecycleFromComments([
+    { message: CLOSED_MARKER, createdAt: "2026-01-02T00:00:00Z" },
+    { message: REOPENED_MARKER }
+  ]), { status: "open", closed: false, marker: REOPENED_MARKER });
   const calls = [];
   const client = {
     async callTool(name, args) {
@@ -59,17 +71,33 @@ async function testPlexClosedFilter() {
           id: args.issueId,
           status: "open",
           message: "Already handled",
-          comments: [{ message: " closed. " }]
+          comments: args.issueId === "plex-reopened"
+            ? [
+                { message: CLOSED_MARKER, createdAt: "2026-01-01T00:00:00Z" },
+                { message: REOPENED_MARKER, createdAt: "2026-01-02T00:00:00Z" }
+              ]
+            : [{ message: " closed. " }]
         }
       };
     }
   };
+  const queued = await issueQueue([
+    { source: "plex", id: "plex-fixture-1", status: "open", commentCount: 1, message: "Already handled" },
+    { source: "plex", id: "plex-reopened", status: "open", commentCount: 2, message: "Reopened" },
+    { source: "seerr", id: 22, status: "resolved", message: "Needs attention", mediaTitle: "Fixture Movie" }
+  ], client);
+  assert.deepEqual(queued.map(issue => [issue.issueId, issue.status, issue.isClosed]), [
+    ["plex-fixture-1", "closed", true],
+    ["plex-reopened", "open", false],
+    ["22", "closed", true]
+  ]);
   const open = await filterOpenIssues([
     { source: "plex", id: "plex-fixture-1", status: "open", commentCount: 1, message: "Already handled" },
+    { source: "plex", id: "plex-reopened", status: "open", commentCount: 2, message: "Reopened" },
     { source: "seerr", id: 22, status: "open", message: "Needs attention", mediaTitle: "Fixture Movie" }
   ], client);
-  assert.deepEqual(open.map(issue => issue.source), ["seerr"]);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(open.map(issue => issue.issueId), ["plex-reopened", "22"]);
+  assert.equal(calls.length, 4);
   assert.equal(calls[0].name, "plex_issue_details");
 }
 
@@ -352,6 +380,8 @@ async function testWebAuthAndApi() {
   let investigateRequest = null;
   let continueRequest = null;
   let steerRequest = null;
+  let closeRequest = null;
+  let reopenRequest = null;
   const agent = {
     status: () => ({ dryRun: true, snapshots: { count: 1, latestId: 7 }, jobs: [{ state: "approved_for_execution", count: 1 }], approvals: [] }),
     latestWithEntries: () => ({
@@ -393,6 +423,15 @@ async function testWebAuthAndApi() {
     steerInvestigation: async (jobId, message, actor) => {
       steerRequest = { jobId, message, actor };
       return { jobId, approvalId: 11, approvalKind: "action", summary: "Steered fixture summary" };
+    },
+    issueSummary: async (snapshotId, index) => ({ snapshotId, index, closed: true, summary: "Closed fixture summary" }),
+    closeIssue: async (snapshotId, index, comment, actor) => {
+      closeRequest = { snapshotId, index, comment, actor };
+      return { jobId: 9, status: "closed" };
+    },
+    reopenIssue: async (snapshotId, index, actor) => {
+      reopenRequest = { snapshotId, index, actor };
+      return { jobId: 9, status: "open" };
     }
   };
   const server = http.createServer(createWebHandler(agent, config));
@@ -414,7 +453,9 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
     assert.match(pageText, /id="continue-button"/);
+    assert.match(pageText, /id="reopen-button"/);
     assert.match(pageText, /id="steer-panel"/);
+    assert.match(pageText, /id="close-dialog"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
@@ -422,6 +463,8 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /button\.job-row \{\s+display: grid;/);
     assert.match(cssText, /justify-self: end;/);
     assert.match(cssText, /white-space: nowrap;/);
+    assert.match(cssText, /tbody tr\.issue-closed/);
+    assert.match(cssText, /\.modal-backdrop/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
     assert.equal(js.status, 200);
     const jsText = await js.text();
@@ -434,8 +477,13 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function showJob/);
     assert.match(jsText, /function continueJob/);
     assert.match(jsText, /function steerInvestigation/);
+    assert.match(jsText, /function openCloseDialog/);
+    assert.match(jsText, /function showIssueSummary/);
+    assert.match(jsText, /function reopenIssue/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
     assert.match(jsText, /data-job-id/);
+    assert.match(jsText, /data-close-issue/);
+    assert.match(jsText, /data-issue-summary/);
     assert.match(jsText, /force/);
     const authStatus = await fetch(`${baseUrl}/api/auth`, { headers: { authorization: auth } });
     assert.equal(authStatus.status, 200);
@@ -470,6 +518,22 @@ async function testWebAuthAndApi() {
     });
     assert.equal((await steered.json()).result.summary, "Steered fixture summary");
     assert.deepEqual(steerRequest, { jobId: 9, message: "Client-side issue", actor: "web" });
+    const summary = await fetch(`${baseUrl}/api/issues/7/1/summary`, { headers: { authorization: auth } });
+    assert.equal((await summary.json()).summary, "Closed fixture summary");
+    const closed = await fetch(`${baseUrl}/api/issues/7/1/close`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({ comment: "Fixture close note" })
+    });
+    assert.equal((await closed.json()).result.status, "closed");
+    assert.deepEqual(closeRequest, { snapshotId: 7, index: 1, comment: "Fixture close note", actor: "web" });
+    const reopened = await fetch(`${baseUrl}/api/issues/7/1/reopen`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal((await reopened.json()).result.status, "open");
+    assert.deepEqual(reopenRequest, { snapshotId: 7, index: 1, actor: "web" });
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

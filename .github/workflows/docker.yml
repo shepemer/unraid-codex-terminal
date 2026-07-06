@@ -37,7 +37,35 @@ env:
   UTILITIES_MCP_IMAGE: unraid-codex-terminal-utilities-mcp
 
 jobs:
+  media-issue-agent-sil:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Run media issue agent checks
+        run: |
+          npm --prefix media-issue-agent ci
+          npm --prefix media-issue-agent exec playwright install --with-deps chromium
+          npm --prefix media-issue-agent run check
+          npm --prefix media-issue-agent test
+          npm --prefix media-issue-agent run test:web
+          npm --prefix media-issue-agent run sil
+
   build:
+    needs: media-issue-agent-sil
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

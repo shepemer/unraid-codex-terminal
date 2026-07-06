@@ -1,3 +1,5 @@
+import { CLOSED_MARKER, REOPENED_MARKER } from "./comments.js";
+
 function firstString(...values) {
   return values.find(value => typeof value === "string" && value.trim())?.trim() || "";
 }
@@ -11,8 +13,52 @@ function escapeMarkdownCell(value) {
 }
 
 export function hasPlexClosedComment(comments) {
-  return Array.isArray(comments)
-    && comments.some(comment => String(comment?.message ?? "").trim().toLowerCase() === "closed.");
+  return issueLifecycleFromComments(comments).closed;
+}
+
+function markerType(message) {
+  const normalized = String(message ?? "").trim().toLowerCase();
+  if (normalized === CLOSED_MARKER.toLowerCase()) {
+    return "closed";
+  }
+  if (normalized === REOPENED_MARKER.toLowerCase()) {
+    return "open";
+  }
+  return null;
+}
+
+function commentTimestamp(comment) {
+  const timestamp = Date.parse(comment?.createdAt || comment?.updatedAt || comment?.date || "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function issueLifecycleFromComments(comments, fallbackStatus = "") {
+  const markers = [];
+  if (Array.isArray(comments)) {
+    comments.forEach((comment, index) => {
+      const type = markerType(comment?.message);
+      if (!type) return;
+      markers.push({ type, index, timestamp: commentTimestamp(comment) });
+    });
+  }
+  const allMarkersHaveTimestamps = markers.length > 0 && markers.every(marker => marker.timestamp !== null);
+  const latest = allMarkersHaveTimestamps
+    ? markers.toSorted((left, right) => left.timestamp - right.timestamp || left.index - right.index).at(-1)
+    : markers.at(-1);
+  if (latest) {
+    return {
+      status: latest.type,
+      closed: latest.type === "closed",
+      marker: latest.type === "closed" ? CLOSED_MARKER : REOPENED_MARKER
+    };
+  }
+  const normalizedStatus = String(fallbackStatus || "").toLowerCase();
+  const closed = normalizedStatus.includes("closed") || normalizedStatus.includes("resolved");
+  return {
+    status: closed ? "closed" : "open",
+    closed,
+    marker: null
+  };
 }
 
 export function plexNeedsCommentDetails(issue) {
@@ -23,6 +69,7 @@ export function plexNeedsCommentDetails(issue) {
 }
 
 export function normalizeIssue(issue) {
+  const lifecycle = issueLifecycleFromComments(issue.comments, firstString(issue.status, issue.rawStatus, "open"));
   const reporter = typeof issue.reporter === "string"
     ? issue.reporter
     : firstString(issue.reporter?.displayName, issue.reporter?.username, issue.user?.displayName, issue.user?.username);
@@ -40,7 +87,10 @@ export function normalizeIssue(issue) {
     date: firstString(issue.date, issue.createdAt, issue.updatedAt),
     reporter,
     mediaTitle,
-    status: firstString(issue.status, issue.rawStatus, "open"),
+    status: lifecycle.closed ? "closed" : firstString(issue.status, issue.rawStatus, "open"),
+    lifecycle: lifecycle.status,
+    isClosed: lifecycle.closed,
+    lifecycleMarker: lifecycle.marker,
     description: firstString(issue.description, issue.message, issue.subject),
     createdAt: issue.createdAt || issue.date || "",
     updatedAt: issue.updatedAt || "",
@@ -48,28 +98,36 @@ export function normalizeIssue(issue) {
   };
 }
 
-export async function filterOpenIssues(records, client) {
-  const open = [];
+function needsCommentDetails(issue) {
+  if (issue.source === "plex") {
+    return plexNeedsCommentDetails(issue);
+  }
+  return !Array.isArray(issue.comments) && Number(issue.commentCount || 0) > 0;
+}
+
+export async function issueQueue(records, client) {
+  const queued = [];
   for (const record of records) {
     let issue = record;
-    if (record.source === "plex" && plexNeedsCommentDetails(record)) {
+    if (needsCommentDetails(record)) {
       const details = await client.callTool("plex_issue_details", {
-        source: "plex",
+        source: record.source,
         issueId: String(record.id ?? record.issueId),
         verbose: false
       });
       issue = details.issue || details;
     }
-    if (issue.source === "plex" && hasPlexClosedComment(issue.comments)) {
-      continue;
-    }
-    open.push(normalizeIssue(issue));
+    queued.push(normalizeIssue(issue));
   }
-  return open.sort((left, right) => {
+  return queued.sort((left, right) => {
     const leftDate = left.updatedAt || left.createdAt || left.date || "";
     const rightDate = right.updatedAt || right.createdAt || right.date || "";
     return rightDate.localeCompare(leftDate);
   });
+}
+
+export async function filterOpenIssues(records, client) {
+  return (await issueQueue(records, client)).filter(issue => !issue.isClosed);
 }
 
 export function issueTableMarkdown(entries) {
