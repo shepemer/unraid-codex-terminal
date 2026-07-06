@@ -114,7 +114,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, inspect jobs, and approve or reject pending work. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Action approval advances the job to a drafted reporter comment for a second approval. Comment approval posts through `media-mcp` using the configured dry-run mode. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
@@ -122,6 +122,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1 --force
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js approve 1
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js continue 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js status
    ```
 
@@ -272,6 +273,8 @@ Important behavior:
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
 - The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
+- Job rows in the Activity panel are clickable. The detail pane shows the current state, pending approval kind, draft comments, planned action dry-run/live results, and recent audit events.
+- Action approval does not post comments directly. It generates a reporter-facing draft and moves the job to comment approval. Comment approval posts the exact draft through `media-mcp`; with dry-run enabled, the job finishes as `dry_run_complete` after recording the dry-run result.
 - Mutating media actions are intended to stay behind explicit approvals and exact allowlists. Dry-run mode defaults to `true`.
 - Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`
 
@@ -283,6 +286,7 @@ media-issue-agent list
 media-issue-agent investigate <snapshot-id> <index> [--force]
 media-issue-agent approve <job-id>
 media-issue-agent reject <job-id>
+media-issue-agent continue <job-id>
 media-issue-agent status
 ```
 

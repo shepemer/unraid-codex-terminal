@@ -95,11 +95,14 @@ const HTML = `<!doctype html>
       <div class="section-header">
         <div>
           <span class="eyebrow">Decision Detail</span>
-          <h2>Investigation</h2>
+          <h2 id="detail-heading">Investigation</h2>
         </div>
-        <div id="approval-actions" class="toolbar hidden">
-          <button id="approve-button" type="button">Approve</button>
-          <button id="reject-button" type="button" class="danger">Reject</button>
+        <div class="toolbar">
+          <button id="continue-button" type="button" class="secondary hidden">Continue</button>
+          <div id="approval-actions" class="toolbar hidden">
+            <button id="approve-button" type="button">Approve</button>
+            <button id="reject-button" type="button" class="danger">Reject</button>
+          </div>
         </div>
       </div>
       <pre id="investigation-output">Select an issue to investigate.</pre>
@@ -522,15 +525,28 @@ th:last-child {
   overflow: auto;
 }
 
-.job-row {
+button.job-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   column-gap: 12px;
+  width: 100%;
+  min-height: 0;
   border: 1px solid var(--line);
   border-radius: 9px;
   padding: 11px;
   background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  box-shadow: none;
+}
+
+button.job-row:hover,
+button.job-row.active {
+  background: color-mix(in srgb, var(--accent-soft) 28%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+  transform: none;
 }
 
 .job-main {
@@ -670,6 +686,7 @@ pre {
 const JS = `const state = {
   snapshotId: null,
   entries: [],
+  jobs: [],
   activeJobId: null,
   busy: false,
   authOk: false,
@@ -691,7 +708,9 @@ const el = {
   statsGrid: document.getElementById("stats-grid"),
   jobList: document.getElementById("job-list"),
   dryRun: document.getElementById("dry-run"),
+  detailHeading: document.getElementById("detail-heading"),
   output: document.getElementById("investigation-output"),
+  continueButton: document.getElementById("continue-button"),
   approvalActions: document.getElementById("approval-actions"),
   approveButton: document.getElementById("approve-button"),
   rejectButton: document.getElementById("reject-button"),
@@ -759,7 +778,7 @@ async function api(path, options = {}) {
 function badgeClass(stateName) {
   const normalized = String(stateName || "");
   if (!normalized) return "badge muted";
-  if (normalized === "closed" || normalized === "approved_for_execution") return "badge success";
+  if (normalized === "closed" || normalized === "approved_for_execution" || normalized === "dry_run_complete") return "badge success";
   if (normalized.startsWith("failed") || normalized === "blocked_needs_human") return "badge danger";
   if (normalized.includes("awaiting")) return "badge warning";
   return "badge muted";
@@ -779,6 +798,7 @@ function stateLabel(stateName) {
     posting_comment: "Posting",
     closing_issue: "Closing",
     closed: "Closed",
+    dry_run_complete: "Dry-run done",
     blocked_needs_human: "Needs human",
     failed_retryable: "Retry needed",
     failed_terminal: "Failed"
@@ -809,18 +829,19 @@ function renderStats(status) {
 }
 
 function renderJobs(jobs) {
+  state.jobs = jobs;
   if (!jobs.length) {
     el.jobList.innerHTML = '<div class="empty">No jobs yet.</div>';
     return;
   }
   el.jobList.innerHTML = jobs.map(job => \`
-    <div class="job-row">
+    <button class="job-row \${Number(state.activeJobId) === Number(job.id) ? "active" : ""}" type="button" data-job-id="\${job.id}">
       <div class="job-main">
         <strong>Job \${escapeHtml(job.id)}</strong>
         <span>\${escapeHtml(job.source)} \${escapeHtml(job.issueId)}</span>
       </div>
       <span class="\${badgeClass(job.state)}">\${escapeHtml(stateLabel(job.state))}</span>
-    </div>
+    </button>
   \`).join("");
 }
 
@@ -874,6 +895,8 @@ function showEntry(index) {
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   if (!entry) return;
   state.activeJobId = entry.jobId || null;
+  el.detailHeading.textContent = "Investigation";
+  el.continueButton.classList.add("hidden");
   if (entry.investigationSummary) {
     const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
     const updated = entry.investigationUpdatedAt ? \`Updated: \${entry.investigationUpdatedAt}\` : "";
@@ -882,6 +905,80 @@ function showEntry(index) {
   } else {
     el.output.textContent = \`No cached investigation for \${entry.source} issue \${entry.issueId}. Select Investigate to run Codex.\`;
     el.approvalActions.classList.add("hidden");
+  }
+}
+
+function formatJson(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function pendingApproval(detail) {
+  return (detail.approvals || []).find(approval => approval.status === "pending") || null;
+}
+
+function formatJobDetail(detail) {
+  const job = detail.job;
+  const pending = pendingApproval(detail);
+  const lines = [
+    \`Job \${job.id} · \${stateLabel(job.state)}\`,
+    \`\${job.source} issue \${job.issueId}\`,
+    \`Updated: \${job.updatedAt}\`
+  ];
+  if (job.lastError) {
+    lines.push(\`Last note: \${job.lastError}\`);
+  }
+  if (pending) {
+    lines.push("", \`Pending \${pending.kind} approval #\${pending.id}\`);
+    if (pending.payload?.message) {
+      lines.push("", "Draft comment:", pending.payload.message);
+    }
+  }
+  if (detail.investigation?.summary) {
+    lines.push("", "Investigation:", detail.investigation.summary);
+  }
+  if (detail.plannedActions?.length) {
+    lines.push("", "Planned/executed actions:");
+    for (const action of detail.plannedActions) {
+      lines.push(formatJson({
+        tool: action.toolName,
+        risk: action.riskLevel,
+        args: action.args,
+        dryRunResult: action.dryRunResult,
+        result: action.result
+      }));
+    }
+  }
+  if (detail.auditEvents?.length) {
+    lines.push("", "Recent activity:");
+    for (const event of detail.auditEvents.slice(0, 8)) {
+      lines.push(\`- \${event.createdAt} \${event.eventType}\`);
+    }
+  }
+  return lines.join("\\n");
+}
+
+function updateJobControls(detail) {
+  const pending = pendingApproval(detail);
+  const stateName = detail.job.state;
+  const canApprove = Boolean(pending) && ["awaiting_action_approval", "awaiting_comment_approval"].includes(stateName);
+  el.approvalActions.classList.toggle("hidden", !canApprove);
+  el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
+}
+
+async function showJob(jobId) {
+  state.activeJobId = Number(jobId);
+  el.detailHeading.textContent = "Job Detail";
+  el.output.textContent = "Loading job detail...";
+  el.approvalActions.classList.add("hidden");
+  el.continueButton.classList.add("hidden");
+  try {
+    const result = await api(\`/api/jobs/\${state.activeJobId}\`);
+    el.output.textContent = formatJobDetail(result.detail);
+    updateJobControls(result.detail);
+    renderJobs(state.jobs);
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
   }
 }
 
@@ -914,6 +1011,7 @@ async function startLogin() {
     toast("Codex login started");
     scheduleAuthRefresh();
   } catch (error) {
+    el.output.textContent = error.message;
     toast(error.message);
   } finally {
     setBusy(false);
@@ -927,6 +1025,7 @@ async function poll() {
     toast(\`Snapshot \${result.result.snapshotId} recorded\`);
     await refresh();
   } catch (error) {
+    el.output.textContent = error.message;
     toast(error.message);
   } finally {
     setBusy(false);
@@ -960,11 +1059,31 @@ async function approval(action) {
   if (!state.activeJobId) return;
   setBusy(true);
   try {
-    await api(\`/api/jobs/\${state.activeJobId}/\${action}\`, { method: "POST", body: "{}" });
+    const result = await api(\`/api/jobs/\${state.activeJobId}/\${action}\`, { method: "POST", body: "{}" });
     toast(\`Job \${state.activeJobId} \${action}d\`);
     el.approvalActions.classList.add("hidden");
+    el.output.textContent = result.result?.message || formatJson(result.result);
     await refresh();
+    await showJob(state.activeJobId);
   } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function continueJob() {
+  if (!state.activeJobId) return;
+  setBusy(true);
+  try {
+    const result = await api(\`/api/jobs/\${state.activeJobId}/continue\`, { method: "POST", body: "{}" });
+    toast(\`Job \${state.activeJobId} continued\`);
+    el.output.textContent = result.result?.message || formatJson(result.result);
+    await refresh();
+    await showJob(state.activeJobId);
+  } catch (error) {
+    el.output.textContent = error.message;
     toast(error.message);
   } finally {
     setBusy(false);
@@ -990,6 +1109,13 @@ el.issueRows.addEventListener("click", event => {
 });
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
+el.continueButton.addEventListener("click", continueJob);
+el.jobList.addEventListener("click", event => {
+  const row = event.target.closest("[data-job-id]");
+  if (row) {
+    showJob(Number(row.dataset.jobId));
+  }
+});
 
 applyTheme(document.documentElement.dataset.theme || "dark");
 refresh().catch(error => toast(error.message));`;
@@ -1186,6 +1312,11 @@ export function createWebHandler(agent, config) {
         sendJson(res, 200, { ok: true, jobs: agent.jobs(50), approvals: agent.approvals(50) });
         return;
       }
+      const jobDetailMatch = url.pathname.match(/^\/api\/jobs\/(\d+)$/);
+      if (req.method === "GET" && jobDetailMatch) {
+        sendJson(res, 200, { ok: true, detail: agent.jobDetails(Number(jobDetailMatch[1])) });
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/poll") {
         await readJson(req);
         sendJson(res, 200, { ok: true, result: await agent.pollOnce() });
@@ -1202,7 +1333,14 @@ export function createWebHandler(agent, config) {
       if (req.method === "POST" && approvalMatch) {
         await readJson(req);
         const [, jobId, action] = approvalMatch;
-        const result = action === "approve" ? agent.approve(Number(jobId), "web") : agent.reject(Number(jobId), "web");
+        const result = action === "approve" ? await agent.approve(Number(jobId), "web") : agent.reject(Number(jobId), "web");
+        sendJson(res, 200, { ok: true, result });
+        return;
+      }
+      const continueMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/continue$/);
+      if (req.method === "POST" && continueMatch) {
+        await readJson(req);
+        const result = await agent.continueJob(Number(continueMatch[1]), "web");
         sendJson(res, 200, { ok: true, result });
         return;
       }

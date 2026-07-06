@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir, chmod } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import {
   createApproval,
@@ -10,6 +11,7 @@ import {
   initDb,
   insertSnapshot,
   investigationForJob,
+  jobDetails,
   pendingApprovalForJob,
   snapshotEntries,
   snapshotEntry,
@@ -30,6 +32,18 @@ async function authHome(authJson = { chatgpt: { account: "fixture" } }) {
   const dir = await tempDir();
   await writeFile(path.join(dir, "auth.json"), JSON.stringify(authJson));
   return dir;
+}
+
+async function fakeCodexBin() {
+  const dir = await tempDir();
+  const bin = path.join(dir, "codex-fixture");
+  await writeFile(bin, [
+    "#!/bin/sh",
+    "cat >/dev/null",
+    "printf '%s\\n' 'Fixture automated update.' 'Automated response from Codex.'"
+  ].join("\n"));
+  await chmod(bin, 0o700);
+  return { dir, bin };
 }
 
 async function testPlexClosedFilter() {
@@ -117,6 +131,79 @@ async function testInvestigationCacheAndStaleApprovalSuperseding() {
   supersedePendingApprovals(dbPath, job.id);
   assert.equal(pendingApprovalForJob(dbPath, job.id), null);
   await rm(dir, { recursive: true, force: true });
+}
+
+async function testApprovedJobContinuesToDryRunCommentPosting() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const fakeCodex = await fakeCodexBin();
+  const calls = [];
+  const client = {
+    async callTool(name, args) {
+      calls.push({ name, args });
+      if (name === "plex_issue_details") {
+        return { issue: { source: args.source, id: args.issueId, status: "open", message: "Fixture issue" } };
+      }
+      if (name === "media_diagnose_issue") {
+        return {
+          issue: { source: args.source, id: args.issueId, status: "open" },
+          suggestedActions: [{ type: "seerr_add_comment", issueId: Number(args.issueId), message: "Fixture" }]
+        };
+      }
+      if (name === "seerr_comment_and_resolve_issue") {
+        return {
+          dryRun: args.dryRun,
+          wouldAddComment: { issueId: args.issueId, message: args.message },
+          wouldSetStatus: "resolved"
+        };
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  };
+  const agent = new MediaIssueAgent({
+    dbPath,
+    codexHome,
+    codexBin: fakeCodex.bin,
+    codexWorkspace: path.join(dir, "codex-workspace"),
+    codexTimeoutMs: 10000,
+    dryRun: true
+  }, client);
+  await agent.init();
+  const entries = [{
+    source: "seerr",
+    issueId: "1",
+    date: "2026-01-01T00:00:00Z",
+    reporter: "Fixture Reporter",
+    mediaTitle: "Fixture Movie",
+    status: "open",
+    description: "Fixture playback issue"
+  }];
+  const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+  const investigated = await agent.investigate(snapshot.id, 1, { force: true });
+  assert.equal(jobDetails(dbPath, investigated.jobId).job.state, "awaiting_action_approval");
+
+  const commentReview = await agent.approve(investigated.jobId, "fixture");
+  assert.equal(commentReview.status, "awaiting_comment_approval");
+  assert.equal(commentReview.approvalKind, "comment");
+  assert.match(commentReview.message, /Automated response from Codex\.$/);
+  let details = jobDetails(dbPath, investigated.jobId);
+  assert.equal(details.job.state, "awaiting_comment_approval");
+  assert.equal(pendingApprovalForJob(dbPath, investigated.jobId, "comment").kind, "comment");
+
+  const posted = await agent.approve(investigated.jobId, "fixture");
+  assert.equal(posted.status, "dry_run_complete");
+  details = jobDetails(dbPath, investigated.jobId);
+  assert.equal(details.job.state, "dry_run_complete");
+  assert.equal(details.plannedActions[0].toolName, "seerr_comment_and_resolve_issue");
+  assert.equal(details.plannedActions[0].dryRunResult.dryRun, true);
+  const postCall = calls.find(call => call.name === "seerr_comment_and_resolve_issue");
+  assert.equal(postCall.args.dryRun, true);
+  assert.match(postCall.args.message, /Automated response from Codex\.$/);
+
+  await rm(dir, { recursive: true, force: true });
+  await rm(codexHome, { recursive: true, force: true });
+  await rm(fakeCodex.dir, { recursive: true, force: true });
 }
 
 function testCommentValidation() {
@@ -242,8 +329,9 @@ async function testWebAuthAndApi() {
     webPassword: "fixture-password"
   };
   let investigateRequest = null;
+  let continueRequest = null;
   const agent = {
-    status: () => ({ dryRun: true, snapshots: { count: 1, latestId: 7 }, jobs: [], approvals: [] }),
+    status: () => ({ dryRun: true, snapshots: { count: 1, latestId: 7 }, jobs: [{ state: "approved_for_execution", count: 1 }], approvals: [] }),
     latestWithEntries: () => ({
       id: 7,
       generatedAt: "2026-01-01T00:00:00Z",
@@ -259,15 +347,27 @@ async function testWebAuthAndApi() {
         investigationUpdatedAt: "2026-01-01T00:01:00Z"
       }]
     }),
-    jobs: () => [],
+    jobs: () => [{ id: 9, source: "seerr", issueId: "fixture", state: "approved_for_execution" }],
     approvals: () => [],
+    jobDetails: jobId => ({
+      job: { id: jobId, source: "seerr", issueId: "fixture", state: "approved_for_execution", updatedAt: "2026-01-01T00:02:00Z" },
+      investigation: { summary: "Cached fixture summary" },
+      approvals: [],
+      plannedActions: [],
+      verificationChecks: [],
+      auditEvents: [{ eventType: "approval_accepted", createdAt: "2026-01-01T00:02:00Z" }]
+    }),
     pollOnce: async () => ({ snapshotId: 8, issueCount: 1 }),
     investigate: async (snapshotId, index, options) => {
       investigateRequest = { snapshotId, index, options };
       return { jobId: 9, approvalId: 10, summary: "Fixture summary" };
     },
-    approve: () => [{ id: 10, status: "approved" }],
-    reject: () => [{ id: 10, status: "rejected" }]
+    approve: async () => ({ jobId: 9, status: "awaiting_comment_approval", message: "Draft comment" }),
+    reject: () => [{ id: 10, status: "rejected" }],
+    continueJob: async jobId => {
+      continueRequest = { jobId };
+      return { jobId, status: "awaiting_comment_approval", message: "Draft comment" };
+    }
   };
   const server = http.createServer(createWebHandler(agent, config));
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -287,11 +387,12 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /<html lang="en" data-theme="dark">/);
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
+    assert.match(pageText, /id="continue-button"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
     assert.match(cssText, /:root\[data-theme="dark"\]/);
-    assert.match(cssText, /\.job-row \{\s+display: grid;/);
+    assert.match(cssText, /button\.job-row \{\s+display: grid;/);
     assert.match(cssText, /justify-self: end;/);
     assert.match(cssText, /white-space: nowrap;/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
@@ -303,7 +404,10 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /\/api\/auth\/login/);
     assert.match(jsText, /Re-investigate/);
     assert.match(jsText, /function showEntry/);
+    assert.match(jsText, /function showJob/);
+    assert.match(jsText, /function continueJob/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
+    assert.match(jsText, /data-job-id/);
     assert.match(jsText, /force/);
     const authStatus = await fetch(`${baseUrl}/api/auth`, { headers: { authorization: auth } });
     assert.equal(authStatus.status, 200);
@@ -321,6 +425,16 @@ async function testWebAuthAndApi() {
       index: 1,
       options: { force: true }
     });
+    const detail = await fetch(`${baseUrl}/api/jobs/9`, { headers: { authorization: auth } });
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json()).detail.job.state, "approved_for_execution");
+    const continued = await fetch(`${baseUrl}/api/jobs/9/continue`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal((await continued.json()).result.status, "awaiting_comment_approval");
+    assert.deepEqual(continueRequest, { jobId: 9 });
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
@@ -331,6 +445,7 @@ async function run() {
   await testTableAndSnapshotMapping();
   testCommentValidation();
   await testInvestigationCacheAndStaleApprovalSuperseding();
+  await testApprovedJobContinuesToDryRunCommentPosting();
   await testAuthConfig();
   await testStateTransitions();
   await testDbDirectoryWritablePreflight();
