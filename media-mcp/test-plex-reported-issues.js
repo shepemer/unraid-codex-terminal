@@ -348,6 +348,10 @@ async function run() {
       "createReportComment",
       "removeReportComment"
     ]);
+    assert.ok(dryState.discovery.methodsAttempted.some(method => /generic Activity mutation path/.test(method)));
+    assert.ok(dryState.discovery.methodsAttempted.some(method => /removeActivity type map does not include Report/.test(method)));
+    assert.equal(dryState.discovery.nearMisses.find(nearMiss => nearMiss.operation === "removeActivity").reasonNotUsed.includes("does not contain Report"), true);
+    assert.equal(dryState.discovery.nearMisses.find(nearMiss => nearMiss.operation === "removeReportComment").reasonNotUsed.includes("comment only"), true);
     assert.match(dryState.discovery.conclusion, /No upstream Plex-native report state mutation/i);
     assert.ok(dryState.discovery.methodsAttempted.some(method => /205 JavaScript bundles/.test(method)));
     assert.equal(dryState.discovery.uiCapabilitiesObserved.reportDeleteActionFound, false);

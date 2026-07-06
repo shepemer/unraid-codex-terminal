@@ -2236,6 +2236,8 @@ const plexReportedIssueStateDiscovery = {
     "Extracted the Webpack chunk map and downloaded/searched all 205 JavaScript bundles for Reported Issues, report GraphQL operations, and close/resolve/archive/delete/dismiss/ignore verbs.",
     "Extracted the Reported Issues GraphQL endpoint module and verified it exposes create/list/detail/comment/comment-delete operations only.",
     "Inspected the bundled Reported Issues UI route and labels for close, resolve, reopen, archive, delete, dismiss, hide, and ignore actions.",
+    "Traced Plex Web's generic Activity mutation path, including removeActivity($input: RemoveActivityInput!) and updateActivity($id: ID!, $input: UpdateActivityInput!), as a possible backdoor.",
+    "Verified Report objects are fetched through reportByID/reportComments rather than activityByID/activityComments, Report cards are wrapped without generic metadata actions, and the removeActivity type map does not include Report.",
     "Attempted direct in-app browser navigation to https://app.plex.tv/desktop/#!/reports; browser access to app.plex.tv is blocked by this environment's enterprise network policy before authenticated UI interaction."
   ],
   graphqlOperationsFound: {
@@ -2251,6 +2253,23 @@ const plexReportedIssueStateDiscovery = {
       "removeReportComment"
     ]
   },
+  nearMisses: [
+    {
+      operation: "removeActivity",
+      document: "mutation removeActivity($input: RemoveActivityInput!) { removeActivity(input: $input) }",
+      reasonNotUsed: "This is wired only for Plex Activity objects. Plex Web's activity type map contains ActivityMetadataMessage, ActivityPost, ActivityRating, ActivityReview, ActivityWatchHistory, ActivityWatchRating, ActivityWatchReview, ActivityWatchSession, and ActivityWatchlist; it does not contain Report."
+    },
+    {
+      operation: "updateActivityDate",
+      document: "mutation updateActivityDate($id: ID!, $input: UpdateActivityInput!) { updateActivity(id: $id, input: $input) { id } }",
+      reasonNotUsed: "This only edits activity dates for supported activity objects and is not connected to Reported Issues in Plex Web."
+    },
+    {
+      operation: "removeReportComment",
+      document: "mutation removeReportComment($input: RemoveReportCommentInput!) { removeReportComment(input: $input) }",
+      reasonNotUsed: "This deletes a report comment only; it does not delete, close, resolve, archive, ignore, or hide the parent report."
+    }
+  ],
   uiCapabilitiesObserved: {
     list: true,
     detail: true,
