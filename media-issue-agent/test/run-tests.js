@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, chmod } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -14,9 +14,9 @@ async function tempDir() {
   return mkdtemp(path.join(os.tmpdir(), "media-issue-agent-test-"));
 }
 
-async function authHome() {
+async function authHome(authJson = { chatgpt: { account: "fixture" } }) {
   const dir = await tempDir();
-  await writeFile(path.join(dir, "auth.json"), JSON.stringify({ chatgpt: { account: "fixture" } }));
+  await writeFile(path.join(dir, "auth.json"), JSON.stringify(authJson));
   return dir;
 }
 
@@ -82,6 +82,21 @@ function testCommentValidation() {
 
 async function testAuthConfig() {
   const codexHome = await authHome();
+  const chatGptCodexHome = await authHome({
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: "fixture-id-token",
+      access_token: "fixture-access-token",
+      refresh_token: "fixture-refresh-token",
+      account_id: "fixture-account-id"
+    },
+    last_refresh: "2026-01-01T00:00:00.000000000Z"
+  });
+  const apiKeyCodexHome = await authHome({
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "sk-fixturetoken"
+  });
   await assert.rejects(
     () => loadConfig({
       ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
@@ -96,11 +111,27 @@ async function testAuthConfig() {
     }),
     /CODEX_HOME is required/
   );
+  const webStartupWithoutAuth = await loadConfig({
+    ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token"
+  }, { requireCodexAuth: false });
+  assert.equal(webStartupWithoutAuth.mediaMcpBearerToken, "fixture-token");
   const loaded = await loadConfig({
     ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
     CODEX_HOME: codexHome
   });
   assert.equal(loaded.codexHome, codexHome);
+  const chatGptLoaded = await loadConfig({
+    ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
+    CODEX_HOME: chatGptCodexHome
+  });
+  assert.equal(chatGptLoaded.codexHome, chatGptCodexHome);
+  await assert.rejects(
+    () => loadConfig({
+      ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
+      CODEX_HOME: apiKeyCodexHome
+    }),
+    /appears to contain API-key auth/
+  );
   await assert.rejects(
     () => loadConfig({
       ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
@@ -109,6 +140,8 @@ async function testAuthConfig() {
     /ISSUE_AGENT_WEB_PASSWORD is required/
   );
   await rm(codexHome, { recursive: true, force: true });
+  await rm(chatGptCodexHome, { recursive: true, force: true });
+  await rm(apiKeyCodexHome, { recursive: true, force: true });
 }
 
 async function testStateTransitions() {
@@ -123,6 +156,22 @@ async function testStateTransitions() {
     /Cannot transition/
   );
   await rm(dir, { recursive: true, force: true });
+}
+
+async function testDbDirectoryWritablePreflight() {
+  const dir = await tempDir();
+  const lockedDir = path.join(dir, "locked");
+  await mkdir(lockedDir, { recursive: true });
+  await chmod(lockedDir, 0o500);
+  try {
+    await assert.rejects(
+      async () => initDb(path.join(lockedDir, "state.sqlite")),
+      /SQLite state directory is not writable/
+    );
+  } finally {
+    await chmod(lockedDir, 0o700);
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 function testRedaction() {
@@ -174,6 +223,7 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /Media Issue Agent/);
     assert.match(pageText, /<html lang="en" data-theme="dark">/);
     assert.match(pageText, /data-theme-choice="dark"/);
+    assert.match(pageText, /id="auth-panel"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
@@ -186,6 +236,12 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /media-issue-agent-theme/);
     assert.match(jsText, /applyTheme\(document\.documentElement\.dataset\.theme \|\| "dark"\)/);
     assert.match(jsText, /class="job-main"/);
+    assert.match(jsText, /\/api\/auth\/login/);
+    const authStatus = await fetch(`${baseUrl}/api/auth`, { headers: { authorization: auth } });
+    assert.equal(authStatus.status, 200);
+    const authBody = await authStatus.json();
+    assert.equal(authBody.auth.ok, false);
+    assert.equal(authBody.auth.status, "missing_home");
     const investigated = await fetch(`${baseUrl}/api/investigate`, {
       method: "POST",
       headers: { authorization: auth, "content-type": "application/json" },
@@ -203,6 +259,7 @@ async function run() {
   testCommentValidation();
   await testAuthConfig();
   await testStateTransitions();
+  await testDbDirectoryWritablePreflight();
   testRedaction();
   await testWebAuthAndApi();
   console.log("media-issue-agent tests passed");

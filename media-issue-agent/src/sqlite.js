@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -28,7 +29,13 @@ export function sql(values, ...substitutions) {
 }
 
 export async function ensureDbDir(dbPath) {
-  await mkdir(path.dirname(dbPath), { recursive: true });
+  const dbDir = path.dirname(dbPath);
+  try {
+    await mkdir(dbDir, { recursive: true });
+    await access(dbDir, constants.W_OK);
+  } catch {
+    throw new Error(`SQLite state directory is not writable: ${dbDir}. Ensure the host State Directory bind mount exists and is writable by container uid 1000/gid 1000.`);
+  }
 }
 
 export function sqliteExec(dbPath, statement, options = {}) {

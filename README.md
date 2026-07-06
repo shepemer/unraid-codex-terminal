@@ -83,7 +83,7 @@ For full configuration, validation, local development, and security notes, see [
    - a persistent `CODEX_HOME` mount containing Codex ChatGPT auth
    - strong `ISSUE_AGENT_WEB_PASSWORD`
 
-   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`; run Codex login with ChatGPT auth instead.
+   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`; use the Web UI Codex Auth panel or run Codex login with ChatGPT auth instead.
 
 Do not publish host ports for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. Only SSH, the Codex terminal WebUI, and the password-protected media issue agent WebUI should be reachable from your LAN, VPN, or Tailscale.
 

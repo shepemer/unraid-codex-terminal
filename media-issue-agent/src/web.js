@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdir } from "node:fs/promises";
 import http from "node:http";
+import { inspectCodexAuth } from "./config.js";
 import { redactText, sanitizeValue } from "./redact.js";
 
 const HTML = `<!doctype html>
@@ -33,6 +36,16 @@ const HTML = `<!doctype html>
         <button id="poll-button" type="button">Poll Now</button>
       </nav>
     </header>
+
+    <section id="auth-panel" class="auth-panel panel hidden" aria-labelledby="auth-heading">
+      <div class="auth-copy">
+        <span class="eyebrow">Codex Auth</span>
+        <h2 id="auth-heading">Connect ChatGPT</h2>
+        <p id="auth-message">Codex ChatGPT auth is required before investigations can run.</p>
+      </div>
+      <button id="login-button" type="button">Start Login</button>
+      <pre id="login-output" class="login-output hidden"></pre>
+    </section>
 
     <main class="workspace">
       <section class="issue-section panel" aria-labelledby="issues-heading">
@@ -296,6 +309,31 @@ p { color: var(--muted); margin-top: 4px; }
   background: var(--panel);
   color: var(--text);
   transform: none;
+}
+
+.auth-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 16px 0;
+  padding: 14px;
+}
+
+.auth-panel.connected {
+  display: none;
+}
+
+.auth-copy {
+  min-width: 0;
+}
+
+.login-output {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-height: 96px;
+  max-height: 220px;
+  border-top: 1px solid var(--line);
 }
 
 .workspace {
@@ -615,6 +653,15 @@ pre {
     flex: 1;
   }
 
+  .auth-panel {
+    grid-template-columns: 1fr;
+    margin: 12px 12px 0;
+  }
+
+  .auth-panel > button {
+    width: 100%;
+  }
+
   .stats-grid {
     grid-template-columns: 1fr;
   }
@@ -623,10 +670,18 @@ pre {
 const JS = `const state = {
   snapshotId: null,
   activeJobId: null,
-  busy: false
+  busy: false,
+  authOk: false,
+  loginRunning: false,
+  authTimer: null
 };
 
 const el = {
+  authPanel: document.getElementById("auth-panel"),
+  authHeading: document.getElementById("auth-heading"),
+  authMessage: document.getElementById("auth-message"),
+  loginButton: document.getElementById("login-button"),
+  loginOutput: document.getElementById("login-output"),
   snapshotMeta: document.getElementById("snapshot-meta"),
   issueCount: document.getElementById("issue-count"),
   issueRows: document.getElementById("issue-rows"),
@@ -653,7 +708,15 @@ function toast(message) {
 function setBusy(value) {
   state.busy = value;
   for (const button of document.querySelectorAll("button:not([data-theme-choice])")) {
-    button.disabled = value;
+    if (value) {
+      button.disabled = true;
+    } else if (button === el.loginButton) {
+      button.disabled = state.loginRunning || state.authOk;
+    } else if (button.dataset.investigate) {
+      button.disabled = !state.authOk;
+    } else {
+      button.disabled = false;
+    }
   }
 }
 
@@ -739,6 +802,20 @@ function renderJobs(jobs) {
   \`).join("");
 }
 
+function renderAuth(auth, login) {
+  state.authOk = Boolean(auth?.ok);
+  state.loginRunning = login?.status === "running";
+  el.authPanel.classList.toggle("hidden", state.authOk && !state.loginRunning);
+  el.authPanel.classList.toggle("connected", state.authOk && !state.loginRunning);
+  el.authHeading.textContent = state.authOk ? "ChatGPT Connected" : "Connect ChatGPT";
+  el.authMessage.textContent = auth?.message || "Codex ChatGPT auth is required before investigations can run.";
+  el.loginButton.textContent = state.loginRunning ? "Login Running" : "Start Login";
+  el.loginButton.disabled = state.busy || state.loginRunning || state.authOk;
+  const output = login?.output || "";
+  el.loginOutput.classList.toggle("hidden", !output);
+  el.loginOutput.textContent = output;
+}
+
 function renderSnapshot(snapshot) {
   if (!snapshot) {
     state.snapshotId = null;
@@ -764,20 +841,44 @@ function renderSnapshot(snapshot) {
       <td>\${escapeHtml(entry.mediaTitle)}</td>
       <td><span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span></td>
       <td>\${escapeHtml(entry.description)}</td>
-      <td><button class="secondary" type="button" data-investigate="\${entry.idx}">Investigate</button></td>
+      <td><button class="secondary" type="button" data-investigate="\${entry.idx}" \${state.authOk ? "" : "disabled"}>Investigate</button></td>
     </tr>
   \`).join("");
 }
 
 async function refresh() {
-  const [status, snapshot, jobs] = await Promise.all([
+  const [status, snapshot, jobs, auth] = await Promise.all([
     api("/api/status"),
     api("/api/snapshot/latest"),
-    api("/api/jobs")
+    api("/api/jobs"),
+    api("/api/auth")
   ]);
   renderStats(status.status);
+  renderAuth(auth.auth, auth.login);
   renderSnapshot(snapshot.snapshot);
   renderJobs(jobs.jobs);
+  scheduleAuthRefresh();
+}
+
+function scheduleAuthRefresh() {
+  clearTimeout(state.authTimer);
+  if (state.loginRunning) {
+    state.authTimer = setTimeout(() => refresh().catch(error => toast(error.message)), 2000);
+  }
+}
+
+async function startLogin() {
+  setBusy(true);
+  try {
+    const result = await api("/api/auth/login", { method: "POST", body: "{}" });
+    renderAuth(result.auth, result.login);
+    toast("Codex login started");
+    scheduleAuthRefresh();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function poll() {
@@ -833,6 +934,7 @@ async function approval(action) {
 
 el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
+el.loginButton.addEventListener("click", startLogin);
 for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
@@ -891,6 +993,10 @@ function sendJson(res, status, value) {
   send(res, status, safeJson(value), "application/json; charset=utf-8");
 }
 
+function sendPublicJson(res, status, value) {
+  send(res, status, JSON.stringify(value), "application/json; charset=utf-8");
+}
+
 async function readJson(req) {
   let data = "";
   for await (const chunk of req) {
@@ -900,6 +1006,89 @@ async function readJson(req) {
     }
   }
   return data ? JSON.parse(data) : {};
+}
+
+let loginSession = null;
+
+function redactLoginText(value) {
+  return String(value ?? "")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/\-=]+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|(?:gho|ghp|github_pat)_[A-Za-z0-9_=-]{8,})\b/g, "[REDACTED_TOKEN]")
+    .replace(/\b[A-Za-z0-9_]*API[_-]?KEY[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "API_KEY=[REDACTED]")
+    .replace(/\b[A-Za-z0-9_]*TOKEN[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "TOKEN=[REDACTED]")
+    .replace(/(?:\/Users|\/home|\/mnt\/user|\/mnt\/unraid|\/config|\/codex-home|\/boot|\/var\/run)\/[^\s"'<>),]+/g, "[REDACTED_PATH]");
+}
+
+function appendLoginOutput(session, chunk) {
+  session.output = `${session.output}${redactLoginText(chunk)}`.slice(-16000);
+}
+
+function publicLoginSession() {
+  if (!loginSession) {
+    return null;
+  }
+  return {
+    id: loginSession.id,
+    status: loginSession.status,
+    startedAt: loginSession.startedAt,
+    completedAt: loginSession.completedAt,
+    exitCode: loginSession.exitCode,
+    output: loginSession.output
+  };
+}
+
+function publicAuthStatus(auth) {
+  return {
+    ok: auth.ok,
+    status: auth.status,
+    message: auth.message
+  };
+}
+
+async function currentAuthStatus(config) {
+  return publicAuthStatus(await inspectCodexAuth(config.codexHome));
+}
+
+async function startCodexLogin(config) {
+  if (loginSession?.status === "running") {
+    return publicLoginSession();
+  }
+  await mkdir(config.codexWorkspace, { recursive: true });
+  await mkdir(config.codexHome, { recursive: true });
+  const session = {
+    id: crypto.randomUUID(),
+    status: "running",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    exitCode: null,
+    output: ""
+  };
+  loginSession = session;
+  const env = {
+    ...process.env,
+    CODEX_HOME: config.codexHome,
+    HOME: process.env.HOME || "/home/agent"
+  };
+  delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  const child = spawn(config.codexBin, ["login", "--device-auth"], {
+    cwd: config.codexWorkspace,
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  child.stdout.on("data", chunk => appendLoginOutput(session, chunk));
+  child.stderr.on("data", chunk => appendLoginOutput(session, chunk));
+  child.on("error", error => {
+    session.status = "failed";
+    session.completedAt = new Date().toISOString();
+    appendLoginOutput(session, `\n${error.message}\n`);
+  });
+  child.on("close", code => {
+    session.status = code === 0 ? "completed" : "failed";
+    session.exitCode = code;
+    session.completedAt = new Date().toISOString();
+  });
+  return publicLoginSession();
 }
 
 export function createWebHandler(agent, config) {
@@ -929,6 +1118,16 @@ export function createWebHandler(agent, config) {
       }
       if (req.method === "GET" && url.pathname === "/assets/app.js") {
         send(res, 200, JS, "text/javascript; charset=utf-8");
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/auth") {
+        sendPublicJson(res, 200, { ok: true, auth: await currentAuthStatus(config), login: publicLoginSession() });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/auth/login") {
+        await readJson(req);
+        const login = await startCodexLogin(config);
+        sendPublicJson(res, 200, { ok: true, auth: await currentAuthStatus(config), login });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/status") {
