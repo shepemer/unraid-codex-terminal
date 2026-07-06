@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -42,6 +45,7 @@ function parseSse(text) {
 
 async function run() {
   const graphqlCalls = [];
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "media-mcp-state-"));
   const reports = [
     {
       __typename: "Report",
@@ -199,6 +203,7 @@ async function run() {
       MEDIA_MCP_BEARER_TOKEN: "test-token",
       MEDIA_MCP_HOST: "127.0.0.1",
       MEDIA_MCP_PORT: String(mediaPort),
+      MEDIA_MCP_STATE_DIR: stateDir,
       PLEX_URL: `http://127.0.0.1:${mockPort}/plex`,
       PLEX_TOKEN: "plex-token",
       PLEX_COMMUNITY_URL: `http://127.0.0.1:${mockPort}/community`
@@ -242,6 +247,10 @@ async function run() {
     assert.ok(!response.error, JSON.stringify(response));
     assert.ok(!response.result.isError, response.result.content?.[0]?.text);
     return JSON.parse(response.result.content[0].text);
+  }
+
+  async function stateDirEntries() {
+    return (await readdir(stateDir, { recursive: true })).sort();
   }
 
   try {
@@ -324,7 +333,25 @@ async function run() {
     });
     assert.equal(dryState.supported, false);
     assert.equal(dryState.applied, false);
-    assert.equal(dryState.wouldSetStatus, "resolved");
+    assert.equal(dryState.requestedState, "resolved");
+    assert.equal(dryState.upstreamRequest, null);
+    assert.equal(dryState.capabilities.list, true);
+    assert.equal(dryState.capabilities.detail, true);
+    assert.equal(dryState.capabilities.comment, true);
+    assert.equal(dryState.capabilities.reportStateMutation, false);
+    assert.equal(dryState.capabilities.reportDeletion, false);
+    assert.equal(dryState.capabilities.localStateOverlay, false);
+    assert.equal(dryState.discovery.plexWebVersion, "4.159.0-d0cea4c");
+    assert.equal(dryState.discovery.communityEndpoint, "https://community.plex.tv/api");
+    assert.deepEqual(dryState.discovery.graphqlOperationsFound.mutations, [
+      "createReport",
+      "createReportComment",
+      "removeReportComment"
+    ]);
+    assert.match(dryState.discovery.conclusion, /No upstream Plex-native report state mutation/i);
+    assert.ok(dryState.discovery.methodsAttempted.some(method => /205 JavaScript bundles/.test(method)));
+    assert.equal(dryState.discovery.uiCapabilitiesObserved.reportDeleteActionFound, false);
+    assert.deepEqual(await stateDirEntries(), []);
 
     const appliedState = await tool("plex_update_reported_issue_state", {
       issueId: "report-1",
@@ -333,12 +360,15 @@ async function run() {
     });
     assert.equal(appliedState.supported, false);
     assert.equal(appliedState.applied, false);
-    assert.equal(appliedState.wouldSetStatus, "open");
-    assert.equal(graphqlCalls.some(call => /state/i.test(call.operationName)), false);
+    assert.equal(appliedState.requestedState, "open");
+    assert.equal(appliedState.upstreamRequest, null);
+    assert.equal(graphqlCalls.some(call => /state|resolve|close|archive|delete|ignore/i.test(call.operationName)), false);
+    assert.deepEqual(await stateDirEntries(), []);
   } finally {
     child.kill("SIGTERM");
     mock.close();
     await once(mock, "close");
+    await rm(stateDir, { recursive: true, force: true });
   }
 }
 

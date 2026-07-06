@@ -2217,6 +2217,51 @@ const plexCreateReportCommentMutation = `
   }
 `;
 
+const plexReportedIssueStateDiscovery = {
+  plexWebVersion: "4.159.0-d0cea4c",
+  plexWebHash: "f9a38bb3b6abfdce03f4",
+  inspectedAt: "2026-07-06",
+  communityEndpoint: "https://community.plex.tv/api",
+  apiVersion: "not exposed by the Plex Web community GraphQL endpoint",
+  requiredHeaders: [
+    "X-Plex-Token",
+    "X-Plex-Client-Identifier",
+    "X-Plex-Product",
+    "X-Plex-Version",
+    "Accept: application/json",
+    "Content-Type: application/json"
+  ],
+  methodsAttempted: [
+    "Fetched Plex Web app shell from https://app.plex.tv/desktop/ and identified Plex Web 4.159.0-d0cea4c.",
+    "Extracted the Webpack chunk map and downloaded/searched all 205 JavaScript bundles for Reported Issues, report GraphQL operations, and close/resolve/archive/delete/dismiss/ignore verbs.",
+    "Extracted the Reported Issues GraphQL endpoint module and verified it exposes create/list/detail/comment/comment-delete operations only.",
+    "Inspected the bundled Reported Issues UI route and labels for close, resolve, reopen, archive, delete, dismiss, hide, and ignore actions.",
+    "Attempted direct in-app browser navigation to https://app.plex.tv/desktop/#!/reports; browser access to app.plex.tv is blocked by this environment's enterprise network policy before authenticated UI interaction."
+  ],
+  graphqlOperationsFound: {
+    queries: [
+      "reportsUnreadCount",
+      "getReportedIssues",
+      "reportById",
+      "reportComments"
+    ],
+    mutations: [
+      "createReport",
+      "createReportComment",
+      "removeReportComment"
+    ]
+  },
+  uiCapabilitiesObserved: {
+    list: true,
+    detail: true,
+    addComment: true,
+    removeComment: true,
+    reportStateActionLabelsFound: [],
+    reportDeleteActionFound: false
+  },
+  conclusion: "No upstream Plex-native report state mutation or report deletion mutation was found. List, detail, and comment operations are supported; report state changes remain unsupported without a Plex upstream API."
+};
+
 async function listSeerrIssues(input) {
   const status = input.status || "open";
   const body = await seerrApi("issue", {
@@ -4885,22 +4930,32 @@ async function addPlexIssueComment(issueId, message, dryRun, verbose = false) {
 }
 
 async function updatePlexIssueState(issueId, action, dryRun, verbose = false) {
-  const normalizedAction = {
+  const requestedState = {
     close: "closed",
     resolve: "resolved",
     reopen: "open",
     open: "open",
     archive: "archived",
-    delete: "deleted",
     ignore: "ignored"
-  }[action] || action;
+  }[action];
   return {
     dryRun,
     applied: false,
     supported: false,
     requestedAction: action,
-    wouldSetStatus: normalizedAction,
-    limitation: "The Plex Web community API currently exposes report list/detail/comment operations, but no native report state transition mutation.",
+    requestedState,
+    upstreamRequest: null,
+    capabilities: {
+      list: true,
+      detail: true,
+      comment: true,
+      removeComment: true,
+      reportStateMutation: false,
+      reportDeletion: false,
+      localStateOverlay: false
+    },
+    discovery: plexReportedIssueStateDiscovery,
+    limitation: "Plex Web 4.159.0 exposes native report list/detail/comment/comment-delete operations, but no upstream report state transition or report deletion mutation. No local-only state overlay is used.",
     issue: await getPlexIssue(issueId, verbose)
   };
 }
