@@ -30,7 +30,10 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     console.log(usage());
     return 0;
   }
-  const config = await loadConfig(env, { requireWebPassword: ["serve", "web"].includes(command) });
+  const config = await loadConfig(env, {
+    requireCodexAuth: command === "investigate",
+    requireWebPassword: ["serve", "web"].includes(command)
+  });
   const agent = new MediaIssueAgent(config);
   await agent.init();
 
