@@ -11,9 +11,11 @@ export const JOB_STATES = new Set([
   "waiting_for_plex_verification",
   "drafting_comment",
   "awaiting_comment_approval",
+  "awaiting_resolution_approval",
   "posting_comment",
   "closing_issue",
   "closed",
+  "dry_run_complete",
   "blocked_needs_human",
   "failed_retryable",
   "failed_terminal"
@@ -298,6 +300,21 @@ LIMIT 1;
   return { ...row, payload: JSON.parse(row.payloadJson) };
 }
 
+export function pendingApprovalForJobAnyKind(dbPath, jobId) {
+  const rows = sqliteExec(dbPath, sql`
+SELECT id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash, payload_json AS payloadJson
+FROM approvals
+WHERE job_id = ${jobId} AND status = 'pending'
+ORDER BY id DESC
+LIMIT 1;
+`, { json: true });
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return { ...row, payload: JSON.parse(row.payloadJson) };
+}
+
 export function supersedePendingApprovals(dbPath, jobId, kind = "action") {
   sqliteExec(dbPath, sql`
 UPDATE approvals
@@ -341,23 +358,141 @@ LIMIT 1;
   return { ...row, evidence: JSON.parse(row.evidenceJson) };
 }
 
-export function setPendingApprovals(dbPath, jobId, status, actor = "operator") {
+export function setPendingApprovals(dbPath, jobId, status, actor = "operator", kind = null) {
   if (!["approved", "rejected"].includes(status)) {
     throw new Error(`Unsupported approval status ${status}`);
   }
-  sqliteExec(dbPath, sql`
+  const update = kind ? sql`
+UPDATE approvals
+SET status = ${status},
+    approved_by = ${actor},
+    approved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE job_id = ${jobId} AND kind = ${kind} AND status = 'pending';
+` : sql`
 UPDATE approvals
 SET status = ${status},
     approved_by = ${actor},
     approved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE job_id = ${jobId} AND status = 'pending';
-`);
+`;
+  sqliteExec(dbPath, update);
   return sqliteExec(dbPath, sql`
 SELECT id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash
 FROM approvals
 WHERE job_id = ${jobId}
 ORDER BY id;
 `, { json: true });
+}
+
+export function jobForId(dbPath, jobId) {
+  return sqliteExec(dbPath, sql`
+SELECT
+  id,
+  source,
+  issue_id AS issueId,
+  state,
+  created_at AS createdAt,
+  updated_at AS updatedAt,
+  attempts,
+  last_error AS lastError
+FROM jobs
+WHERE id = ${jobId}
+LIMIT 1;
+`, { json: true })[0] || null;
+}
+
+export function jobDetails(dbPath, jobId) {
+  const job = jobForId(dbPath, jobId);
+  if (!job) {
+    return null;
+  }
+  const investigation = investigationForJob(dbPath, jobId);
+  const approvals = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  job_id AS jobId,
+  kind,
+  status,
+  channel,
+  approved_by AS approvedBy,
+  approved_at AS approvedAt,
+  created_at AS createdAt,
+  payload_json AS payloadJson
+FROM approvals
+WHERE job_id = ${jobId}
+ORDER BY id DESC;
+`, { json: true }).map(row => ({ ...row, payload: JSON.parse(row.payloadJson) }));
+  const plannedActions = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  job_id AS jobId,
+  tool_name AS toolName,
+  args_json AS argsJson,
+  risk_level AS riskLevel,
+  dry_run_result_json AS dryRunResultJson,
+  approved_at AS approvedAt,
+  executed_at AS executedAt,
+  result_json AS resultJson
+FROM planned_actions
+WHERE job_id = ${jobId}
+ORDER BY id DESC;
+`, { json: true }).map(row => ({
+    ...row,
+    args: JSON.parse(row.argsJson),
+    dryRunResult: row.dryRunResultJson ? JSON.parse(row.dryRunResultJson) : null,
+    result: row.resultJson ? JSON.parse(row.resultJson) : null
+  }));
+  const verificationChecks = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  job_id AS jobId,
+  check_type AS checkType,
+  criteria_json AS criteriaJson,
+  status,
+  started_at AS startedAt,
+  completed_at AS completedAt
+FROM verification_checks
+WHERE job_id = ${jobId}
+ORDER BY id DESC;
+`, { json: true }).map(row => ({ ...row, criteria: JSON.parse(row.criteriaJson) }));
+  const auditEvents = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  event_type AS eventType,
+  redacted_payload_json AS redactedPayloadJson,
+  created_at AS createdAt
+FROM audit_events
+WHERE job_id = ${jobId}
+ORDER BY id DESC
+LIMIT 25;
+`, { json: true }).map(row => ({ ...row, redactedPayload: JSON.parse(row.redactedPayloadJson) }));
+  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents };
+}
+
+export function createPlannedAction(dbPath, jobId, toolName, args, riskLevel = "comment") {
+  const [{ id }] = sqliteExec(dbPath, sql`
+INSERT INTO planned_actions (job_id, tool_name, args_json, risk_level)
+VALUES (${jobId}, ${toolName}, ${JSON.stringify(args)}, ${riskLevel})
+RETURNING id;
+`, { json: true });
+  return { id, jobId, toolName, args, riskLevel };
+}
+
+export function markPlannedActionExecuted(dbPath, actionId, result, dryRun = false) {
+  if (dryRun) {
+    sqliteExec(dbPath, sql`
+UPDATE planned_actions
+SET dry_run_result_json = ${JSON.stringify(result)}
+WHERE id = ${actionId};
+`);
+  } else {
+    sqliteExec(dbPath, sql`
+UPDATE planned_actions
+SET executed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    result_json = ${JSON.stringify(result)}
+WHERE id = ${actionId};
+`);
+  }
 }
 
 export function recordAudit(dbPath, eventType, payload, jobId = null) {

@@ -65,6 +65,25 @@ export function commentDraftPrompt(evidence) {
   ].join("\n");
 }
 
+export function steeredInvestigationPrompt(evidence, previousSummary, operatorMessage) {
+  return [
+    "You are Codex running inside media-issue-agent.",
+    "Revise the investigation using only the sanitized evidence, the previous summary, and the operator steering note.",
+    "Do not infer private URLs, tokens, hostnames, identities, or facts not present here.",
+    "Do not execute fixes. Return a concise revised investigation, likely causes, whether this appears client-side or server-side, and exact safe next actions.",
+    "If the operator steers you toward no server-side action or a client-side cause, make that determination explicit.",
+    "",
+    "Previous summary:",
+    previousSummary || "(none)",
+    "",
+    "Operator steering note:",
+    operatorMessage,
+    "",
+    "Sanitized evidence JSON:",
+    JSON.stringify(sanitizeValue(evidence), null, 2)
+  ].join("\n");
+}
+
 export async function runCodex(config, prompt) {
   await mkdir(config.codexWorkspace, { recursive: true });
   const env = {
