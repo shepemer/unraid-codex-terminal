@@ -114,12 +114,13 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js list
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1 --force
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js approve 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js status
    ```
@@ -266,6 +267,7 @@ Important behavior:
 - Plex-native reports with any comment exactly `Closed.` are treated as resolved. Matching is case-insensitive and ignores leading or trailing whitespace.
 - If a Plex list response does not include comments, or `commentCount` shows comments may exist, the agent fetches issue details before deciding whether the report is open.
 - Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, and redacted audit events.
+- Investigation summaries and sanitized evidence are cached per job. Selecting an issue in the Web UI shows the cached investigation when one exists; Re-investigate or CLI `--force` reruns Codex and replaces the cached result.
 - The agent uses Codex local through ChatGPT auth for investigation summaries and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
@@ -278,7 +280,7 @@ The Web UI is the primary approval surface. The CLI remains available for the sa
 ```sh
 media-issue-agent poll-once
 media-issue-agent list
-media-issue-agent investigate <snapshot-id> <index>
+media-issue-agent investigate <snapshot-id> <index> [--force]
 media-issue-agent approve <job-id>
 media-issue-agent reject <job-id>
 media-issue-agent status

@@ -10,7 +10,7 @@ function usage() {
   media-issue-agent web
   media-issue-agent poll-once
   media-issue-agent list
-  media-issue-agent investigate <snapshot-id> <index>
+  media-issue-agent investigate <snapshot-id> <index> [--force]
   media-issue-agent approve <job-id> [actor]
   media-issue-agent reject <job-id> [actor]
   media-issue-agent status`;
@@ -64,7 +64,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (command === "investigate") {
     const snapshotId = integerArg(argv[1], "snapshot-id");
     const index = integerArg(argv[2], "index");
-    const result = await agent.investigate(snapshotId, index);
+    const result = await agent.investigate(snapshotId, index, { force: argv.includes("--force") });
     console.log(result.summary);
     console.log("");
     console.log(`Job: ${result.jobId}`);

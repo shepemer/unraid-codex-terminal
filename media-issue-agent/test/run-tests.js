@@ -4,7 +4,19 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig } from "../src/config.js";
-import { initDb, insertSnapshot, snapshotEntry, ensureJob, transitionJob } from "../src/db.js";
+import {
+  createApproval,
+  ensureJob,
+  initDb,
+  insertSnapshot,
+  investigationForJob,
+  pendingApprovalForJob,
+  snapshotEntries,
+  snapshotEntry,
+  supersedePendingApprovals,
+  transitionJob,
+  upsertInvestigation
+} from "../src/db.js";
 import { filterOpenIssues, hasPlexClosedComment, issueTableMarkdown } from "../src/issues.js";
 import { validateDraftComment, AUTOMATED_SUFFIX } from "../src/comments.js";
 import { redactText, sanitizeValue } from "../src/redact.js";
@@ -67,6 +79,43 @@ async function testTableAndSnapshotMapping() {
   const mapped = snapshotEntry(dbPath, snapshot.id, 1);
   assert.equal(mapped.source, "seerr");
   assert.equal(mapped.issueId, "42");
+  await rm(dir, { recursive: true, force: true });
+}
+
+async function testInvestigationCacheAndStaleApprovalSuperseding() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  await initDb(dbPath);
+  const entries = [{
+    source: "plex",
+    issueId: "plex-fixture-1001",
+    date: "2026-01-01T00:00:00Z",
+    reporter: "Fixture Reporter",
+    mediaTitle: "Fixture Movie",
+    status: "open",
+    description: "Fixture playback issue"
+  }];
+  const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+  const job = ensureJob(dbPath, "plex", "plex-fixture-1001");
+  const approval = createApproval(dbPath, job.id, "action", { summary: "Previous summary" });
+  const cached = upsertInvestigation(dbPath, job.id, {
+    status: "ready",
+    summary: "Cached investigation summary",
+    evidence: { issueId: "plex-fixture-1001", source: "plex" }
+  });
+  assert.equal(cached.summary, "Cached investigation summary");
+  assert.equal(investigationForJob(dbPath, job.id).evidence.issueId, "plex-fixture-1001");
+  assert.equal(pendingApprovalForJob(dbPath, job.id).id, approval.id);
+
+  const mapped = snapshotEntry(dbPath, snapshot.id, 1);
+  assert.equal(mapped.jobId, job.id);
+  assert.equal(mapped.jobState, "detected");
+  assert.equal(mapped.investigationStatus, "ready");
+  assert.equal(mapped.investigationSummary, "Cached investigation summary");
+  assert.equal(snapshotEntries(dbPath, snapshot.id)[0].investigationSummary, "Cached investigation summary");
+
+  supersedePendingApprovals(dbPath, job.id);
+  assert.equal(pendingApprovalForJob(dbPath, job.id), null);
   await rm(dir, { recursive: true, force: true });
 }
 
@@ -192,17 +241,31 @@ async function testWebAuthAndApi() {
     webUsername: "operator",
     webPassword: "fixture-password"
   };
+  let investigateRequest = null;
   const agent = {
     status: () => ({ dryRun: true, snapshots: { count: 1, latestId: 7 }, jobs: [], approvals: [] }),
     latestWithEntries: () => ({
       id: 7,
       generatedAt: "2026-01-01T00:00:00Z",
-      entries: [{ idx: 1, source: "seerr", issueId: "fixture", description: "<script>" }]
+      entries: [{
+        idx: 1,
+        source: "seerr",
+        issueId: "fixture",
+        description: "<script>",
+        jobId: 9,
+        jobState: "awaiting_action_approval",
+        investigationStatus: "ready",
+        investigationSummary: "Cached fixture summary",
+        investigationUpdatedAt: "2026-01-01T00:01:00Z"
+      }]
     }),
     jobs: () => [],
     approvals: () => [],
     pollOnce: async () => ({ snapshotId: 8, issueCount: 1 }),
-    investigate: async () => ({ jobId: 9, approvalId: 10, summary: "Fixture summary" }),
+    investigate: async (snapshotId, index, options) => {
+      investigateRequest = { snapshotId, index, options };
+      return { jobId: 9, approvalId: 10, summary: "Fixture summary" };
+    },
     approve: () => [{ id: 10, status: "approved" }],
     reject: () => [{ id: 10, status: "rejected" }]
   };
@@ -230,6 +293,7 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /:root\[data-theme="dark"\]/);
     assert.match(cssText, /\.job-row \{\s+display: grid;/);
     assert.match(cssText, /justify-self: end;/);
+    assert.match(cssText, /white-space: nowrap;/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
     assert.equal(js.status, 200);
     const jsText = await js.text();
@@ -237,6 +301,10 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /applyTheme\(document\.documentElement\.dataset\.theme \|\| "dark"\)/);
     assert.match(jsText, /class="job-main"/);
     assert.match(jsText, /\/api\/auth\/login/);
+    assert.match(jsText, /Re-investigate/);
+    assert.match(jsText, /function showEntry/);
+    assert.match(jsText, /stateLabel\(job\.state\)/);
+    assert.match(jsText, /force/);
     const authStatus = await fetch(`${baseUrl}/api/auth`, { headers: { authorization: auth } });
     assert.equal(authStatus.status, 200);
     const authBody = await authStatus.json();
@@ -245,9 +313,14 @@ async function testWebAuthAndApi() {
     const investigated = await fetch(`${baseUrl}/api/investigate`, {
       method: "POST",
       headers: { authorization: auth, "content-type": "application/json" },
-      body: JSON.stringify({ snapshotId: 7, index: 1 })
+      body: JSON.stringify({ snapshotId: 7, index: 1, force: true })
     });
     assert.equal((await investigated.json()).result.jobId, 9);
+    assert.deepEqual(investigateRequest, {
+      snapshotId: 7,
+      index: 1,
+      options: { force: true }
+    });
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
@@ -257,6 +330,7 @@ async function run() {
   await testPlexClosedFilter();
   await testTableAndSnapshotMapping();
   testCommentValidation();
+  await testInvestigationCacheAndStaleApprovalSuperseding();
   await testAuthConfig();
   await testStateTransitions();
   await testDbDirectoryWritablePreflight();
