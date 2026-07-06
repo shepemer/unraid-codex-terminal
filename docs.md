@@ -114,13 +114,14 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, inspect jobs, and approve or reject pending work. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Action approval advances the job to a drafted reporter comment for a second approval. Comment approval posts through `media-mcp` using the configured dry-run mode. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, steer investigations with operator notes, inspect jobs, and approve or reject pending work. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Each steering note supersedes the previous pending plan approval and creates a new one. Action approval executes the approved job flow, then moves to an approve-fix state with the execution result and a drafted resolution comment. Final approval posts the resolution, adds `Closed.`, and resolves Seerr-family issues when applicable. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js list
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1 --force
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js steer 1 "Treat this as client-side; no server-side action is needed."
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js approve 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js continue 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js status
@@ -273,9 +274,11 @@ Important behavior:
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
 - The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
-- Job rows in the Activity panel are clickable. The detail pane shows the current state, pending approval kind, draft comments, planned action dry-run/live results, and recent audit events.
-- Action approval does not post comments directly. It generates a reporter-facing draft and moves the job to comment approval. Comment approval posts the exact draft through `media-mcp`; with dry-run enabled, the job finishes as `dry_run_complete` after recording the dry-run result.
-- Mutating media actions are intended to stay behind explicit approvals and exact allowlists. Dry-run mode defaults to `true`.
+- Job rows in the Activity panel are clickable. The detail pane shows the current state, pending approval kind, approved plan, execution result, draft resolution comment, planned action results, and recent audit events.
+- The investigation pane includes a steering box. Each steering note reruns Codex against sanitized evidence and the previous summary, updates the investigation, supersedes the old action approval, and creates a fresh approval for the new plan.
+- Action approval starts the job flow. If the approved determination is client-side or has no exact supported server action, the job records that no server-side media action was executed and moves directly to approve-fix with a drafted resolution comment. Supported future repair actions stay behind exact allowlists.
+- Final resolution approval posts the drafted comment, posts the exact `Closed.` marker, and resolves Seerr-family issues when applicable. These final closure actions run live after approval.
+- Mutating media actions stay behind explicit approvals and exact allowlists.
 - Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`
 
 The Web UI is the primary approval surface. The CLI remains available for the same operations:
@@ -284,6 +287,7 @@ The Web UI is the primary approval surface. The CLI remains available for the sa
 media-issue-agent poll-once
 media-issue-agent list
 media-issue-agent investigate <snapshot-id> <index> [--force]
+media-issue-agent steer <job-id> <message>
 media-issue-agent approve <job-id>
 media-issue-agent reject <job-id>
 media-issue-agent continue <job-id>

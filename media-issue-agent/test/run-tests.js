@@ -151,11 +151,16 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
           suggestedActions: [{ type: "seerr_add_comment", issueId: Number(args.issueId), message: "Fixture" }]
         };
       }
-      if (name === "seerr_comment_and_resolve_issue") {
+      if (name === "seerr_add_issue_comment") {
         return {
           dryRun: args.dryRun,
-          wouldAddComment: { issueId: args.issueId, message: args.message },
-          wouldSetStatus: "resolved"
+          issue: { id: args.issueId, status: "open", message: args.message }
+        };
+      }
+      if (name === "seerr_resolve_issue") {
+        return {
+          dryRun: args.dryRun,
+          issue: { id: args.issueId, status: "resolved" }
         };
       }
       throw new Error(`Unexpected tool ${name}`);
@@ -182,24 +187,40 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
   const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
   const investigated = await agent.investigate(snapshot.id, 1, { force: true });
   assert.equal(jobDetails(dbPath, investigated.jobId).job.state, "awaiting_action_approval");
+  const firstActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
+  const steered = await agent.steerInvestigation(investigated.jobId, "Treat this as client-side; no server-side action is needed.", "fixture");
+  assert.equal(steered.approvalKind, "action");
+  const steeredDetails = jobDetails(dbPath, investigated.jobId);
+  const currentActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
+  assert.notEqual(currentActionApproval.id, firstActionApproval.id);
+  assert.equal(steeredDetails.approvals.find(approval => approval.id === firstActionApproval.id).status, "superseded");
+  assert.equal(currentActionApproval.payload.plan.classification, "client_side");
 
-  const commentReview = await agent.approve(investigated.jobId, "fixture");
-  assert.equal(commentReview.status, "awaiting_comment_approval");
-  assert.equal(commentReview.approvalKind, "comment");
-  assert.match(commentReview.message, /Automated response from Codex\.$/);
+  const resolutionReview = await agent.approve(investigated.jobId, "fixture");
+  assert.equal(resolutionReview.status, "awaiting_resolution_approval");
+  assert.equal(resolutionReview.approvalKind, "resolution");
+  assert.equal(resolutionReview.executionResult.actionsExecuted, 0);
+  assert.match(resolutionReview.message, /Automated response from Codex\.$/);
   let details = jobDetails(dbPath, investigated.jobId);
-  assert.equal(details.job.state, "awaiting_comment_approval");
-  assert.equal(pendingApprovalForJob(dbPath, investigated.jobId, "comment").kind, "comment");
+  assert.equal(details.job.state, "awaiting_resolution_approval");
+  assert.equal(pendingApprovalForJob(dbPath, investigated.jobId, "resolution").kind, "resolution");
 
   const posted = await agent.approve(investigated.jobId, "fixture");
-  assert.equal(posted.status, "dry_run_complete");
+  assert.equal(posted.status, "closed");
   details = jobDetails(dbPath, investigated.jobId);
-  assert.equal(details.job.state, "dry_run_complete");
-  assert.equal(details.plannedActions[0].toolName, "seerr_comment_and_resolve_issue");
-  assert.equal(details.plannedActions[0].dryRunResult.dryRun, true);
-  const postCall = calls.find(call => call.name === "seerr_comment_and_resolve_issue");
-  assert.equal(postCall.args.dryRun, true);
-  assert.match(postCall.args.message, /Automated response from Codex\.$/);
+  assert.equal(details.job.state, "closed");
+  assert.deepEqual(details.plannedActions.map(action => action.toolName).sort(), [
+    "seerr_add_issue_comment",
+    "seerr_add_issue_comment",
+    "seerr_resolve_issue"
+  ].sort());
+  const commentCalls = calls.filter(call => call.name === "seerr_add_issue_comment");
+  assert.equal(commentCalls.length, 2);
+  assert.equal(commentCalls[0].args.dryRun, false);
+  assert.match(commentCalls[0].args.message, /Automated response from Codex\.$/);
+  assert.equal(commentCalls[1].args.message, "Closed.");
+  const resolveCall = calls.find(call => call.name === "seerr_resolve_issue");
+  assert.equal(resolveCall.args.dryRun, false);
 
   await rm(dir, { recursive: true, force: true });
   await rm(codexHome, { recursive: true, force: true });
@@ -330,6 +351,7 @@ async function testWebAuthAndApi() {
   };
   let investigateRequest = null;
   let continueRequest = null;
+  let steerRequest = null;
   const agent = {
     status: () => ({ dryRun: true, snapshots: { count: 1, latestId: 7 }, jobs: [{ state: "approved_for_execution", count: 1 }], approvals: [] }),
     latestWithEntries: () => ({
@@ -362,11 +384,15 @@ async function testWebAuthAndApi() {
       investigateRequest = { snapshotId, index, options };
       return { jobId: 9, approvalId: 10, summary: "Fixture summary" };
     },
-    approve: async () => ({ jobId: 9, status: "awaiting_comment_approval", message: "Draft comment" }),
+    approve: async () => ({ jobId: 9, status: "awaiting_resolution_approval", message: "Draft comment" }),
     reject: () => [{ id: 10, status: "rejected" }],
     continueJob: async jobId => {
       continueRequest = { jobId };
-      return { jobId, status: "awaiting_comment_approval", message: "Draft comment" };
+      return { jobId, status: "awaiting_resolution_approval", message: "Draft comment" };
+    },
+    steerInvestigation: async (jobId, message, actor) => {
+      steerRequest = { jobId, message, actor };
+      return { jobId, approvalId: 11, approvalKind: "action", summary: "Steered fixture summary" };
     }
   };
   const server = http.createServer(createWebHandler(agent, config));
@@ -388,6 +414,7 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
     assert.match(pageText, /id="continue-button"/);
+    assert.match(pageText, /id="steer-panel"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
@@ -406,6 +433,7 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function showEntry/);
     assert.match(jsText, /function showJob/);
     assert.match(jsText, /function continueJob/);
+    assert.match(jsText, /function steerInvestigation/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
     assert.match(jsText, /data-job-id/);
     assert.match(jsText, /force/);
@@ -433,8 +461,15 @@ async function testWebAuthAndApi() {
       headers: { authorization: auth, "content-type": "application/json" },
       body: "{}"
     });
-    assert.equal((await continued.json()).result.status, "awaiting_comment_approval");
+    assert.equal((await continued.json()).result.status, "awaiting_resolution_approval");
     assert.deepEqual(continueRequest, { jobId: 9 });
+    const steered = await fetch(`${baseUrl}/api/jobs/9/steer`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({ message: "Client-side issue" })
+    });
+    assert.equal((await steered.json()).result.summary, "Steered fixture summary");
+    assert.deepEqual(steerRequest, { jobId: 9, message: "Client-side issue", actor: "web" });
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

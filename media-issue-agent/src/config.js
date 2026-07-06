@@ -107,7 +107,7 @@ export async function loadConfig(env = process.env, options = {}) {
     mediaMcpBearerToken: env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN || "",
     dbPath: env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite",
     pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
-    dryRun: truthy(env.ISSUE_AGENT_DRY_RUN, true),
+    dryRun: truthy(env.ISSUE_AGENT_DRY_RUN, false),
     approvalBackend: env.ISSUE_AGENT_APPROVAL_BACKEND || "cli",
     discordBotToken: env.ISSUE_AGENT_DISCORD_BOT_TOKEN || "",
     discordChannelId: env.ISSUE_AGENT_DISCORD_CHANNEL_ID || "",

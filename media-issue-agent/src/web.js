@@ -84,7 +84,7 @@ const HTML = `<!doctype html>
             <span class="eyebrow">Operations</span>
             <h2 id="activity-heading">Activity</h2>
           </div>
-          <span id="dry-run" class="badge muted">dry-run</span>
+          <span id="dry-run" class="badge warning">approval-gated</span>
         </div>
         <div class="stats-grid" id="stats-grid"></div>
         <div class="job-list" id="job-list"></div>
@@ -106,6 +106,10 @@ const HTML = `<!doctype html>
         </div>
       </div>
       <pre id="investigation-output">Select an issue to investigate.</pre>
+      <div id="steer-panel" class="steer-panel hidden">
+        <textarea id="steer-input" rows="3" placeholder="Steer the investigation"></textarea>
+        <button id="steer-button" type="button" class="secondary">Send</button>
+      </div>
     </section>
   </div>
   <div id="toast" role="status" aria-live="polite"></div>
@@ -590,6 +594,33 @@ pre {
   font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 
+.steer-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.steer-panel textarea {
+  width: 100%;
+  min-height: 76px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  resize: vertical;
+  padding: 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
+.steer-panel textarea:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
 .hidden { display: none; }
 
 #toast {
@@ -691,7 +722,8 @@ const JS = `const state = {
   busy: false,
   authOk: false,
   loginRunning: false,
-  authTimer: null
+  authTimer: null,
+  jobPollTimer: null
 };
 
 const el = {
@@ -714,6 +746,9 @@ const el = {
   approvalActions: document.getElementById("approval-actions"),
   approveButton: document.getElementById("approve-button"),
   rejectButton: document.getElementById("reject-button"),
+  steerPanel: document.getElementById("steer-panel"),
+  steerInput: document.getElementById("steer-input"),
+  steerButton: document.getElementById("steer-button"),
   toast: document.getElementById("toast"),
   themeButtons: [...document.querySelectorAll("[data-theme-choice]")]
 };
@@ -795,6 +830,7 @@ function stateLabel(stateName) {
     waiting_for_plex_verification: "Verifying",
     drafting_comment: "Drafting",
     awaiting_comment_approval: "Comment review",
+    awaiting_resolution_approval: "Approve fix",
     posting_comment: "Posting",
     closing_issue: "Closing",
     closed: "Closed",
@@ -818,8 +854,8 @@ function renderStats(status) {
   const jobTotal = (status.jobs || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
   const pending = (status.approvals || []).find(row => row.status === "pending")?.count || 0;
   const latest = status.snapshots?.latestId || "-";
-  el.dryRun.textContent = status.dryRun ? "dry-run" : "live";
-  el.dryRun.className = status.dryRun ? "badge muted" : "badge warning";
+  el.dryRun.textContent = "approval-gated";
+  el.dryRun.className = "badge warning";
   el.statsGrid.innerHTML = [
     ["Snapshots", status.snapshots?.count || 0],
     ["Latest", latest],
@@ -845,6 +881,11 @@ function renderJobs(jobs) {
   \`).join("");
 }
 
+function setSteerVisible(visible) {
+  el.steerPanel.classList.toggle("hidden", !visible);
+  el.steerButton.disabled = !visible || state.busy || !state.authOk;
+}
+
 function renderAuth(auth, login) {
   state.authOk = Boolean(auth?.ok);
   state.loginRunning = login?.status === "running";
@@ -863,6 +904,7 @@ function renderSnapshot(snapshot) {
   if (!snapshot) {
     state.snapshotId = null;
     state.entries = [];
+    setSteerVisible(false);
     el.snapshotMeta.textContent = "No snapshot loaded";
     el.issueCount.textContent = "0";
     el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>';
@@ -897,6 +939,7 @@ function showEntry(index) {
   state.activeJobId = entry.jobId || null;
   el.detailHeading.textContent = "Investigation";
   el.continueButton.classList.add("hidden");
+  setSteerVisible(Boolean(entry.jobId) && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
   if (entry.investigationSummary) {
     const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
     const updated = entry.investigationUpdatedAt ? \`Updated: \${entry.investigationUpdatedAt}\` : "";
@@ -905,6 +948,7 @@ function showEntry(index) {
   } else {
     el.output.textContent = \`No cached investigation for \${entry.source} issue \${entry.issueId}. Select Investigate to run Codex.\`;
     el.approvalActions.classList.add("hidden");
+    setSteerVisible(false);
   }
 }
 
@@ -929,8 +973,14 @@ function formatJobDetail(detail) {
   }
   if (pending) {
     lines.push("", \`Pending \${pending.kind} approval #\${pending.id}\`);
+    if (pending.payload?.plan) {
+      lines.push("", "Approved plan waiting for your decision:", formatJson(pending.payload.plan));
+    }
+    if (pending.payload?.executionResult) {
+      lines.push("", "Fix result:", formatJson(pending.payload.executionResult));
+    }
     if (pending.payload?.message) {
-      lines.push("", "Draft comment:", pending.payload.message);
+      lines.push("", "Draft resolution comment:", pending.payload.message);
     }
   }
   if (detail.investigation?.summary) {
@@ -960,15 +1010,39 @@ function formatJobDetail(detail) {
 function updateJobControls(detail) {
   const pending = pendingApproval(detail);
   const stateName = detail.job.state;
-  const canApprove = Boolean(pending) && ["awaiting_action_approval", "awaiting_comment_approval"].includes(stateName);
+  const canApprove = Boolean(pending) && ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"].includes(stateName);
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
+  setSteerVisible(stateName === "awaiting_action_approval");
 }
 
-async function showJob(jobId) {
+function shouldPollJob(detail) {
+  return ["investigating", "approved_for_execution", "executing", "drafting_comment", "closing_issue"].includes(detail.job.state);
+}
+
+function clearJobPolling() {
+  clearInterval(state.jobPollTimer);
+  state.jobPollTimer = null;
+}
+
+function startJobPolling() {
+  clearJobPolling();
+  if (!state.activeJobId) return;
+  state.jobPollTimer = setInterval(() => {
+    if (!state.activeJobId) {
+      clearJobPolling();
+      return;
+    }
+    showJob(state.activeJobId, { quiet: true }).catch(() => {});
+  }, 1600);
+}
+
+async function showJob(jobId, options = {}) {
   state.activeJobId = Number(jobId);
   el.detailHeading.textContent = "Job Detail";
-  el.output.textContent = "Loading job detail...";
+  if (!options.quiet) {
+    el.output.textContent = "Loading job detail...";
+  }
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   try {
@@ -976,6 +1050,11 @@ async function showJob(jobId) {
     el.output.textContent = formatJobDetail(result.detail);
     updateJobControls(result.detail);
     renderJobs(state.jobs);
+    if (shouldPollJob(result.detail)) {
+      if (!state.jobPollTimer) startJobPolling();
+    } else {
+      clearJobPolling();
+    }
   } catch (error) {
     el.output.textContent = error.message;
     toast(error.message);
@@ -1058,6 +1137,11 @@ async function investigate(index, force = false) {
 async function approval(action) {
   if (!state.activeJobId) return;
   setBusy(true);
+  const polling = setInterval(() => {
+    if (state.activeJobId) {
+      showJob(state.activeJobId, { quiet: true }).catch(() => {});
+    }
+  }, 1500);
   try {
     const result = await api(\`/api/jobs/\${state.activeJobId}/\${action}\`, { method: "POST", body: "{}" });
     toast(\`Job \${state.activeJobId} \${action}d\`);
@@ -1069,6 +1153,7 @@ async function approval(action) {
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
+    clearInterval(polling);
     setBusy(false);
   }
 }
@@ -1076,10 +1161,41 @@ async function approval(action) {
 async function continueJob() {
   if (!state.activeJobId) return;
   setBusy(true);
+  const polling = setInterval(() => {
+    if (state.activeJobId) {
+      showJob(state.activeJobId, { quiet: true }).catch(() => {});
+    }
+  }, 1500);
   try {
     const result = await api(\`/api/jobs/\${state.activeJobId}/continue\`, { method: "POST", body: "{}" });
     toast(\`Job \${state.activeJobId} continued\`);
     el.output.textContent = result.result?.message || formatJson(result.result);
+    await refresh();
+    await showJob(state.activeJobId);
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    clearInterval(polling);
+    setBusy(false);
+  }
+}
+
+async function steerInvestigation() {
+  if (!state.activeJobId) return;
+  const message = el.steerInput.value.trim();
+  if (!message) return;
+  setBusy(true);
+  el.output.textContent = "Revising investigation...";
+  el.approvalActions.classList.add("hidden");
+  try {
+    const result = await api(\`/api/jobs/\${state.activeJobId}/steer\`, {
+      method: "POST",
+      body: JSON.stringify({ message })
+    });
+    el.steerInput.value = "";
+    el.output.textContent = result.result.summary;
+    toast("Investigation revised");
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
@@ -1110,6 +1226,12 @@ el.issueRows.addEventListener("click", event => {
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
 el.continueButton.addEventListener("click", continueJob);
+el.steerButton.addEventListener("click", steerInvestigation);
+el.steerInput.addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    steerInvestigation();
+  }
+});
 el.jobList.addEventListener("click", event => {
   const row = event.target.closest("[data-job-id]");
   if (row) {
@@ -1341,6 +1463,13 @@ export function createWebHandler(agent, config) {
       if (req.method === "POST" && continueMatch) {
         await readJson(req);
         const result = await agent.continueJob(Number(continueMatch[1]), "web");
+        sendJson(res, 200, { ok: true, result });
+        return;
+      }
+      const steerMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/steer$/);
+      if (req.method === "POST" && steerMatch) {
+        const body = await readJson(req);
+        const result = await agent.steerInvestigation(Number(steerMatch[1]), body.message, "web");
         sendJson(res, 200, { ok: true, result });
         return;
       }

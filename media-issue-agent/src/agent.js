@@ -24,7 +24,7 @@ import {
   transitionJob,
   upsertInvestigation
 } from "./db.js";
-import { commentDraftPrompt, investigationPrompt, runCodex } from "./codex.js";
+import { commentDraftPrompt, investigationPrompt, runCodex, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
@@ -33,11 +33,25 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function fallbackDraftComment(source) {
+function textSuggestsClientSide(...values) {
+  const text = values.join(" ").toLowerCase();
+  return /\b(client|device|app|browser|network|wifi|user-side|user side|client-side|client side)\b/.test(text)
+    || /\bno server(?:-side| side)? action\b/.test(text)
+    || /\bno automated (?:server )?(?:fix|action)\b/.test(text);
+}
+
+function fallbackDraftComment(source, executionResult = null) {
+  const outcome = executionResult?.outcome || "";
   if (source === "plex") {
-    return `Reviewed this report and prepared a follow-up. ${AUTOMATED_SUFFIX}`;
+    if (outcome === "client_side") {
+      return `Reviewed this report as client-side. ${AUTOMATED_SUFFIX}`;
+    }
+    return `Reviewed this report and completed follow-up. ${AUTOMATED_SUFFIX}`;
   }
-  return `Reviewed this report and prepared a follow-up for the media item.\n${AUTOMATED_SUFFIX}`;
+  if (outcome === "client_side") {
+    return `Reviewed this report as a client-side playback issue. No server-side media action was applied.\n${AUTOMATED_SUFFIX}`;
+  }
+  return `Reviewed this report and completed the approved follow-up for the media item.\n${AUTOMATED_SUFFIX}`;
 }
 
 function normalizeDraftComment(source, draft) {
@@ -52,22 +66,38 @@ function normalizeDraftComment(source, draft) {
   return message;
 }
 
-function commentToolFor(source, issueId, message, dryRun) {
+function buildPlan(entry, evidence, summary, operatorMessage = "") {
+  const clientSide = textSuggestsClientSide(summary, operatorMessage);
+  const actions = [];
+  return {
+    source: entry.source,
+    issueId: entry.issueId,
+    summary,
+    plan: {
+      classification: clientSide ? "client_side" : "no_supported_server_action",
+      actions,
+      requiresServerAction: actions.length > 0,
+      note: clientSide
+        ? "Determination is client-side or no server-side action is required."
+        : "No exact allowlisted server-side repair action is available for this issue yet."
+    },
+    evidence
+  };
+}
+
+function closeActionsFor(source, issueId, message) {
   if (source === "plex") {
-    return {
-      toolName: "plex_add_reported_issue_comment",
-      args: { issueId: String(issueId), message, dryRun, verbose: false },
-      liveTerminalState: "blocked_needs_human",
-      liveMessage: "Plex native issue was commented; add the Plex Closed. marker manually if the report is fully resolved."
-    };
+    return [
+      { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message, dryRun: false, verbose: false } },
+      { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: "Closed.", dryRun: false, verbose: false } }
+    ];
   }
   if (source === "seerr") {
-    return {
-      toolName: "seerr_comment_and_resolve_issue",
-      args: { issueId: Number(issueId), message, dryRun, verbose: false },
-      liveTerminalState: "closed",
-      liveMessage: null
-    };
+    return [
+      { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message, dryRun: false, verbose: false } },
+      { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message: "Closed.", dryRun: false, verbose: false } },
+      { toolName: "seerr_resolve_issue", args: { issueId: Number(issueId), dryRun: false, verbose: false } }
+    ];
   }
   throw new Error(`Unsupported issue source ${source}`);
 }
@@ -220,13 +250,72 @@ export class MediaIssueAgent {
       evidence
     });
     transitionJob(this.config.dbPath, job.id, ["investigating"], "awaiting_action_approval");
-    const approval = createApproval(this.config.dbPath, job.id, "action", {
-      source: entry.source,
-      issueId: entry.issueId,
-      summary
-    });
+    const approvalPayload = buildPlan(entry, evidence, summary);
+    const approval = createApproval(this.config.dbPath, job.id, "action", approvalPayload);
     recordAudit(this.config.dbPath, "investigation_ready", sanitizeValue({ approval, summary }), job.id);
     return { jobId: job.id, approvalId: approval.id, summary, evidence, status: investigation.status, cached: false };
+  }
+
+  async steerInvestigation(jobId, message, actor = "operator") {
+    await this.init();
+    await validateCodexHome(this.config.codexHome);
+    const job = jobForId(this.config.dbPath, jobId);
+    if (!job) {
+      throw new Error(`Job ${jobId} was not found`);
+    }
+    const current = investigationForJob(this.config.dbPath, jobId);
+    if (!current) {
+      throw new Error(`Job ${jobId} has no investigation to steer`);
+    }
+    const operatorMessage = String(message || "").trim();
+    if (!operatorMessage) {
+      throw new Error("Steering message is required");
+    }
+    transitionJob(this.config.dbPath, jobId, [
+      "awaiting_action_approval",
+      "failed_retryable",
+      "blocked_needs_human"
+    ], "investigating");
+    supersedePendingApprovals(this.config.dbPath, jobId, "action");
+    recordAudit(this.config.dbPath, "operator_steered_investigation", sanitizeValue({ actor, message: operatorMessage }), jobId);
+    const evidence = sanitizeValue({
+      ...current.evidence,
+      steering: {
+        actor,
+        message: operatorMessage,
+        previousSummary: current.summary
+      }
+    });
+    let summary;
+    try {
+      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage));
+    } catch (error) {
+      const reason = redactText(error.message);
+      summary = [
+        current.summary,
+        "",
+        "Operator steering was recorded, but Codex could not revise the summary automatically.",
+        `Reason: ${reason}`,
+        `Steering note: ${operatorMessage}`
+      ].join("\n");
+      recordAudit(this.config.dbPath, "codex_steered_investigation_failed", sanitizeValue({ error: error.message }), jobId);
+    }
+    const investigation = upsertInvestigation(this.config.dbPath, jobId, {
+      status: "ready",
+      summary,
+      evidence
+    });
+    transitionJob(this.config.dbPath, jobId, ["investigating"], "awaiting_action_approval");
+    const approval = createApproval(this.config.dbPath, jobId, "action", buildPlan(job, evidence, summary, operatorMessage));
+    recordAudit(this.config.dbPath, "steered_investigation_ready", sanitizeValue({ approval, summary }), jobId);
+    return {
+      jobId,
+      approvalId: approval.id,
+      approvalKind: "action",
+      summary,
+      evidence,
+      status: investigation.status
+    };
   }
 
   async approve(jobId, actor = "operator") {
@@ -240,8 +329,8 @@ export class MediaIssueAgent {
       transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval"], "approved_for_execution");
       return this.continueJob(jobId, actor, { approvals });
     }
-    if (pending.kind === "comment") {
-      return this.postApprovedComment(jobId, pending, actor, approvals);
+    if (pending.kind === "resolution") {
+      return this.closeApprovedIssue(jobId, pending, actor, approvals);
     }
     throw new Error(`Unsupported approval kind ${pending.kind}`);
   }
@@ -249,7 +338,7 @@ export class MediaIssueAgent {
   reject(jobId, actor = "operator") {
     const pending = pendingApprovalForJobAnyKind(this.config.dbPath, jobId);
     const approvals = setPendingApprovals(this.config.dbPath, jobId, "rejected", actor, pending?.kind || null);
-    transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval", "awaiting_comment_approval"], "blocked_needs_human");
+    transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"], "blocked_needs_human");
     recordAudit(this.config.dbPath, "approval_rejected", sanitizeValue({ approvals, actor }), jobId);
     return approvals;
   }
@@ -262,19 +351,51 @@ export class MediaIssueAgent {
     if (job.state !== "approved_for_execution") {
       throw new Error(`Job ${jobId} cannot continue from ${job.state}`);
     }
-    return this.draftCommentApproval(jobId, actor, context);
+    return this.executeApprovedPlan(jobId, actor, context);
   }
 
-  async draftCommentApproval(jobId, actor, context = {}) {
+  async executeApprovedPlan(jobId, actor, context = {}) {
+    const details = this.jobDetails(jobId);
+    const actionApproval = details.approvals.find(approval => approval.kind === "action" && approval.status === "approved");
+    if (!actionApproval) {
+      throw new Error(`Job ${jobId} has no approved action plan`);
+    }
+    transitionJob(this.config.dbPath, jobId, ["approved_for_execution"], "executing");
+    recordAudit(this.config.dbPath, "execution_started", sanitizeValue({ actor, plan: actionApproval.payload.plan }), jobId);
+    const actions = Array.isArray(actionApproval.payload?.plan?.actions) ? actionApproval.payload.plan.actions : [];
+    const executionResult = {
+      outcome: actionApproval.payload?.plan?.classification === "client_side" ? "client_side" : "no_supported_action",
+      summary: actionApproval.payload?.plan?.classification === "client_side"
+        ? "Determination was client-side or no server-side action was required. No server-side media action was executed."
+        : "No exact allowlisted server-side repair action is available for this issue yet. No media action was executed.",
+      actionsRequested: actions.length,
+      actionsExecuted: 0,
+      actions: []
+    };
+    if (actions.length) {
+      executionResult.outcome = "unsupported_actions";
+      executionResult.summary = "The approved plan contained actions, but none are on the media issue agent execution allowlist yet. No media action was executed.";
+      executionResult.actions = actions.map(action => ({
+        requested: action,
+        status: "not_executed",
+        reason: "unsupported action for media issue agent v1"
+      }));
+    }
+    recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
+    transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
+    return this.draftResolutionApproval(jobId, actor, executionResult, context);
+  }
+
+  async draftResolutionApproval(jobId, actor, executionResult, context = {}) {
     await validateCodexHome(this.config.codexHome);
     const details = this.jobDetails(jobId);
     if (!details.investigation) {
       throw new Error(`Job ${jobId} has no investigation to draft from`);
     }
-    transitionJob(this.config.dbPath, jobId, ["approved_for_execution"], "drafting_comment");
     const evidence = sanitizeValue({
       job: details.job,
       investigation: details.investigation,
+      executionResult,
       approvedBy: actor
     });
     let draft;
@@ -282,7 +403,7 @@ export class MediaIssueAgent {
       draft = await runCodex(this.config, commentDraftPrompt(evidence));
     } catch (error) {
       recordAudit(this.config.dbPath, "codex_comment_draft_failed", sanitizeValue({ error: error.message }), jobId);
-      draft = fallbackDraftComment(details.job.source);
+      draft = fallbackDraftComment(details.job.source, executionResult);
     }
     const message = normalizeDraftComment(details.job.source, draft);
     const validation = validateDraftComment(details.job.source, message);
@@ -290,49 +411,52 @@ export class MediaIssueAgent {
       transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", validation.errors.join("; "));
       throw new Error(`Draft comment failed validation: ${validation.errors.join("; ")}`);
     }
-    const approval = createApproval(this.config.dbPath, jobId, "comment", {
+    const approval = createApproval(this.config.dbPath, jobId, "resolution", {
       source: details.job.source,
       issueId: details.job.issueId,
       message,
-      characterCount: validation.characterCount
+      characterCount: validation.characterCount,
+      executionResult
     });
-    transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "awaiting_comment_approval");
-    recordAudit(this.config.dbPath, "comment_draft_ready", sanitizeValue({ approval, characterCount: validation.characterCount }), jobId);
+    transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "awaiting_resolution_approval");
+    recordAudit(this.config.dbPath, "resolution_draft_ready", sanitizeValue({ approval, characterCount: validation.characterCount, executionResult }), jobId);
     return {
       ...context,
       jobId,
-      status: "awaiting_comment_approval",
+      status: "awaiting_resolution_approval",
       approvalId: approval.id,
-      approvalKind: "comment",
-      message
+      approvalKind: "resolution",
+      message,
+      executionResult
     };
   }
 
-  async postApprovedComment(jobId, approval, actor, approvals) {
-    transitionJob(this.config.dbPath, jobId, ["awaiting_comment_approval"], "posting_comment");
+  async closeApprovedIssue(jobId, approval, actor, approvals) {
+    transitionJob(this.config.dbPath, jobId, ["awaiting_resolution_approval"], "closing_issue");
     const { source, issueId, message } = approval.payload;
-    const action = commentToolFor(source, issueId, message, this.config.dryRun);
-    const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, "comment");
+    const actions = closeActionsFor(source, issueId, message);
+    const results = [];
     try {
-      const result = await this.client.callTool(action.toolName, action.args);
-      markPlannedActionExecuted(this.config.dbPath, planned.id, sanitizeValue(result), this.config.dryRun);
-      if (this.config.dryRun) {
-        transitionJob(this.config.dbPath, jobId, ["posting_comment"], "dry_run_complete");
-      } else {
-        transitionJob(this.config.dbPath, jobId, ["posting_comment"], action.liveTerminalState, action.liveMessage);
+      for (const action of actions) {
+        const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, "resolution");
+        recordAudit(this.config.dbPath, "closing_action_started", sanitizeValue({ action: planned }), jobId);
+        const result = await this.client.callTool(action.toolName, action.args);
+        const sanitized = sanitizeValue(result);
+        markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
+        results.push({ action: planned, result: sanitized });
       }
-      recordAudit(this.config.dbPath, "comment_posted", sanitizeValue({ actor, dryRun: this.config.dryRun, action: planned, result }), jobId);
+      transitionJob(this.config.dbPath, jobId, ["closing_issue"], "closed");
+      recordAudit(this.config.dbPath, "issue_closed", sanitizeValue({ actor, results }), jobId);
       return {
         jobId,
-        status: this.config.dryRun ? "dry_run_complete" : action.liveTerminalState,
+        status: "closed",
         approvals,
-        dryRun: this.config.dryRun,
-        result
+        results
       };
     } catch (error) {
       const messageText = redactText(error.message);
-      transitionJob(this.config.dbPath, jobId, ["posting_comment"], "failed_retryable", messageText);
-      recordAudit(this.config.dbPath, "comment_post_failed", sanitizeValue({ actor, error: error.message, action: planned }), jobId);
+      transitionJob(this.config.dbPath, jobId, ["closing_issue"], "failed_retryable", messageText);
+      recordAudit(this.config.dbPath, "issue_close_failed", sanitizeValue({ actor, error: error.message, results }), jobId);
       throw error;
     }
   }

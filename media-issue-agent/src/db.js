@@ -11,6 +11,7 @@ export const JOB_STATES = new Set([
   "waiting_for_plex_verification",
   "drafting_comment",
   "awaiting_comment_approval",
+  "awaiting_resolution_approval",
   "posting_comment",
   "closing_issue",
   "closed",
