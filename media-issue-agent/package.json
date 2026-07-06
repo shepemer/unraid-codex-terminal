@@ -10,6 +10,7 @@
   "scripts": {
     "check": "node --check src/*.js test/*.js",
     "test": "node test/run-tests.js",
+    "sil": "node test/sil-runner.js",
     "start": "node src/cli.js serve"
   },
   "engines": {
