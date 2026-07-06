@@ -6,7 +6,8 @@
   "description": "Optional media automation MCP sidecar for Unraid Codex Terminal.",
   "scripts": {
     "check": "node --check server.js",
-    "test:arr-commands": "node test-arr-command-tools.js"
+    "test:arr-commands": "node test-arr-command-tools.js",
+    "test:plex-issues": "node test-plex-reported-issues.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
