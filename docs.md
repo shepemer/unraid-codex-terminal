@@ -31,6 +31,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
 - `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-issue-agent`: optional human-in-the-loop worker on the internal `codex-mgmt` network for Plex-native reports and Seerr-family issue triage. It uses `media-mcp` for media API access and local Codex ChatGPT auth for investigation summaries and comment drafts.
 - `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
 
@@ -53,6 +54,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - `ghcr.io/shepemer/unraid-codex-terminal:latest`
    - `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest`
    - `ghcr.io/shepemer/unraid-codex-terminal-media-mcp:latest`
+   - `ghcr.io/shepemer/unraid-codex-terminal-media-issue-agent:latest`
    - `ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest`
 
 4. Install `unraid-mcp` first. Set:
@@ -80,13 +82,50 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
 
-7. Optional: install `utilities-mcp` on `codex-mgmt`. Set `UTILITIES_MCP_BEARER_TOKEN` and the Scrutiny endpoint:
+7. Optional: install `media-issue-agent` on `codex-mgmt` after `media-mcp`.
+
+   Set:
+
+   - `ISSUE_AGENT_MEDIA_MCP_URL`, normally `http://media-mcp:6971/mcp`
+   - `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN`, matching the media MCP bearer token until scoped tokens are available
+   - `CODEX_HOME`, normally `/codex-home` inside the container
+   - `ISSUE_AGENT_WEB_PASSWORD`, a strong Web UI password
+   - a persistent Codex home path mounted to `/codex-home`
+   - a persistent state path mounted to `/state`
+
+   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`. It is intended to use ChatGPT-managed Codex access, such as a Pro plan, through Codex local authentication. To prepare the mounted Codex home, run a one-time Codex login in a trusted shell:
+
+   ```sh
+   docker compose --profile issue-agent run --rm media-issue-agent codex login --device-auth
+   ```
+
+   You can also copy a trusted Codex `auth.json` into the mounted Codex home. Treat `auth.json` like a password: never commit it, paste it into chat, include it in issue reports, or expose it in logs.
+
+   Open the Web UI at:
+
+   ```text
+   http://<unraid-ip>:6983/
+   ```
+
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can poll, list current snapshots, start investigations, and approve or reject pending jobs. The CLI remains available for the same workflow:
+
+   ```sh
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js list
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js approve 1
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js status
+   ```
+
+   Local state stores snapshots, job state, approvals, retries, and audit events only. Plex and Seerr remain the source of truth for issue status and comments.
+
+8. Optional: install `utilities-mcp` on `codex-mgmt`. Set `UTILITIES_MCP_BEARER_TOKEN` and the Scrutiny endpoint:
 
    - Scrutiny: `SCRUTINY_URL`, plus optional `SCRUTINY_BASE_PATH` for reverse-proxy base paths
 
    Set the same `UTILITIES_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
 
-Do not add a port mapping for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. MCP servers should only be reachable from containers attached to `codex-mgmt`.
+Do not add a port mapping for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. The media issue agent publishes only its password-protected Web UI port; expose it only on LAN, VPN, or Tailscale.
 
 `UNRAID_API_URL` must include `/graphql` and must match the scheme your Unraid WebUI/API actually serves. If `https://<unraid-ip>` refuses port `443` but `http://<unraid-ip>` works on port `80`, use `http://<unraid-ip>/graphql`.
 
@@ -210,6 +249,34 @@ Use `media_archive_environment_check` or the container command below to verify t
 ```sh
 archive-tools-check --downloads-dir /mnt/unraid/downloads
 ```
+
+## Optional Media Issue Agent
+
+`media-issue-agent` is a separate worker for user-reported media issues. It periodically reconciles both Plex-native reports and Seerr-family issues through `media-mcp`, writes a GitHub-flavored Markdown table with stable numeric indexes, serves a password-protected Web UI, and stores only automation bookkeeping in SQLite.
+
+Important behavior:
+
+- Plex-native reports with any comment exactly `Closed.` are treated as resolved. Matching is case-insensitive and ignores leading or trailing whitespace.
+- If a Plex list response does not include comments, or `commentCount` shows comments may exist, the agent fetches issue details before deciding whether the report is open.
+- Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, and redacted audit events.
+- The agent uses Codex local through ChatGPT auth for investigation summaries and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
+- The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
+- The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
+- Mutating media actions are intended to stay behind explicit approvals and exact allowlists. Dry-run mode defaults to `true`.
+- Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`
+
+The Web UI is the primary approval surface. The CLI remains available for the same operations:
+
+```sh
+media-issue-agent poll-once
+media-issue-agent list
+media-issue-agent investigate <snapshot-id> <index>
+media-issue-agent approve <job-id>
+media-issue-agent reject <job-id>
+media-issue-agent status
+```
+
+Do not mount media libraries, download shares, appdata, Docker sockets, or broad host paths into `media-issue-agent`. It should only need `/state`, `/codex-home`, the internal `media-mcp` URL, and the media MCP bearer token.
 
 Example media MCP payloads:
 
@@ -383,13 +450,20 @@ docker compose up -d
 
 For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key. To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`. For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
 
-The Unraid MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set. The media MCP sidecar refuses to start unless `MEDIA_MCP_BEARER_TOKEN` and at least one supported media service credential set are configured. The utilities MCP sidecar refuses to start unless `UTILITIES_MCP_BEARER_TOKEN` and at least one supported utility endpoint are configured.
+The Unraid MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set. The media MCP sidecar refuses to start unless `MEDIA_MCP_BEARER_TOKEN` and at least one supported media service credential set are configured. The media issue agent refuses to start if OpenAI API key auth is present, if `CODEX_HOME/auth.json` is missing, or if `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN` is unset. The utilities MCP sidecar refuses to start unless `UTILITIES_MCP_BEARER_TOKEN` and at least one supported utility endpoint are configured.
 
 To include the optional media sidecar in local compose runs:
 
 ```sh
 docker compose --profile media config
 docker compose --profile media build media-mcp
+```
+
+To include the optional media issue agent in local compose runs:
+
+```sh
+docker compose --profile issue-agent config
+docker compose --profile issue-agent build media-issue-agent
 ```
 
 To include the optional utilities sidecar in local compose runs:
@@ -446,10 +520,13 @@ bash -n archive-tools-check
 sh -n codex-terminal-profile.sh
 npm --prefix media-mcp run check
 npm --prefix media-mcp run test:arr-commands
+npm --prefix media-issue-agent run check
+npm --prefix media-issue-agent test
 npm --prefix utilities-mcp run check
-python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml", "templates/media-mcp.xml", "templates/utilities-mcp.xml")]'
+python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml", "templates/media-mcp.xml", "templates/media-issue-agent.xml", "templates/utilities-mcp.xml")]'
 docker compose config
 docker compose --profile media config
+docker compose --profile issue-agent config
 docker compose --profile utilities config
 docker compose --profile media --profile utilities config
 tmpdir="$(mktemp -d)" && mkdir -p "$tmpdir/downloads" && touch "$tmpdir/downloads/sample.mkv" && CODEX_MEDIA_PATH_MAPS="/downloads=$tmpdir/downloads" ./media-path-check --json /downloads/sample.mkv >/dev/null

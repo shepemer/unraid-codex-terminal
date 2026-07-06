@@ -33,6 +33,7 @@ env:
   TERMINAL_IMAGE: unraid-codex-terminal
   MCP_IMAGE: unraid-codex-terminal-unraid-mcp
   MEDIA_MCP_IMAGE: unraid-codex-terminal-media-mcp
+  ISSUE_AGENT_IMAGE: unraid-codex-terminal-media-issue-agent
   UTILITIES_MCP_IMAGE: unraid-codex-terminal-utilities-mcp
 
 jobs:
@@ -57,16 +58,19 @@ jobs:
           terminal_base="${REGISTRY}/${{ github.repository_owner }}/${TERMINAL_IMAGE}"
           mcp_base="${REGISTRY}/${{ github.repository_owner }}/${MCP_IMAGE}"
           media_mcp_base="${REGISTRY}/${{ github.repository_owner }}/${MEDIA_MCP_IMAGE}"
+          issue_agent_base="${REGISTRY}/${{ github.repository_owner }}/${ISSUE_AGENT_IMAGE}"
           utilities_mcp_base="${REGISTRY}/${{ github.repository_owner }}/${UTILITIES_MCP_IMAGE}"
           terminal_tags=("${terminal_base}:${image_sha}")
           mcp_tags=("${mcp_base}:${image_sha}")
           media_mcp_tags=("${media_mcp_base}:${image_sha}")
+          issue_agent_tags=("${issue_agent_base}:${image_sha}")
           utilities_mcp_tags=("${utilities_mcp_base}:${image_sha}")
 
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "branch" ] && [ "${{ github.ref_name }}" = "main" ]; then
             terminal_tags+=("${terminal_base}:main")
             mcp_tags+=("${mcp_base}:main")
             media_mcp_tags+=("${media_mcp_base}:main")
+            issue_agent_tags+=("${issue_agent_base}:main")
             utilities_mcp_tags+=("${utilities_mcp_base}:main")
           fi
 
@@ -74,6 +78,7 @@ jobs:
             terminal_tags+=("${terminal_base}:${GITHUB_REF_NAME}")
             mcp_tags+=("${mcp_base}:${GITHUB_REF_NAME}")
             media_mcp_tags+=("${media_mcp_base}:${GITHUB_REF_NAME}")
+            issue_agent_tags+=("${issue_agent_base}:${GITHUB_REF_NAME}")
             utilities_mcp_tags+=("${utilities_mcp_base}:${GITHUB_REF_NAME}")
           fi
 
@@ -81,6 +86,7 @@ jobs:
             terminal_tags+=("${terminal_base}:${{ inputs.channel }}")
             mcp_tags+=("${mcp_base}:${{ inputs.channel }}")
             media_mcp_tags+=("${media_mcp_base}:${{ inputs.channel }}")
+            issue_agent_tags+=("${issue_agent_base}:${{ inputs.channel }}")
             utilities_mcp_tags+=("${utilities_mcp_base}:${{ inputs.channel }}")
           fi
 
@@ -94,6 +100,9 @@ jobs:
             echo "EOF"
             echo "media_mcp_tags<<EOF"
             printf '%s\n' "${media_mcp_tags[@]}"
+            echo "EOF"
+            echo "issue_agent_tags<<EOF"
+            printf '%s\n' "${issue_agent_tags[@]}"
             echo "EOF"
             echo "utilities_mcp_tags<<EOF"
             printf '%s\n' "${utilities_mcp_tags[@]}"
@@ -162,6 +171,26 @@ jobs:
           format: table
           exit-code: "1"
 
+      - name: Build media-issue-agent
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.media-issue-agent
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.image-tags.outputs.issue_agent_tags }}
+
+      - name: Scan media-issue-agent
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.ISSUE_AGENT_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          version: v0.70.0
+          format: table
+          exit-code: "1"
+
       - name: Build utilities-mcp
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
@@ -218,6 +247,16 @@ jobs:
             docker push "${image_tag}"
           done <<'EOF'
           ${{ steps.image-tags.outputs.media_mcp_tags }}
+          EOF
+
+      - name: Push media-issue-agent
+        if: github.event_name != 'pull_request'
+        run: |
+          while IFS= read -r image_tag; do
+            [ -n "${image_tag}" ] || continue
+            docker push "${image_tag}"
+          done <<'EOF'
+          ${{ steps.image-tags.outputs.issue_agent_tags }}
           EOF
 
       - name: Push utilities-mcp
