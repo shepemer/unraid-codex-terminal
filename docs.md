@@ -93,7 +93,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - a persistent Codex home path mounted to `/codex-home`
    - a persistent state path mounted to `/state`
 
-   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`. It is intended to use ChatGPT-managed Codex access, such as a Pro plan, through Codex local authentication. To prepare the mounted Codex home, run a one-time Codex login in a trusted shell:
+   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`. It is intended to use ChatGPT-managed Codex access, such as a Pro plan, through Codex local authentication. On first start, open the Web UI and use the Codex Auth panel to start a ChatGPT device-login flow. To prepare the mounted Codex home from a trusted shell instead, run:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent codex login --device-auth
@@ -107,7 +107,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can poll, list current snapshots, start investigations, and approve or reject pending jobs. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
@@ -261,6 +261,7 @@ Important behavior:
 - Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, and redacted audit events.
 - The agent uses Codex local through ChatGPT auth for investigation summaries and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
+- If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
 - The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
 - Mutating media actions are intended to stay behind explicit approvals and exact allowlists. Dry-run mode defaults to `true`.
 - Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`

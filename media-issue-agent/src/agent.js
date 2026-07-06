@@ -16,6 +16,7 @@ import {
   transitionJob
 } from "./db.js";
 import { investigationPrompt, runCodex } from "./codex.js";
+import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { sanitizeValue } from "./redact.js";
 
 function sleep(ms) {
@@ -87,8 +88,13 @@ export class MediaIssueAgent {
     };
   }
 
+  async codexAuthStatus() {
+    return inspectCodexAuth(this.config.codexHome);
+  }
+
   async investigate(snapshotId, index) {
     await this.init();
+    await validateCodexHome(this.config.codexHome);
     const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
     if (!entry) {
       throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);

@@ -16,26 +16,88 @@ function integer(value, defaultValue, min) {
   return parsed;
 }
 
+function containsApiKey(value) {
+  if (typeof value === "string") {
+    return /\bsk-[A-Za-z0-9_-]{8,}/.test(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some(item => containsApiKey(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).some(([key, nested]) => {
+      const normalizedKey = key.toLowerCase();
+      if ((normalizedKey === "openai_api_key" || normalizedKey === "codex_api_key") && typeof nested === "string" && nested.trim()) {
+        return true;
+      }
+      return containsApiKey(nested);
+    });
+  }
+  return false;
+}
+
 export function assertNoOpenAiApiKeys(env = process.env) {
   if (env.OPENAI_API_KEY || env.CODEX_API_KEY) {
     throw new Error("media-issue-agent refuses OpenAI API key auth; use Codex ChatGPT auth in CODEX_HOME instead.");
   }
 }
 
-export async function validateCodexHome(codexHome) {
+export async function inspectCodexAuth(codexHome) {
   if (!codexHome) {
-    throw new Error("CODEX_HOME is required and must point to a Codex ChatGPT-authenticated config directory.");
+    return {
+      ok: false,
+      status: "missing_home",
+      message: "CODEX_HOME is required and must point to a Codex ChatGPT-authenticated config directory."
+    };
   }
   const authPath = path.join(codexHome, "auth.json");
-  await access(authPath);
+  try {
+    await access(authPath);
+  } catch {
+    return {
+      ok: false,
+      status: "missing_auth",
+      message: "CODEX_HOME/auth.json is missing; run Codex login with ChatGPT auth first."
+    };
+  }
   const text = await readFile(authPath, "utf8");
   if (!text.trim()) {
-    throw new Error("CODEX_HOME/auth.json is empty; run Codex login with ChatGPT auth first.");
+    return {
+      ok: false,
+      status: "empty_auth",
+      message: "CODEX_HOME/auth.json is empty; run Codex login with ChatGPT auth first."
+    };
   }
-  if (/OPENAI_API_KEY|CODEX_API_KEY|\bsk-[A-Za-z0-9_-]{8,}/.test(text)) {
-    throw new Error("CODEX_HOME/auth.json appears to contain API-key auth; use ChatGPT Codex auth instead.");
+  let authJson;
+  try {
+    authJson = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      status: "invalid_auth",
+      message: "CODEX_HOME/auth.json is not valid JSON; run Codex login with ChatGPT auth first."
+    };
   }
-  return authPath;
+  if (containsApiKey(authJson)) {
+    return {
+      ok: false,
+      status: "api_key_auth",
+      message: "CODEX_HOME/auth.json appears to contain API-key auth; use ChatGPT Codex auth instead."
+    };
+  }
+  return {
+    ok: true,
+    status: "chatgpt_auth",
+    message: "Codex ChatGPT auth is configured.",
+    authPath
+  };
+}
+
+export async function validateCodexHome(codexHome) {
+  const auth = await inspectCodexAuth(codexHome);
+  if (!auth.ok) {
+    throw new Error(auth.message);
+  }
+  return auth.authPath;
 }
 
 export async function loadConfig(env = process.env, options = {}) {
