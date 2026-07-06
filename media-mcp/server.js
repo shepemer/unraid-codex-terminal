@@ -668,7 +668,7 @@ function summarizeSeerrIssue(issue, verbose = false) {
     category: issueTypeName(issue.issueType ?? issue.type),
     status: seerrIssueStatus(issue),
     subject: firstString(issue.subject, issue.message, comments[0]?.message),
-    message: issue.message,
+    message: firstString(issue.message, comments[0]?.message),
     reporter: summarizeUser(issue.createdBy ?? issue.user ?? issue.reportedBy, verbose),
     modifiedBy: summarizeUser(issue.modifiedBy, verbose),
     mediaTitle: mediaTitle(media),
@@ -2243,6 +2243,178 @@ async function listSeerrIssues(input) {
 
 async function getSeerrIssue(issueId, verbose = false) {
   return summarizeSeerrIssue(await seerrApi(`issue/${issueId}`), verbose);
+}
+
+const seerrIssueMessageFields = new Set(["message", "body", "description"]);
+
+// Overseerr/Jellyseerr edit issue descriptions by updating the initial issue comment.
+const seerrIssueUnsupportedFieldReasons = {
+  subject: "Seerr-family issue records do not expose a separate subject/title update field.",
+  issueType: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  type: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  category: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  status: "Use seerr_resolve_issue or seerr_reopen_issue; Seerr exposes status transitions as dedicated routes.",
+  mediaId: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  media: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  mediaInfo: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  tmdbId: "Associated media identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  tvdbId: "Associated media identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  plexRatingKey: "Plex identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  ratingKey: "Plex identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  guid: "Media GUIDs belong to the media record and are not issue-editable through the Seerr issue API.",
+  problemSeason: "Problem season is only accepted on create; Seerr does not expose an issue metadata update route.",
+  problemEpisode: "Problem episode is only accepted on create; Seerr does not expose an issue metadata update route."
+};
+
+function normalizeSeerrIssuePatch(input) {
+  const patch = { ...(input.patch || {}) };
+  for (const field of seerrIssueMessageFields) {
+    if (input[field] !== undefined) {
+      patch[field] = input[field];
+    }
+  }
+
+  const providedEntries = Object.entries(patch).filter(([, value]) => value !== undefined);
+  const contentEntries = providedEntries.filter(([field]) => seerrIssueMessageFields.has(field));
+  const blockers = [];
+  const unsupportedFields = providedEntries
+    .filter(([field]) => !seerrIssueMessageFields.has(field))
+    .map(([field, value]) => ({
+      field,
+      proposedValue: value,
+      reason: seerrIssueUnsupportedFieldReasons[field] || "Seerr-family servers do not expose this field through a safe issue update API."
+    }));
+
+  const invalidContentFields = contentEntries.filter(([, value]) => typeof value !== "string" || !value.trim());
+  for (const [field] of invalidContentFields) {
+    blockers.push({ field, reason: "Issue message/body/description must be a non-empty string." });
+  }
+
+  const contentValues = contentEntries
+    .filter(([, value]) => typeof value === "string" && value.trim())
+    .map(([field, value]) => ({ field, value }));
+  const distinctContentValues = new Set(contentValues.map(({ value }) => value));
+  if (distinctContentValues.size > 1) {
+    blockers.push({
+      field: "message",
+      reason: "message, body, and description are aliases for the same Seerr first-comment field; provide only one value or matching values."
+    });
+  }
+
+  if (!providedEntries.length) {
+    blockers.push({ field: "patch", reason: "Provide at least one issue field to update." });
+  }
+
+  const message = distinctContentValues.size === 1 ? contentValues[0]?.value : undefined;
+  return { patch, message, unsupportedFields, blockers, contentFields: contentValues.map(({ field }) => field) };
+}
+
+function seerrInitialIssueComment(issue) {
+  if (!Array.isArray(issue?.comments) || !issue.comments.length) {
+    return undefined;
+  }
+  return [...issue.comments]
+    .filter(comment => comment?.id !== undefined && comment?.id !== null)
+    .sort((a, b) => {
+      const aTime = Date.parse(a.createdAt ?? a.date ?? "") || 0;
+      const bTime = Date.parse(b.createdAt ?? b.date ?? "") || 0;
+      if (aTime !== bTime) {
+        return aTime - bTime;
+      }
+      return Number(a.id) - Number(b.id);
+    })[0];
+}
+
+function seerrIssueCurrentEditableFields(rawIssue, normalizedIssue, initialComment) {
+  const media = rawIssue.media ?? rawIssue.mediaInfo ?? {};
+  return compactObject({
+    message: initialComment?.message ?? normalizedIssue.message,
+    body: initialComment?.message ?? normalizedIssue.message,
+    description: initialComment?.message ?? normalizedIssue.message,
+    subject: normalizedIssue.subject,
+    status: normalizedIssue.status,
+    issueType: rawIssue.issueType ?? rawIssue.type,
+    type: normalizedIssue.type,
+    category: normalizedIssue.category,
+    mediaId: media.id ?? rawIssue.mediaId,
+    tmdbId: media.tmdbId,
+    tvdbId: media.tvdbId,
+    plexRatingKey: plexRatingKey(media),
+    problemSeason: rawIssue.problemSeason,
+    problemEpisode: rawIssue.problemEpisode
+  });
+}
+
+function seerrIssueProposedFields(patchInfo) {
+  const proposed = {};
+  if (patchInfo.message !== undefined) {
+    proposed.message = patchInfo.message;
+    for (const field of patchInfo.contentFields) {
+      proposed[field] = patchInfo.message;
+    }
+  }
+  for (const unsupported of patchInfo.unsupportedFields) {
+    proposed[unsupported.field] = unsupported.proposedValue;
+  }
+  return proposed;
+}
+
+async function updateSeerrIssue(input) {
+  const issueId = seerrIssueId(input.issueId);
+  const rawIssue = await seerrApi(`issue/${issueId}`);
+  const issue = summarizeSeerrIssue(rawIssue, input.verbose);
+  const initialComment = seerrInitialIssueComment(rawIssue);
+  const patchInfo = normalizeSeerrIssuePatch(input);
+  const blockers = [...patchInfo.blockers];
+  if (patchInfo.unsupportedFields.length) {
+    blockers.push({
+      field: "patch",
+      reason: "Unsupported fields are present. No partial issue update will be applied."
+    });
+  }
+  if (patchInfo.message !== undefined && !initialComment) {
+    blockers.push({
+      field: "message",
+      reason: "The issue has no editable initial comment to represent its description."
+    });
+  }
+
+  const endpoint = initialComment
+    ? {
+      method: "PUT",
+      path: "/api/v1/issueComment/{commentId}",
+      resolvedPath: `/api/v1/issueComment/${initialComment.id}`,
+      action: "update first issue comment message"
+    }
+    : undefined;
+  const base = {
+    dryRun: input.dryRun !== false,
+    supported: blockers.length === 0,
+    applied: false,
+    issueId,
+    endpoint,
+    current: seerrIssueCurrentEditableFields(rawIssue, issue, initialComment),
+    proposed: seerrIssueProposedFields(patchInfo),
+    unsupportedFields: patchInfo.unsupportedFields.length ? patchInfo.unsupportedFields : undefined,
+    blockers: blockers.length ? blockers : undefined,
+    issue
+  };
+
+  if (base.dryRun || blockers.length) {
+    return base;
+  }
+
+  const comment = await seerrApi(`issueComment/${initialComment.id}`, {
+    method: "PUT",
+    body: { message: patchInfo.message }
+  });
+  return {
+    ...base,
+    dryRun: false,
+    applied: true,
+    updatedComment: summarizeIssueComment(comment, input.verbose),
+    issue: await getSeerrIssue(issueId, input.verbose)
+  };
 }
 
 async function listPlexReportNodes(input) {
@@ -6236,6 +6408,40 @@ function createServer() {
       verbose: z.boolean().default(false)
     }
   }, async ({ issueId, verbose }) => jsonText(await getSeerrIssue(issueId, verbose)));
+
+  server.registerTool("seerr_update_issue", {
+    title: "Seerr Update Issue",
+    description: "Dry-run-first Seerr-family issue metadata update. Only message/body/description is supported, via the first issue comment.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      patch: z.object({
+        message: z.string().min(1).optional(),
+        body: z.string().min(1).optional(),
+        description: z.string().min(1).optional(),
+        subject: z.string().min(1).optional(),
+        issueType: z.union([z.string(), z.number()]).optional(),
+        type: z.union([z.string(), z.number()]).optional(),
+        category: z.union([z.string(), z.number()]).optional(),
+        status: z.union([z.string(), z.number()]).optional(),
+        mediaId: z.union([z.string(), z.number()]).optional(),
+        media: z.any().optional(),
+        mediaInfo: z.any().optional(),
+        tmdbId: z.union([z.string(), z.number()]).optional(),
+        tvdbId: z.union([z.string(), z.number()]).optional(),
+        plexRatingKey: z.union([z.string(), z.number()]).optional(),
+        ratingKey: z.union([z.string(), z.number()]).optional(),
+        guid: z.string().optional(),
+        problemSeason: z.union([z.string(), z.number()]).optional(),
+        problemEpisode: z.union([z.string(), z.number()]).optional()
+      }).catchall(z.any()).optional(),
+      message: z.string().min(1).optional(),
+      body: z.string().min(1).optional(),
+      description: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await updateSeerrIssue(input)));
 
   server.registerTool("seerr_add_issue_comment", {
     title: "Seerr Add Issue Comment",
