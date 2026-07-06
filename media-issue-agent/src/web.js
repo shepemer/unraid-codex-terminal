@@ -1,0 +1,982 @@
+import crypto from "node:crypto";
+import http from "node:http";
+import { redactText, sanitizeValue } from "./redact.js";
+
+const HTML = `<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Issue Agent</title>
+  <script>
+    const savedTheme = localStorage.getItem("media-issue-agent-theme");
+    document.documentElement.dataset.theme = savedTheme || "dark";
+  </script>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="app-mark" aria-hidden="true">MI</div>
+        <div>
+          <h1>Media Issue Agent</h1>
+          <p id="snapshot-meta">No snapshot loaded</p>
+        </div>
+      </div>
+      <nav class="toolbar" aria-label="Primary actions">
+        <div class="theme-toggle" aria-label="Theme">
+          <button type="button" data-theme-choice="light">Light</button>
+          <button type="button" data-theme-choice="dark">Dark</button>
+        </div>
+        <button id="reload-button" class="ghost" type="button">Reload</button>
+        <button id="poll-button" type="button">Poll Now</button>
+      </nav>
+    </header>
+
+    <main class="workspace">
+      <section class="issue-section panel" aria-labelledby="issues-heading">
+        <div class="section-header">
+          <div>
+            <span class="eyebrow">Triage Queue</span>
+            <h2 id="issues-heading">Open Issues</h2>
+          </div>
+          <span id="issue-count" class="badge">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Source</th>
+                <th>Issue ID</th>
+                <th>Date</th>
+                <th>Reporter</th>
+                <th>Media/title</th>
+                <th>Status</th>
+                <th>Description</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="issue-rows">
+              <tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="side-panel panel" aria-labelledby="activity-heading">
+        <div class="section-header">
+          <div>
+            <span class="eyebrow">Operations</span>
+            <h2 id="activity-heading">Activity</h2>
+          </div>
+          <span id="dry-run" class="badge muted">dry-run</span>
+        </div>
+        <div class="stats-grid" id="stats-grid"></div>
+        <div class="job-list" id="job-list"></div>
+      </aside>
+    </main>
+
+    <section class="detail-band panel" aria-live="polite">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Decision Detail</span>
+          <h2>Investigation</h2>
+        </div>
+        <div id="approval-actions" class="toolbar hidden">
+          <button id="approve-button" type="button">Approve</button>
+          <button id="reject-button" type="button" class="danger">Reject</button>
+        </div>
+      </div>
+      <pre id="investigation-output">Select an issue to investigate.</pre>
+    </section>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>`;
+
+const CSS = `:root {
+  color-scheme: light;
+  --bg: #f5f7f3;
+  --bg-soft: #e8eee9;
+  --panel: #ffffff;
+  --panel-2: #f1f5f1;
+  --line: #d6ded8;
+  --line-soft: #e6ece7;
+  --text: #15191b;
+  --muted: #64706a;
+  --subtle: #7c8780;
+  --accent: #147d76;
+  --accent-strong: #0f5e59;
+  --accent-soft: #dff2ee;
+  --success: #27784d;
+  --success-soft: #e3f3e8;
+  --danger: #ad3d39;
+  --danger-soft: #fae7e4;
+  --warning: #9b6812;
+  --warning-soft: #fff0c7;
+  --shadow: 0 16px 40px rgba(19, 33, 29, 0.10);
+  --shadow-soft: 0 1px 2px rgba(19, 33, 29, 0.08);
+  --focus: 0 0 0 3px rgba(20, 125, 118, 0.22);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #101312;
+  --bg-soft: #171b19;
+  --panel: #1c211f;
+  --panel-2: #242a27;
+  --line: #343d38;
+  --line-soft: #2c3430;
+  --text: #f1f5f0;
+  --muted: #a8b3ad;
+  --subtle: #7d8a83;
+  --accent: #45b8a8;
+  --accent-strong: #79d6ca;
+  --accent-soft: #133d39;
+  --success: #77ca95;
+  --success-soft: #163823;
+  --danger: #e07b72;
+  --danger-soft: #46201e;
+  --warning: #dfb256;
+  --warning-soft: #402e12;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.42);
+  --shadow-soft: 0 1px 1px rgba(0, 0, 0, 0.28);
+  --focus: 0 0 0 3px rgba(69, 184, 168, 0.28);
+}
+
+* { box-sizing: border-box; }
+
+html {
+  min-width: 320px;
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--accent-soft) 72%, transparent), transparent 32rem),
+    linear-gradient(145deg, var(--bg), var(--bg-soft));
+  color: var(--text);
+  font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button {
+  min-height: 36px;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  padding: 0 14px;
+  font-weight: 720;
+  cursor: pointer;
+  box-shadow: var(--shadow-soft);
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, transform 120ms ease;
+}
+
+button:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  transform: translateY(-1px);
+}
+
+button:focus-visible { outline: none; box-shadow: var(--focus); }
+button:disabled { cursor: wait; opacity: 0.58; transform: none; }
+button.secondary,
+button.ghost {
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  color: var(--accent-strong);
+  border-color: var(--line);
+}
+button.secondary:hover,
+button.ghost:hover {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.topbar {
+  min-height: 82px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 20px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(14px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand-block {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.app-mark {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--warning) 58%, var(--accent)));
+  color: #fff;
+  font-size: 13px;
+  font-weight: 850;
+  letter-spacing: 0;
+  box-shadow: var(--shadow-soft);
+}
+
+h1, h2, p { margin: 0; }
+h1 { font-size: 21px; line-height: 1.1; font-weight: 780; letter-spacing: 0; }
+h2 { font-size: 16px; line-height: 1.2; font-weight: 780; letter-spacing: 0; }
+p { color: var(--muted); margin-top: 4px; }
+
+.eyebrow {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--subtle);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 36px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.theme-toggle button {
+  min-height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 10px;
+  box-shadow: none;
+  font-size: 12px;
+}
+
+.theme-toggle button:hover,
+.theme-toggle button.active {
+  background: var(--panel);
+  color: var(--text);
+  transform: none;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 344px;
+  gap: 16px;
+  padding: 16px;
+  min-height: 0;
+}
+
+.panel {
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.issue-section,
+.side-panel {
+  min-height: 430px;
+}
+
+.detail-band {
+  margin: 0 16px 16px;
+  min-height: 224px;
+}
+
+.section-header {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--panel-2) 82%, transparent), color-mix(in srgb, var(--panel) 92%, transparent));
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: 999px;
+  padding: 0 9px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.badge.muted { color: var(--muted); background: var(--panel-2); border-color: var(--line); }
+.badge.success { color: var(--success); background: var(--success-soft); border-color: color-mix(in srgb, var(--success) 35%, var(--line)); }
+.badge.warning { color: var(--warning); background: var(--warning-soft); border-color: color-mix(in srgb, var(--warning) 35%, var(--line)); }
+.badge.danger { color: var(--danger); background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
+
+.source-pill,
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 23px;
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.source-pill {
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.status-pill {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+}
+
+.status-pill.muted { color: var(--muted); background: var(--panel-2); border-color: var(--line); }
+.status-pill.success { color: var(--success); background: var(--success-soft); border-color: color-mix(in srgb, var(--success) 35%, var(--line)); }
+.status-pill.warning { color: var(--warning); background: var(--warning-soft); border-color: color-mix(in srgb, var(--warning) 35%, var(--line)); }
+
+.table-wrap {
+  overflow: auto;
+  max-height: calc(100vh - 290px);
+}
+
+table {
+  width: 100%;
+  min-width: 1040px;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+th, td {
+  border-bottom: 1px solid var(--line-soft);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 780;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  z-index: 1;
+}
+
+tbody tr {
+  background: var(--panel);
+}
+
+tbody tr:hover {
+  background: color-mix(in srgb, var(--accent-soft) 30%, var(--panel));
+}
+
+td {
+  max-width: 280px;
+  overflow-wrap: anywhere;
+}
+
+td:first-child,
+th:first-child {
+  width: 48px;
+  color: var(--muted);
+}
+
+td:last-child,
+th:last-child {
+  width: 132px;
+}
+
+.empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 34px 10px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.stat {
+  min-height: 74px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 10px;
+  background: var(--panel-2);
+}
+
+.stat span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stat strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.job-list {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  max-height: calc(100vh - 354px);
+  overflow: auto;
+}
+
+.job-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 11px;
+  background: var(--panel);
+}
+
+.job-main {
+  min-width: 0;
+}
+
+.job-main strong,
+.job-main span {
+  display: block;
+}
+
+.job-main strong {
+  font-size: 15px;
+}
+
+.job-main span {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.job-row .badge {
+  justify-self: end;
+  max-width: 150px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+pre {
+  margin: 0;
+  padding: 16px;
+  min-height: 164px;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--text);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent-soft) 34%, transparent), transparent 28rem),
+    var(--panel);
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.hidden { display: none; }
+
+#toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  max-width: min(460px, calc(100vw - 36px));
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  padding: 10px 13px;
+  transform: translateY(80px);
+  opacity: 0;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+#toast.show {
+  transform: translateY(0);
+  opacity: 1;
+}
+
+@media (max-width: 980px) {
+  .topbar {
+    align-items: flex-start;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .workspace {
+    display: block;
+    padding: 12px;
+  }
+
+  .toolbar {
+    margin-top: 0;
+  }
+
+  .side-panel {
+    margin-top: 12px;
+  }
+
+  .detail-band {
+    margin: 0 12px 12px;
+  }
+
+  .table-wrap,
+  .job-list {
+    max-height: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar {
+    padding: 12px;
+  }
+
+  .brand-block {
+    align-items: flex-start;
+  }
+
+  .app-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+  }
+
+  h1 { font-size: 18px; }
+
+  .theme-toggle,
+  .toolbar > button {
+    width: 100%;
+  }
+
+  .theme-toggle button {
+    flex: 1;
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+}`;
+
+const JS = `const state = {
+  snapshotId: null,
+  activeJobId: null,
+  busy: false
+};
+
+const el = {
+  snapshotMeta: document.getElementById("snapshot-meta"),
+  issueCount: document.getElementById("issue-count"),
+  issueRows: document.getElementById("issue-rows"),
+  pollButton: document.getElementById("poll-button"),
+  reloadButton: document.getElementById("reload-button"),
+  statsGrid: document.getElementById("stats-grid"),
+  jobList: document.getElementById("job-list"),
+  dryRun: document.getElementById("dry-run"),
+  output: document.getElementById("investigation-output"),
+  approvalActions: document.getElementById("approval-actions"),
+  approveButton: document.getElementById("approve-button"),
+  rejectButton: document.getElementById("reject-button"),
+  toast: document.getElementById("toast"),
+  themeButtons: [...document.querySelectorAll("[data-theme-choice]")]
+};
+
+function toast(message) {
+  el.toast.textContent = message;
+  el.toast.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.toast.classList.remove("show"), 2800);
+}
+
+function setBusy(value) {
+  state.busy = value;
+  for (const button of document.querySelectorAll("button:not([data-theme-choice])")) {
+    button.disabled = value;
+  }
+}
+
+function applyTheme(theme) {
+  const selected = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = selected;
+  localStorage.setItem("media-issue-agent-theme", selected);
+  for (const button of el.themeButtons) {
+    const isActive = button.dataset.themeChoice === selected;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) {
+    throw new Error(body.error || "Request failed");
+  }
+  return body;
+}
+
+function badgeClass(stateName) {
+  const normalized = String(stateName || "");
+  if (!normalized) return "badge muted";
+  if (normalized === "closed" || normalized === "approved_for_execution") return "badge success";
+  if (normalized.startsWith("failed") || normalized === "blocked_needs_human") return "badge danger";
+  if (normalized.includes("awaiting")) return "badge warning";
+  return "badge muted";
+}
+
+function statusBadgeClass(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (!normalized) return "status-pill muted";
+  if (normalized.includes("closed") || normalized.includes("resolved")) return "status-pill success";
+  if (normalized.includes("open") || normalized.includes("pending")) return "status-pill warning";
+  return "status-pill";
+}
+
+function renderStats(status) {
+  const jobTotal = (status.jobs || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
+  const pending = (status.approvals || []).find(row => row.status === "pending")?.count || 0;
+  const latest = status.snapshots?.latestId || "-";
+  el.dryRun.textContent = status.dryRun ? "dry-run" : "live";
+  el.dryRun.className = status.dryRun ? "badge muted" : "badge warning";
+  el.statsGrid.innerHTML = [
+    ["Snapshots", status.snapshots?.count || 0],
+    ["Latest", latest],
+    ["Jobs", jobTotal],
+    ["Pending", pending]
+  ].map(([label, value]) => \`<div class="stat"><span>\${label}</span><strong>\${value}</strong></div>\`).join("");
+}
+
+function renderJobs(jobs) {
+  if (!jobs.length) {
+    el.jobList.innerHTML = '<div class="empty">No jobs yet.</div>';
+    return;
+  }
+  el.jobList.innerHTML = jobs.map(job => \`
+    <div class="job-row">
+      <div class="job-main">
+        <strong>Job \${escapeHtml(job.id)}</strong>
+        <span>\${escapeHtml(job.source)} \${escapeHtml(job.issueId)}</span>
+      </div>
+      <span class="\${badgeClass(job.state)}">\${escapeHtml(job.state)}</span>
+    </div>
+  \`).join("");
+}
+
+function renderSnapshot(snapshot) {
+  if (!snapshot) {
+    state.snapshotId = null;
+    el.snapshotMeta.textContent = "No snapshot loaded";
+    el.issueCount.textContent = "0";
+    el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>';
+    return;
+  }
+  state.snapshotId = snapshot.id;
+  el.snapshotMeta.textContent = \`Snapshot \${snapshot.id} · \${snapshot.generatedAt}\`;
+  el.issueCount.textContent = String(snapshot.entries.length);
+  if (!snapshot.entries.length) {
+    el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No open issues.</td></tr>';
+    return;
+  }
+  el.issueRows.innerHTML = snapshot.entries.map(entry => \`
+    <tr>
+      <td>\${entry.idx}</td>
+      <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
+      <td>\${escapeHtml(entry.issueId)}</td>
+      <td>\${escapeHtml(entry.date)}</td>
+      <td>\${escapeHtml(entry.reporter)}</td>
+      <td>\${escapeHtml(entry.mediaTitle)}</td>
+      <td><span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span></td>
+      <td>\${escapeHtml(entry.description)}</td>
+      <td><button class="secondary" type="button" data-investigate="\${entry.idx}">Investigate</button></td>
+    </tr>
+  \`).join("");
+}
+
+async function refresh() {
+  const [status, snapshot, jobs] = await Promise.all([
+    api("/api/status"),
+    api("/api/snapshot/latest"),
+    api("/api/jobs")
+  ]);
+  renderStats(status.status);
+  renderSnapshot(snapshot.snapshot);
+  renderJobs(jobs.jobs);
+}
+
+async function poll() {
+  setBusy(true);
+  try {
+    const result = await api("/api/poll", { method: "POST", body: "{}" });
+    toast(\`Snapshot \${result.result.snapshotId} recorded\`);
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function investigate(index) {
+  if (!state.snapshotId) return;
+  setBusy(true);
+  el.output.textContent = "Investigation running...";
+  el.approvalActions.classList.add("hidden");
+  try {
+    const result = await api("/api/investigate", {
+      method: "POST",
+      body: JSON.stringify({ snapshotId: state.snapshotId, index })
+    });
+    state.activeJobId = result.result.jobId;
+    el.output.textContent = result.result.summary;
+    el.approvalActions.classList.remove("hidden");
+    toast(\`Job \${state.activeJobId} ready\`);
+    await refresh();
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function approval(action) {
+  if (!state.activeJobId) return;
+  setBusy(true);
+  try {
+    await api(\`/api/jobs/\${state.activeJobId}/\${action}\`, { method: "POST", body: "{}" });
+    toast(\`Job \${state.activeJobId} \${action}d\`);
+    el.approvalActions.classList.add("hidden");
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+el.pollButton.addEventListener("click", poll);
+el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
+for (const button of el.themeButtons) {
+  button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
+}
+el.issueRows.addEventListener("click", event => {
+  const button = event.target.closest("[data-investigate]");
+  if (button) {
+    investigate(Number(button.dataset.investigate));
+  }
+});
+el.approveButton.addEventListener("click", () => approval("approve"));
+el.rejectButton.addEventListener("click", () => approval("reject"));
+
+applyTheme(document.documentElement.dataset.theme || "dark");
+refresh().catch(error => toast(error.message));`;
+
+function safeJson(value) {
+  return JSON.stringify(sanitizeValue(value));
+}
+
+function timingSafeEqual(left, right) {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function isAuthorized(req, config) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) {
+    return false;
+  }
+  let decoded = "";
+  try {
+    decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+  const separator = decoded.indexOf(":");
+  if (separator === -1) {
+    return false;
+  }
+  const username = decoded.slice(0, separator);
+  const password = decoded.slice(separator + 1);
+  return timingSafeEqual(username, config.webUsername) && timingSafeEqual(password, config.webPassword);
+}
+
+function send(res, status, body, contentType = "text/plain; charset=utf-8") {
+  res.writeHead(status, {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff"
+  });
+  res.end(body);
+}
+
+function sendJson(res, status, value) {
+  send(res, status, safeJson(value), "application/json; charset=utf-8");
+}
+
+async function readJson(req) {
+  let data = "";
+  for await (const chunk of req) {
+    data += chunk;
+    if (data.length > 64 * 1024) {
+      throw new Error("Request body is too large");
+    }
+  }
+  return data ? JSON.parse(data) : {};
+}
+
+export function createWebHandler(agent, config) {
+  return async function handle(req, res) {
+    try {
+      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      if (url.pathname === "/health") {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (!isAuthorized(req, config)) {
+        res.writeHead(401, {
+          "www-authenticate": 'Basic realm="media-issue-agent"',
+          "cache-control": "no-store"
+        });
+        res.end("Unauthorized");
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/") {
+        send(res, 200, HTML, "text/html; charset=utf-8");
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/assets/app.css") {
+        send(res, 200, CSS, "text/css; charset=utf-8");
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/assets/app.js") {
+        send(res, 200, JS, "text/javascript; charset=utf-8");
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/status") {
+        sendJson(res, 200, { ok: true, status: agent.status() });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/snapshot/latest") {
+        sendJson(res, 200, { ok: true, snapshot: agent.latestWithEntries() });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/jobs") {
+        sendJson(res, 200, { ok: true, jobs: agent.jobs(50), approvals: agent.approvals(50) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/poll") {
+        await readJson(req);
+        sendJson(res, 200, { ok: true, result: await agent.pollOnce() });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/investigate") {
+        const body = await readJson(req);
+        sendJson(res, 200, { ok: true, result: await agent.investigate(Number(body.snapshotId), Number(body.index)) });
+        return;
+      }
+      const approvalMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/(approve|reject)$/);
+      if (req.method === "POST" && approvalMatch) {
+        await readJson(req);
+        const [, jobId, action] = approvalMatch;
+        const result = action === "approve" ? agent.approve(Number(jobId), "web") : agent.reject(Number(jobId), "web");
+        sendJson(res, 200, { ok: true, result });
+        return;
+      }
+      sendJson(res, 404, { ok: false, error: "Not found" });
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: redactText(error.message) });
+    }
+  };
+}
+
+export async function startWebServer(agent, config, log = console.error) {
+  if (!config.webPassword) {
+    throw new Error("ISSUE_AGENT_WEB_PASSWORD is required when the media issue agent Web UI is enabled.");
+  }
+  const server = http.createServer(createWebHandler(agent, config));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(config.webPort, config.webHost, resolve);
+  });
+  log(`media-issue-agent: Web UI listening on ${config.webHost}:${config.webPort}`);
+  return server;
+}

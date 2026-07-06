@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732
+
+ARG CODEX_NPM_VERSION=latest
+ARG NPM_VERSION=11.16.0
+ARG NPM_UNDICI_VERSION=6.27.0
+ARG NPM_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
+
+ENV NODE_ENV=production \
+    CODEX_HOME=/codex-home \
+    ISSUE_AGENT_DB_PATH=/state/media-issue-agent.sqlite \
+    ISSUE_AGENT_MEDIA_MCP_URL=http://media-mcp:6971/mcp \
+    ISSUE_AGENT_POLL_INTERVAL_SECONDS=300 \
+    ISSUE_AGENT_DRY_RUN=true \
+    ISSUE_AGENT_APPROVAL_BACKEND=web \
+    ISSUE_AGENT_WEB_ENABLED=true \
+    ISSUE_AGENT_WEB_HOST=0.0.0.0 \
+    ISSUE_AGENT_WEB_PORT=6983 \
+    ISSUE_AGENT_WEB_USERNAME=operator
+
+WORKDIR /app
+
+RUN groupmod -n agent node \
+    && usermod -l agent -d /home/agent -m node \
+    && usermod -s /usr/sbin/nologin agent \
+    && apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        libgnutls30 \
+        sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY media-issue-agent/package.json media-issue-agent/package-lock.json ./
+
+RUN set -e; \
+    npm install -g "npm@${NPM_VERSION}" "@openai/codex@${CODEX_NPM_VERSION}"; \
+    npm_root="$(npm root -g)"; \
+    npm pack "undici@${NPM_UNDICI_VERSION}" --pack-destination /tmp; \
+    echo "${NPM_UNDICI_SHA256}  /tmp/undici-${NPM_UNDICI_VERSION}.tgz" | sha256sum -c -; \
+    rm -rf "${npm_root}/npm/node_modules/undici"; \
+    mkdir -p "${npm_root}/npm/node_modules/undici"; \
+    tar -xzf "/tmp/undici-${NPM_UNDICI_VERSION}.tgz" -C "${npm_root}/npm/node_modules/undici" --strip-components=1; \
+    actual_undici_version="$(node -p "require('${npm_root}/npm/node_modules/undici/package.json').version")"; \
+    test "${actual_undici_version}" = "${NPM_UNDICI_VERSION}"; \
+    rm -f "/tmp/undici-${NPM_UNDICI_VERSION}.tgz"; \
+    npm ci --omit=dev \
+    && npm cache clean --force
+
+COPY media-issue-agent/src ./src
+
+RUN mkdir -p /state /codex-home /tmp/media-issue-agent-workspace \
+    && chown -R agent:agent /app /state /codex-home /tmp/media-issue-agent-workspace
+
+USER agent
+
+EXPOSE 6983
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD node src/cli.js status >/dev/null
+
+CMD ["node", "src/cli.js", "serve"]

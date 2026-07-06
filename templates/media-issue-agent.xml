@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>media-issue-agent</Name>
+  <Repository>ghcr.io/shepemer/unraid-codex-terminal-media-issue-agent:latest</Repository>
+  <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-media-issue-agent</Registry>
+  <Network>codex-mgmt</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
+  <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
+  <Overview>Optional human-in-the-loop media issue triage agent for Plex-native reports and Seerr-family issues. Uses media-mcp for media APIs and local Codex ChatGPT auth; OpenAI API keys are not accepted.</Overview>
+  <Category>Tools:</Category>
+  <WebUI>http://[IP]:[PORT:6983]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/media-issue-agent.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/unraid-mcp.png</Icon>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --security-opt=no-new-privileges:true --cap-drop=ALL</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>Create the Docker network first: docker network create codex-mgmt. Install media-mcp first. Do not add a host port mapping for this container.</Requires>
+  <Config Name="State Directory" Target="/state" Default="/mnt/user/appdata/media-issue-agent/state" Mode="rw" Description="Persistent SQLite bookkeeping state. This is not issue source-of-truth." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/media-issue-agent/state</Config>
+  <Config Name="Codex Home" Target="/codex-home" Default="/mnt/user/appdata/media-issue-agent/codex" Mode="rw" Description="Persistent Codex config directory containing ChatGPT-authenticated auth.json. Treat this as secret." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/media-issue-agent/codex</Config>
+  <Config Name="WebUI Port" Target="6983" Default="6983" Mode="tcp" Description="Host port for the password-protected media issue agent Web UI. Expose only on LAN, VPN, or Tailscale." Type="Port" Display="always" Required="true" Mask="false">6983</Config>
+  <Config Name="Media MCP URL" Target="ISSUE_AGENT_MEDIA_MCP_URL" Default="http://media-mcp:6971/mcp" Mode="" Description="Internal media-mcp MCP URL on codex-mgmt." Type="Variable" Display="always" Required="true" Mask="false">http://media-mcp:6971/mcp</Config>
+  <Config Name="Media MCP Bearer Token" Target="ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token used to call media-mcp. Use the media-mcp token or a future scoped token." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="WebUI Username" Target="ISSUE_AGENT_WEB_USERNAME" Default="operator" Mode="" Description="Basic-auth username for the media issue agent Web UI." Type="Variable" Display="always" Required="true" Mask="false">operator</Config>
+  <Config Name="WebUI Password" Target="ISSUE_AGENT_WEB_PASSWORD" Default="" Mode="" Description="Basic-auth password for the media issue agent Web UI. Required when the Web UI is enabled." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Codex Home Env" Target="CODEX_HOME" Default="/codex-home" Mode="" Description="Path inside the container for Codex ChatGPT auth." Type="Variable" Display="advanced" Required="true" Mask="false">/codex-home</Config>
+  <Config Name="DB Path" Target="ISSUE_AGENT_DB_PATH" Default="/state/media-issue-agent.sqlite" Mode="" Description="SQLite database path inside the container." Type="Variable" Display="advanced" Required="true" Mask="false">/state/media-issue-agent.sqlite</Config>
+  <Config Name="Poll Interval Seconds" Target="ISSUE_AGENT_POLL_INTERVAL_SECONDS" Default="300" Mode="" Description="Issue reconciliation polling interval. Polling remains the source of truth." Type="Variable" Display="advanced" Required="true" Mask="false">300</Config>
+  <Config Name="Dry Run" Target="ISSUE_AGENT_DRY_RUN" Default="true" Mode="" Description="Keep corrective actions dry-run-first during rollout." Type="Variable" Display="advanced" Required="true" Mask="false">true</Config>
+  <Config Name="Approval Backend" Target="ISSUE_AGENT_APPROVAL_BACKEND" Default="web" Mode="" Description="Approval surface. Web and CLI are available; Discord settings are optional." Type="Variable" Display="advanced" Required="true" Mask="false">web</Config>
+  <Config Name="WebUI Enabled" Target="ISSUE_AGENT_WEB_ENABLED" Default="true" Mode="" Description="Enable the built-in Web UI." Type="Variable" Display="advanced" Required="true" Mask="false">true</Config>
+  <Config Name="WebUI Host" Target="ISSUE_AGENT_WEB_HOST" Default="0.0.0.0" Mode="" Description="Bind address inside the container." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0</Config>
+  <Config Name="WebUI Port Env" Target="ISSUE_AGENT_WEB_PORT" Default="6983" Mode="" Description="Container port for the built-in Web UI." Type="Variable" Display="advanced" Required="true" Mask="false">6983</Config>
+  <Config Name="Discord Bot Token" Target="ISSUE_AGENT_DISCORD_BOT_TOKEN" Default="" Mode="" Description="Optional Discord bot token for approval notifications." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Discord Channel ID" Target="ISSUE_AGENT_DISCORD_CHANNEL_ID" Default="" Mode="" Description="Optional Discord channel ID for approval notifications." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

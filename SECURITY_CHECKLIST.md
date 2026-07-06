@@ -10,12 +10,17 @@ Use this before deploying or publishing the templates.
 - [ ] `WEBUI_LOG_LEVEL=1` unless temporarily troubleshooting, because higher `ttyd` startup logs can include the basic-auth credential.
 - [ ] `unraid-mcp` has no host port mapping.
 - [ ] Optional `media-mcp` has no host port mapping.
+- [ ] Optional `media-issue-agent` WebUI is exposed only on LAN, VPN, or Tailscale.
+- [ ] Optional `media-issue-agent` has a strong `ISSUE_AGENT_WEB_PASSWORD`.
 - [ ] Optional `utilities-mcp` has no host port mapping.
 - [ ] All deployed containers are on `codex-mgmt`.
 - [ ] `UNRAID_API_KEY` is configured only on `unraid-mcp`.
 - [ ] `UNRAID_MCP_BEARER_TOKEN` is long, random, and matches `unraid-mcp` and `codex-terminal`.
 - [ ] Media app API keys and passwords are configured only on `media-mcp`.
 - [ ] `MEDIA_MCP_BEARER_TOKEN` is long, random, and matches `media-mcp` and `codex-terminal` when media MCP is enabled.
+- [ ] `media-issue-agent` has `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN` configured and no media app credentials of its own.
+- [ ] `media-issue-agent` has no `OPENAI_API_KEY` or `CODEX_API_KEY`; it uses Codex ChatGPT auth in its mounted `CODEX_HOME`.
+- [ ] `media-issue-agent` `CODEX_HOME/auth.json` is treated as secret and is never committed, pasted, or logged.
 - [ ] Scrutiny endpoints are configured only on `utilities-mcp`.
 - [ ] `UTILITIES_MCP_BEARER_TOKEN` is long, random, and matches `utilities-mcp` and `codex-terminal` when utilities MCP is enabled.
 - [ ] Root SSH login is disabled.
@@ -58,17 +63,22 @@ Use this before deploying or publishing the templates.
 - [ ] `bash -n media-path-check` passes.
 - [ ] `bash -n web-terminal.sh` passes.
 - [ ] `npm --prefix media-mcp run check` passes.
+- [ ] `npm --prefix media-issue-agent run check` passes.
+- [ ] `npm --prefix media-issue-agent test` passes.
 - [ ] `npm --prefix utilities-mcp run check` passes.
 - [ ] All XML templates parse.
 - [ ] `docker compose config` passes.
 - [ ] `docker compose --profile media config` passes.
+- [ ] `docker compose --profile issue-agent config` passes.
 - [ ] `docker compose --profile utilities config` passes.
+- [ ] `docker compose --profile issue-agent --profile utilities config` passes.
 - [ ] `docker compose --profile media --profile utilities config` passes.
 - [ ] CI vulnerability scans pass before images are pushed.
 - [ ] `sshd -t` passes inside the built `codex-terminal` image.
 - [ ] Codex CLI startup update succeeds when `CODEX_UPDATE_ON_START=true`, or logs a warning and continues with the bundled version.
 - [ ] `unraid-mcp` starts with root-owned appdata directories and rewrites them to UID/GID 1000.
 - [ ] `media-mcp` starts with a read-only root filesystem and no host mounts.
+- [ ] `media-issue-agent` starts with a read-only root filesystem, a state mount, a Codex auth mount, and only its WebUI port published.
 - [ ] `utilities-mcp` starts with a read-only root filesystem and no host mounts.
 - [ ] `media-path-check --json` reports mapped alternatives without creating, deleting, or editing files.
 - [ ] `ssh unraid-codex codex --version` works.
