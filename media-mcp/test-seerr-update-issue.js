@@ -295,6 +295,16 @@ async function run() {
     assert.equal(resolveDryRun.dryRun, true);
     assert.equal(resolveDryRun.wouldSetStatus, "resolved");
 
+    const reopenDryRun = await tool("seerr_reopen_issue", { issueId: 1, dryRun: true });
+    assert.equal(reopenDryRun.dryRun, true);
+    assert.equal(reopenDryRun.wouldSetStatus, "open");
+
+    const beforeDeleteRequests = requests.filter(request => request.method === "DELETE").length;
+    const deleteDryRun = await tool("seerr_delete_issue", { issueId: 1, dryRun: true });
+    assert.equal(deleteDryRun.dryRun, true);
+    assert.equal(deleteDryRun.wouldDeleteIssueId, 1);
+    assert.equal(requests.filter(request => request.method === "DELETE").length, beforeDeleteRequests);
+
     const notFound = await toolError("seerr_update_issue", {
       issueId: 404,
       patch: { message: "No issue here" }

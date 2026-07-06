@@ -4884,27 +4884,6 @@ async function addPlexIssueComment(issueId, message, dryRun, verbose = false) {
   };
 }
 
-async function updatePlexIssueState(issueId, action, dryRun, verbose = false) {
-  const normalizedAction = {
-    close: "closed",
-    resolve: "resolved",
-    reopen: "open",
-    open: "open",
-    archive: "archived",
-    delete: "deleted",
-    ignore: "ignored"
-  }[action] || action;
-  return {
-    dryRun,
-    applied: false,
-    supported: false,
-    requestedAction: action,
-    wouldSetStatus: normalizedAction,
-    limitation: "The Plex Web community API currently exposes report list/detail/comment operations, but no native report state transition mutation.",
-    issue: await getPlexIssue(issueId, verbose)
-  };
-}
-
 async function diagnoseIssue(source, issueId, verbose = false) {
   if (source === "seerr") {
     const id = seerrIssueId(issueId);
@@ -5309,18 +5288,6 @@ function createServer() {
       verbose: z.boolean().default(false)
     }
   }, async ({ issueId, message, dryRun, verbose }) => jsonText(await addPlexIssueComment(issueId, message, dryRun, verbose)));
-
-  server.registerTool("plex_update_reported_issue_state", {
-    title: "Plex Update Reported Issue State",
-    description: "Inspect or attempt a Plex-native reported issue state transition. Current Plex Web API discovery reports state transitions as unsupported.",
-    annotations: { destructiveHint: true, idempotentHint: false },
-    inputSchema: {
-      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
-      action: z.enum(["resolve", "close", "reopen", "open", "archive", "delete", "ignore"]),
-      dryRun: z.boolean().default(true),
-      verbose: z.boolean().default(false)
-    }
-  }, async ({ issueId, action, dryRun, verbose }) => jsonText(await updatePlexIssueState(String(issueId), action, dryRun, verbose)));
 
   server.registerTool("tautulli_activity", {
     title: "Tautulli Activity",

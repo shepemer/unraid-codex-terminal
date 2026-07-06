@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -42,6 +45,7 @@ function parseSse(text) {
 
 async function run() {
   const graphqlCalls = [];
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), "media-mcp-state-"));
   const reports = [
     {
       __typename: "Report",
@@ -199,6 +203,7 @@ async function run() {
       MEDIA_MCP_BEARER_TOKEN: "test-token",
       MEDIA_MCP_HOST: "127.0.0.1",
       MEDIA_MCP_PORT: String(mediaPort),
+      MEDIA_MCP_STATE_DIR: stateDir,
       PLEX_URL: `http://127.0.0.1:${mockPort}/plex`,
       PLEX_TOKEN: "plex-token",
       PLEX_COMMUNITY_URL: `http://127.0.0.1:${mockPort}/community`
@@ -244,6 +249,10 @@ async function run() {
     return JSON.parse(response.result.content[0].text);
   }
 
+  async function stateDirEntries() {
+    return (await readdir(stateDir, { recursive: true })).sort();
+  }
+
   try {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       try {
@@ -264,7 +273,7 @@ async function run() {
     const tools = await rpc("tools/list");
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("plex_add_reported_issue_comment"));
-    assert.ok(toolNames.has("plex_update_reported_issue_state"));
+    assert.equal(toolNames.has("plex_update_reported_issue_state"), false);
 
     const listed = await tool("plex_reported_issues", { source: "plex", status: "open", take: 10 });
     assert.deepEqual(listed.sources, ["plex"]);
@@ -317,28 +326,13 @@ async function run() {
     assert.equal(added.comment.message, "I found the likely source file problem.");
     assert.equal(added.issue.comments.length, 2);
 
-    const dryState = await tool("plex_update_reported_issue_state", {
-      issueId: "report-1",
-      action: "resolve",
-      dryRun: true
-    });
-    assert.equal(dryState.supported, false);
-    assert.equal(dryState.applied, false);
-    assert.equal(dryState.wouldSetStatus, "resolved");
-
-    const appliedState = await tool("plex_update_reported_issue_state", {
-      issueId: "report-1",
-      action: "reopen",
-      dryRun: false
-    });
-    assert.equal(appliedState.supported, false);
-    assert.equal(appliedState.applied, false);
-    assert.equal(appliedState.wouldSetStatus, "open");
-    assert.equal(graphqlCalls.some(call => /state/i.test(call.operationName)), false);
+    assert.equal(graphqlCalls.some(call => /state|resolve|close|archive|delete|ignore/i.test(call.operationName)), false);
+    assert.deepEqual(await stateDirEntries(), []);
   } finally {
     child.kill("SIGTERM");
     mock.close();
     await once(mock, "close");
+    await rm(stateDir, { recursive: true, force: true });
   }
 }
 
