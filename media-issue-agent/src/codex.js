@@ -7,7 +7,7 @@ function runProcess(command, args, options) {
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"]
     });
     let stdout = "";
     let stderr = "";
@@ -25,6 +25,11 @@ function runProcess(command, args, options) {
       clearTimeout(timeout);
       reject(error);
     });
+    if (options.input) {
+      child.stdin.end(options.input);
+    } else {
+      child.stdin.end();
+    }
     child.on("close", code => {
       clearTimeout(timeout);
       if (code === 0) {
@@ -71,10 +76,11 @@ export async function runCodex(config, prompt) {
   delete env.CODEX_API_KEY;
   const result = await runProcess(
     config.codexBin,
-    ["exec", "--sandbox", "read-only", prompt],
+    ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"],
     {
       cwd: config.codexWorkspace,
       env,
+      input: prompt,
       timeoutMs: config.codexTimeoutMs
     }
   );

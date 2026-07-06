@@ -5,19 +5,23 @@ import {
   ensureJob,
   initDb,
   insertSnapshot,
+  investigationForJob,
   latestSnapshot,
   listApprovals,
   listJobs,
+  pendingApprovalForJob,
   recordAudit,
   setPendingApprovals,
   snapshotEntries,
   snapshotEntry,
   statusSummary,
-  transitionJob
+  supersedePendingApprovals,
+  transitionJob,
+  upsertInvestigation
 } from "./db.js";
 import { investigationPrompt, runCodex } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
-import { sanitizeValue } from "./redact.js";
+import { redactText, sanitizeValue } from "./redact.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -92,7 +96,7 @@ export class MediaIssueAgent {
     return inspectCodexAuth(this.config.codexHome);
   }
 
-  async investigate(snapshotId, index) {
+  async investigate(snapshotId, index, options = {}) {
     await this.init();
     await validateCodexHome(this.config.codexHome);
     const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
@@ -100,7 +104,28 @@ export class MediaIssueAgent {
       throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
     }
     const job = ensureJob(this.config.dbPath, entry.source, entry.issueId, "queued_for_investigation");
-    transitionJob(this.config.dbPath, job.id, ["detected", "queued_for_investigation", "awaiting_action_approval"], "investigating");
+    const cached = investigationForJob(this.config.dbPath, job.id);
+    if (cached && !options.force) {
+      const approval = pendingApprovalForJob(this.config.dbPath, job.id);
+      return {
+        jobId: job.id,
+        approvalId: approval?.id || null,
+        summary: cached.summary,
+        evidence: cached.evidence,
+        status: cached.status,
+        cached: true
+      };
+    }
+    transitionJob(this.config.dbPath, job.id, [
+      "detected",
+      "queued_for_investigation",
+      "awaiting_action_approval",
+      "blocked_needs_human",
+      "failed_retryable"
+    ], "investigating");
+    if (options.force) {
+      supersedePendingApprovals(this.config.dbPath, job.id);
+    }
     const [details, diagnosis] = await Promise.all([
       this.client.callTool("plex_issue_details", {
         source: entry.source,
@@ -118,13 +143,29 @@ export class MediaIssueAgent {
     try {
       summary = await runCodex(this.config, investigationPrompt(evidence));
     } catch (error) {
+      const message = redactText(error.message);
       summary = [
         "Codex investigation summary could not be generated automatically.",
+        `Reason: ${message}`,
         `Read-only media diagnostics were collected for ${entry.source} issue ${entry.issueId}.`,
-        "Review the sanitized evidence and approve only exact supported actions."
+        "Re-run the investigation after fixing the Codex error."
       ].join("\n");
+      const investigation = upsertInvestigation(this.config.dbPath, job.id, {
+        status: "failed",
+        summary,
+        evidence,
+        error: message
+      });
+      transitionJob(this.config.dbPath, job.id, ["investigating"], "failed_retryable", message);
       recordAudit(this.config.dbPath, "codex_investigation_failed", sanitizeValue({ error: error.message }), job.id);
+      return { jobId: job.id, approvalId: null, summary, evidence, status: investigation.status, cached: false, error: message };
     }
+    supersedePendingApprovals(this.config.dbPath, job.id);
+    const investigation = upsertInvestigation(this.config.dbPath, job.id, {
+      status: "ready",
+      summary,
+      evidence
+    });
     transitionJob(this.config.dbPath, job.id, ["investigating"], "awaiting_action_approval");
     const approval = createApproval(this.config.dbPath, job.id, "action", {
       source: entry.source,
@@ -132,7 +173,7 @@ export class MediaIssueAgent {
       summary
     });
     recordAudit(this.config.dbPath, "investigation_ready", sanitizeValue({ approval, summary }), job.id);
-    return { jobId: job.id, approvalId: approval.id, summary, evidence };
+    return { jobId: job.id, approvalId: approval.id, summary, evidence, status: investigation.status, cached: false };
   }
 
   approve(jobId, actor = "operator") {

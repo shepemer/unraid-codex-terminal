@@ -93,6 +93,13 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - a persistent Codex home path mounted to `/codex-home`
    - a persistent state path mounted to `/state`
 
+   The state and Codex home host directories must be writable by the container's `agent` user, which runs as uid/gid `1000`. For the default Unraid template paths:
+
+   ```sh
+   mkdir -p /mnt/user/appdata/media-issue-agent/state /mnt/user/appdata/media-issue-agent/codex
+   chown -R 1000:1000 /mnt/user/appdata/media-issue-agent/state /mnt/user/appdata/media-issue-agent/codex
+   ```
+
    The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`. It is intended to use ChatGPT-managed Codex access, such as a Pro plan, through Codex local authentication. On first start, open the Web UI and use the Codex Auth panel to start a ChatGPT device-login flow. To prepare the mounted Codex home from a trusted shell instead, run:
 
    ```sh
@@ -107,12 +114,13 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, and approve or reject pending jobs. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js list
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1
+   docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js investigate 1 1 --force
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js approve 1
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js status
    ```
@@ -259,6 +267,7 @@ Important behavior:
 - Plex-native reports with any comment exactly `Closed.` are treated as resolved. Matching is case-insensitive and ignores leading or trailing whitespace.
 - If a Plex list response does not include comments, or `commentCount` shows comments may exist, the agent fetches issue details before deciding whether the report is open.
 - Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, and redacted audit events.
+- Investigation summaries and sanitized evidence are cached per job. Selecting an issue in the Web UI shows the cached investigation when one exists; Re-investigate or CLI `--force` reruns Codex and replaces the cached result.
 - The agent uses Codex local through ChatGPT auth for investigation summaries and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
@@ -271,13 +280,15 @@ The Web UI is the primary approval surface. The CLI remains available for the sa
 ```sh
 media-issue-agent poll-once
 media-issue-agent list
-media-issue-agent investigate <snapshot-id> <index>
+media-issue-agent investigate <snapshot-id> <index> [--force]
 media-issue-agent approve <job-id>
 media-issue-agent reject <job-id>
 media-issue-agent status
 ```
 
 Do not mount media libraries, download shares, appdata, Docker sockets, or broad host paths into `media-issue-agent`. It should only need `/state`, `/codex-home`, the internal `media-mcp` URL, and the media MCP bearer token.
+
+The `/state` and `/codex-home` bind mounts must be writable by uid/gid `1000`; otherwise SQLite cannot create `/state/media-issue-agent.sqlite` and Codex cannot refresh ChatGPT auth.
 
 Example media MCP payloads:
 

@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
   redacted_payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS investigations (
+  job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 `);
 }
 
@@ -157,18 +167,29 @@ LIMIT 1;
 export function snapshotEntry(dbPath, snapshotId, index) {
   const rows = sqliteExec(dbPath, sql`
 SELECT
-  snapshot_id AS snapshotId,
-  idx,
-  source,
-  issue_id AS issueId,
-  date,
-  reporter,
-  media_title AS mediaTitle,
-  status,
-  description,
-  raw_json AS rawJson
+  issue_snapshot_entries.snapshot_id AS snapshotId,
+  issue_snapshot_entries.idx,
+  issue_snapshot_entries.source,
+  issue_snapshot_entries.issue_id AS issueId,
+  issue_snapshot_entries.date,
+  issue_snapshot_entries.reporter,
+  issue_snapshot_entries.media_title AS mediaTitle,
+  issue_snapshot_entries.status,
+  issue_snapshot_entries.description,
+  issue_snapshot_entries.raw_json AS rawJson,
+  jobs.id AS jobId,
+  jobs.state AS jobState,
+  investigations.status AS investigationStatus,
+  investigations.summary AS investigationSummary,
+  investigations.error AS investigationError,
+  investigations.updated_at AS investigationUpdatedAt
 FROM issue_snapshot_entries
-WHERE snapshot_id = ${snapshotId} AND idx = ${index}
+LEFT JOIN jobs
+  ON jobs.source = issue_snapshot_entries.source
+ AND jobs.issue_id = issue_snapshot_entries.issue_id
+LEFT JOIN investigations
+  ON investigations.job_id = jobs.id
+WHERE issue_snapshot_entries.snapshot_id = ${snapshotId} AND issue_snapshot_entries.idx = ${index}
 LIMIT 1;
 `, { json: true });
   const row = rows[0];
@@ -181,19 +202,30 @@ LIMIT 1;
 export function snapshotEntries(dbPath, snapshotId) {
   return sqliteExec(dbPath, sql`
 SELECT
-  snapshot_id AS snapshotId,
-  idx,
-  source,
-  issue_id AS issueId,
-  date,
-  reporter,
-  media_title AS mediaTitle,
-  status,
-  description,
-  raw_json AS rawJson
+  issue_snapshot_entries.snapshot_id AS snapshotId,
+  issue_snapshot_entries.idx,
+  issue_snapshot_entries.source,
+  issue_snapshot_entries.issue_id AS issueId,
+  issue_snapshot_entries.date,
+  issue_snapshot_entries.reporter,
+  issue_snapshot_entries.media_title AS mediaTitle,
+  issue_snapshot_entries.status,
+  issue_snapshot_entries.description,
+  issue_snapshot_entries.raw_json AS rawJson,
+  jobs.id AS jobId,
+  jobs.state AS jobState,
+  investigations.status AS investigationStatus,
+  investigations.summary AS investigationSummary,
+  investigations.error AS investigationError,
+  investigations.updated_at AS investigationUpdatedAt
 FROM issue_snapshot_entries
-WHERE snapshot_id = ${snapshotId}
-ORDER BY idx;
+LEFT JOIN jobs
+  ON jobs.source = issue_snapshot_entries.source
+ AND jobs.issue_id = issue_snapshot_entries.issue_id
+LEFT JOIN investigations
+  ON investigations.job_id = jobs.id
+WHERE issue_snapshot_entries.snapshot_id = ${snapshotId}
+ORDER BY issue_snapshot_entries.idx;
 `, { json: true }).map(row => ({ ...row, raw: JSON.parse(row.rawJson) }));
 }
 
@@ -249,6 +281,64 @@ VALUES (${jobId}, ${kind}, 'pending', ${channel}, ${tokenHash}, ${payloadJson})
 RETURNING id;
 `, { json: true });
   return { id, jobId, kind, status: "pending", tokenHash, payload };
+}
+
+export function pendingApprovalForJob(dbPath, jobId, kind = "action") {
+  const rows = sqliteExec(dbPath, sql`
+SELECT id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash, payload_json AS payloadJson
+FROM approvals
+WHERE job_id = ${jobId} AND kind = ${kind} AND status = 'pending'
+ORDER BY id DESC
+LIMIT 1;
+`, { json: true });
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return { ...row, payload: JSON.parse(row.payloadJson) };
+}
+
+export function supersedePendingApprovals(dbPath, jobId, kind = "action") {
+  sqliteExec(dbPath, sql`
+UPDATE approvals
+SET status = 'superseded'
+WHERE job_id = ${jobId} AND kind = ${kind} AND status = 'pending';
+`);
+}
+
+export function upsertInvestigation(dbPath, jobId, { status, summary, evidence, error = null }) {
+  sqliteExec(dbPath, sql`
+INSERT INTO investigations (job_id, status, summary, evidence_json, error)
+VALUES (${jobId}, ${status}, ${summary}, ${JSON.stringify(evidence || {})}, ${error})
+ON CONFLICT(job_id) DO UPDATE SET
+  status = excluded.status,
+  summary = excluded.summary,
+  evidence_json = excluded.evidence_json,
+  error = excluded.error,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`);
+  return investigationForJob(dbPath, jobId);
+}
+
+export function investigationForJob(dbPath, jobId) {
+  const rows = sqliteExec(dbPath, sql`
+SELECT
+  job_id AS jobId,
+  status,
+  summary,
+  evidence_json AS evidenceJson,
+  error,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+FROM investigations
+WHERE job_id = ${jobId}
+LIMIT 1;
+`, { json: true });
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return { ...row, evidence: JSON.parse(row.evidenceJson) };
 }
 
 export function setPendingApprovals(dbPath, jobId, status, actor = "operator") {

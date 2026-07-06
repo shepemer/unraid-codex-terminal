@@ -555,8 +555,8 @@ th:last-child {
 
 .job-row .badge {
   justify-self: end;
-  max-width: 150px;
-  overflow-wrap: anywhere;
+  max-width: none;
+  white-space: nowrap;
   text-align: right;
 }
 
@@ -669,6 +669,7 @@ pre {
 
 const JS = `const state = {
   snapshotId: null,
+  entries: [],
   activeJobId: null,
   busy: false,
   authOk: false,
@@ -764,6 +765,27 @@ function badgeClass(stateName) {
   return "badge muted";
 }
 
+function stateLabel(stateName) {
+  const labels = {
+    detected: "Detected",
+    queued_for_investigation: "Queued",
+    investigating: "Investigating",
+    awaiting_action_approval: "Needs approval",
+    approved_for_execution: "Approved",
+    executing: "Executing",
+    waiting_for_plex_verification: "Verifying",
+    drafting_comment: "Drafting",
+    awaiting_comment_approval: "Comment review",
+    posting_comment: "Posting",
+    closing_issue: "Closing",
+    closed: "Closed",
+    blocked_needs_human: "Needs human",
+    failed_retryable: "Retry needed",
+    failed_terminal: "Failed"
+  };
+  return labels[stateName] || String(stateName || "").replaceAll("_", " ");
+}
+
 function statusBadgeClass(status) {
   const normalized = String(status || "").toLowerCase();
   if (!normalized) return "status-pill muted";
@@ -797,7 +819,7 @@ function renderJobs(jobs) {
         <strong>Job \${escapeHtml(job.id)}</strong>
         <span>\${escapeHtml(job.source)} \${escapeHtml(job.issueId)}</span>
       </div>
-      <span class="\${badgeClass(job.state)}">\${escapeHtml(job.state)}</span>
+      <span class="\${badgeClass(job.state)}">\${escapeHtml(stateLabel(job.state))}</span>
     </div>
   \`).join("");
 }
@@ -819,12 +841,14 @@ function renderAuth(auth, login) {
 function renderSnapshot(snapshot) {
   if (!snapshot) {
     state.snapshotId = null;
+    state.entries = [];
     el.snapshotMeta.textContent = "No snapshot loaded";
     el.issueCount.textContent = "0";
     el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>';
     return;
   }
   state.snapshotId = snapshot.id;
+  state.entries = snapshot.entries || [];
   el.snapshotMeta.textContent = \`Snapshot \${snapshot.id} · \${snapshot.generatedAt}\`;
   el.issueCount.textContent = String(snapshot.entries.length);
   if (!snapshot.entries.length) {
@@ -832,7 +856,7 @@ function renderSnapshot(snapshot) {
     return;
   }
   el.issueRows.innerHTML = snapshot.entries.map(entry => \`
-    <tr>
+    <tr data-entry-index="\${entry.idx}">
       <td>\${entry.idx}</td>
       <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
       <td>\${escapeHtml(entry.issueId)}</td>
@@ -841,9 +865,24 @@ function renderSnapshot(snapshot) {
       <td>\${escapeHtml(entry.mediaTitle)}</td>
       <td><span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span></td>
       <td>\${escapeHtml(entry.description)}</td>
-      <td><button class="secondary" type="button" data-investigate="\${entry.idx}" \${state.authOk ? "" : "disabled"}>Investigate</button></td>
+      <td><button class="secondary" type="button" data-investigate="\${entry.idx}" \${state.authOk ? "" : "disabled"}>\${entry.investigationSummary ? "Re-investigate" : "Investigate"}</button></td>
     </tr>
   \`).join("");
+}
+
+function showEntry(index) {
+  const entry = state.entries.find(row => Number(row.idx) === Number(index));
+  if (!entry) return;
+  state.activeJobId = entry.jobId || null;
+  if (entry.investigationSummary) {
+    const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
+    const updated = entry.investigationUpdatedAt ? \`Updated: \${entry.investigationUpdatedAt}\` : "";
+    el.output.textContent = [status, updated, "", entry.investigationSummary].filter(Boolean).join("\\n");
+    el.approvalActions.classList.toggle("hidden", entry.jobState !== "awaiting_action_approval");
+  } else {
+    el.output.textContent = \`No cached investigation for \${entry.source} issue \${entry.issueId}. Select Investigate to run Codex.\`;
+    el.approvalActions.classList.add("hidden");
+  }
 }
 
 async function refresh() {
@@ -894,7 +933,7 @@ async function poll() {
   }
 }
 
-async function investigate(index) {
+async function investigate(index, force = false) {
   if (!state.snapshotId) return;
   setBusy(true);
   el.output.textContent = "Investigation running...";
@@ -902,11 +941,11 @@ async function investigate(index) {
   try {
     const result = await api("/api/investigate", {
       method: "POST",
-      body: JSON.stringify({ snapshotId: state.snapshotId, index })
+      body: JSON.stringify({ snapshotId: state.snapshotId, index, force })
     });
     state.activeJobId = result.result.jobId;
     el.output.textContent = result.result.summary;
-    el.approvalActions.classList.remove("hidden");
+    el.approvalActions.classList.toggle("hidden", !result.result.approvalId);
     toast(\`Job \${state.activeJobId} ready\`);
     await refresh();
   } catch (error) {
@@ -941,7 +980,12 @@ for (const button of el.themeButtons) {
 el.issueRows.addEventListener("click", event => {
   const button = event.target.closest("[data-investigate]");
   if (button) {
-    investigate(Number(button.dataset.investigate));
+    investigate(Number(button.dataset.investigate), true);
+    return;
+  }
+  const row = event.target.closest("[data-entry-index]");
+  if (row) {
+    showEntry(Number(row.dataset.entryIndex));
   }
 });
 el.approveButton.addEventListener("click", () => approval("approve"));
@@ -1149,7 +1193,9 @@ export function createWebHandler(agent, config) {
       }
       if (req.method === "POST" && url.pathname === "/api/investigate") {
         const body = await readJson(req);
-        sendJson(res, 200, { ok: true, result: await agent.investigate(Number(body.snapshotId), Number(body.index)) });
+        sendJson(res, 200, { ok: true, result: await agent.investigate(Number(body.snapshotId), Number(body.index), {
+          force: Boolean(body.force)
+        }) });
         return;
       }
       const approvalMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/(approve|reject)$/);
