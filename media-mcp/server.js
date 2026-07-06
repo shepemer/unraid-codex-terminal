@@ -2217,70 +2217,6 @@ const plexCreateReportCommentMutation = `
   }
 `;
 
-const plexReportedIssueStateDiscovery = {
-  plexWebVersion: "4.159.0-d0cea4c",
-  plexWebHash: "f9a38bb3b6abfdce03f4",
-  inspectedAt: "2026-07-06",
-  communityEndpoint: "https://community.plex.tv/api",
-  apiVersion: "not exposed by the Plex Web community GraphQL endpoint",
-  requiredHeaders: [
-    "X-Plex-Token",
-    "X-Plex-Client-Identifier",
-    "X-Plex-Product",
-    "X-Plex-Version",
-    "Accept: application/json",
-    "Content-Type: application/json"
-  ],
-  methodsAttempted: [
-    "Fetched Plex Web app shell from https://app.plex.tv/desktop/ and identified Plex Web 4.159.0-d0cea4c.",
-    "Extracted the Webpack chunk map and downloaded/searched all 205 JavaScript bundles for Reported Issues, report GraphQL operations, and close/resolve/archive/delete/dismiss/ignore verbs.",
-    "Extracted the Reported Issues GraphQL endpoint module and verified it exposes create/list/detail/comment/comment-delete operations only.",
-    "Inspected the bundled Reported Issues UI route and labels for close, resolve, reopen, archive, delete, dismiss, hide, and ignore actions.",
-    "Traced Plex Web's generic Activity mutation path, including removeActivity($input: RemoveActivityInput!) and updateActivity($id: ID!, $input: UpdateActivityInput!), as a possible backdoor.",
-    "Verified Report objects are fetched through reportByID/reportComments rather than activityByID/activityComments, Report cards are wrapped without generic metadata actions, and the removeActivity type map does not include Report.",
-    "Attempted direct in-app browser navigation to https://app.plex.tv/desktop/#!/reports; browser access to app.plex.tv is blocked by this environment's enterprise network policy before authenticated UI interaction."
-  ],
-  graphqlOperationsFound: {
-    queries: [
-      "reportsUnreadCount",
-      "getReportedIssues",
-      "reportById",
-      "reportComments"
-    ],
-    mutations: [
-      "createReport",
-      "createReportComment",
-      "removeReportComment"
-    ]
-  },
-  nearMisses: [
-    {
-      operation: "removeActivity",
-      document: "mutation removeActivity($input: RemoveActivityInput!) { removeActivity(input: $input) }",
-      reasonNotUsed: "This is wired only for Plex Activity objects. Plex Web's activity type map contains ActivityMetadataMessage, ActivityPost, ActivityRating, ActivityReview, ActivityWatchHistory, ActivityWatchRating, ActivityWatchReview, ActivityWatchSession, and ActivityWatchlist; it does not contain Report."
-    },
-    {
-      operation: "updateActivityDate",
-      document: "mutation updateActivityDate($id: ID!, $input: UpdateActivityInput!) { updateActivity(id: $id, input: $input) { id } }",
-      reasonNotUsed: "This only edits activity dates for supported activity objects and is not connected to Reported Issues in Plex Web."
-    },
-    {
-      operation: "removeReportComment",
-      document: "mutation removeReportComment($input: RemoveReportCommentInput!) { removeReportComment(input: $input) }",
-      reasonNotUsed: "This deletes a report comment only; it does not delete, close, resolve, archive, ignore, or hide the parent report."
-    }
-  ],
-  uiCapabilitiesObserved: {
-    list: true,
-    detail: true,
-    addComment: true,
-    removeComment: true,
-    reportStateActionLabelsFound: [],
-    reportDeleteActionFound: false
-  },
-  conclusion: "No upstream Plex-native report state mutation or report deletion mutation was found. List, detail, and comment operations are supported; report state changes remain unsupported without a Plex upstream API."
-};
-
 async function listSeerrIssues(input) {
   const status = input.status || "open";
   const body = await seerrApi("issue", {
@@ -4948,37 +4884,6 @@ async function addPlexIssueComment(issueId, message, dryRun, verbose = false) {
   };
 }
 
-async function updatePlexIssueState(issueId, action, dryRun, verbose = false) {
-  const requestedState = {
-    close: "closed",
-    resolve: "resolved",
-    reopen: "open",
-    open: "open",
-    archive: "archived",
-    ignore: "ignored"
-  }[action];
-  return {
-    dryRun,
-    applied: false,
-    supported: false,
-    requestedAction: action,
-    requestedState,
-    upstreamRequest: null,
-    capabilities: {
-      list: true,
-      detail: true,
-      comment: true,
-      removeComment: true,
-      reportStateMutation: false,
-      reportDeletion: false,
-      localStateOverlay: false
-    },
-    discovery: plexReportedIssueStateDiscovery,
-    limitation: "Plex Web 4.159.0 exposes native report list/detail/comment/comment-delete operations, but no upstream report state transition or report deletion mutation. No local-only state overlay is used.",
-    issue: await getPlexIssue(issueId, verbose)
-  };
-}
-
 async function diagnoseIssue(source, issueId, verbose = false) {
   if (source === "seerr") {
     const id = seerrIssueId(issueId);
@@ -5383,18 +5288,6 @@ function createServer() {
       verbose: z.boolean().default(false)
     }
   }, async ({ issueId, message, dryRun, verbose }) => jsonText(await addPlexIssueComment(issueId, message, dryRun, verbose)));
-
-  server.registerTool("plex_update_reported_issue_state", {
-    title: "Plex Update Reported Issue State",
-    description: "Inspect or attempt a Plex-native reported issue state transition. Current Plex Web API discovery reports state transitions as unsupported.",
-    annotations: { destructiveHint: true, idempotentHint: false },
-    inputSchema: {
-      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
-      action: z.enum(["resolve", "close", "reopen", "open", "archive", "delete", "ignore"]),
-      dryRun: z.boolean().default(true),
-      verbose: z.boolean().default(false)
-    }
-  }, async ({ issueId, action, dryRun, verbose }) => jsonText(await updatePlexIssueState(String(issueId), action, dryRun, verbose)));
 
   server.registerTool("tautulli_activity", {
     title: "Tautulli Activity",

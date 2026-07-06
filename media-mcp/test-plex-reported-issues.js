@@ -273,7 +273,7 @@ async function run() {
     const tools = await rpc("tools/list");
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("plex_add_reported_issue_comment"));
-    assert.ok(toolNames.has("plex_update_reported_issue_state"));
+    assert.equal(toolNames.has("plex_update_reported_issue_state"), false);
 
     const listed = await tool("plex_reported_issues", { source: "plex", status: "open", take: 10 });
     assert.deepEqual(listed.sources, ["plex"]);
@@ -326,46 +326,6 @@ async function run() {
     assert.equal(added.comment.message, "I found the likely source file problem.");
     assert.equal(added.issue.comments.length, 2);
 
-    const dryState = await tool("plex_update_reported_issue_state", {
-      issueId: "report-1",
-      action: "resolve",
-      dryRun: true
-    });
-    assert.equal(dryState.supported, false);
-    assert.equal(dryState.applied, false);
-    assert.equal(dryState.requestedState, "resolved");
-    assert.equal(dryState.upstreamRequest, null);
-    assert.equal(dryState.capabilities.list, true);
-    assert.equal(dryState.capabilities.detail, true);
-    assert.equal(dryState.capabilities.comment, true);
-    assert.equal(dryState.capabilities.reportStateMutation, false);
-    assert.equal(dryState.capabilities.reportDeletion, false);
-    assert.equal(dryState.capabilities.localStateOverlay, false);
-    assert.equal(dryState.discovery.plexWebVersion, "4.159.0-d0cea4c");
-    assert.equal(dryState.discovery.communityEndpoint, "https://community.plex.tv/api");
-    assert.deepEqual(dryState.discovery.graphqlOperationsFound.mutations, [
-      "createReport",
-      "createReportComment",
-      "removeReportComment"
-    ]);
-    assert.ok(dryState.discovery.methodsAttempted.some(method => /generic Activity mutation path/.test(method)));
-    assert.ok(dryState.discovery.methodsAttempted.some(method => /removeActivity type map does not include Report/.test(method)));
-    assert.equal(dryState.discovery.nearMisses.find(nearMiss => nearMiss.operation === "removeActivity").reasonNotUsed.includes("does not contain Report"), true);
-    assert.equal(dryState.discovery.nearMisses.find(nearMiss => nearMiss.operation === "removeReportComment").reasonNotUsed.includes("comment only"), true);
-    assert.match(dryState.discovery.conclusion, /No upstream Plex-native report state mutation/i);
-    assert.ok(dryState.discovery.methodsAttempted.some(method => /205 JavaScript bundles/.test(method)));
-    assert.equal(dryState.discovery.uiCapabilitiesObserved.reportDeleteActionFound, false);
-    assert.deepEqual(await stateDirEntries(), []);
-
-    const appliedState = await tool("plex_update_reported_issue_state", {
-      issueId: "report-1",
-      action: "reopen",
-      dryRun: false
-    });
-    assert.equal(appliedState.supported, false);
-    assert.equal(appliedState.applied, false);
-    assert.equal(appliedState.requestedState, "open");
-    assert.equal(appliedState.upstreamRequest, null);
     assert.equal(graphqlCalls.some(call => /state|resolve|close|archive|delete|ignore/i.test(call.operationName)), false);
     assert.deepEqual(await stateDirEntries(), []);
   } finally {
