@@ -138,7 +138,11 @@ function plexConfig() {
     console.error("media-mcp: PLEX_URL and PLEX_TOKEN must be set together");
     process.exit(1);
   }
-  return { url: normalizeBaseUrl(url), token };
+  return {
+    url: normalizeBaseUrl(url),
+    token,
+    communityUrl: normalizeBaseUrl(env.PLEX_COMMUNITY_URL || "https://community.plex.tv")
+  };
 }
 
 function normalizeBaseUrl(value) {
@@ -253,7 +257,36 @@ async function plexApi(path = "", options = {}) {
     "X-Plex-Device-Name": "media-mcp",
     Accept: "application/json"
   };
-  return fetchJson(url, { method: "GET", headers });
+  let body;
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.body);
+  }
+  return fetchJson(url, { method: options.method || "GET", headers, body });
+}
+
+async function plexCommunityGraphql(query, variables = {}, operationName) {
+  const service = requireService("plex");
+  const url = new URL(`${service.communityUrl}/api`);
+  const body = await fetchJson(url, {
+    method: "POST",
+    headers: {
+      "X-Plex-Token": service.token,
+      "X-Plex-Client-Identifier": "unraid-codex-media-mcp",
+      "X-Plex-Product": "Unraid Codex Terminal Media MCP",
+      "X-Plex-Version": "0.1.0",
+      "X-Plex-Device": "MCP",
+      "X-Plex-Device-Name": "media-mcp",
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify(compactObject({ query, variables, operationName }))
+  });
+  if (Array.isArray(body?.errors) && body.errors.length) {
+    const message = body.errors.map(error => error.message).filter(Boolean).join("; ") || "unknown GraphQL error";
+    throw new Error(`Plex community GraphQL ${operationName || "request"} failed: ${message}`);
+  }
+  return body?.data ?? body;
 }
 
 async function bazarrApi(path, options = {}) {
@@ -590,7 +623,7 @@ function summarizeUser(user, verbose = false) {
   }
   return compactObject({
     id: user.id,
-    displayName: firstString(user.displayName, user.username, user.plexUsername, user.name, verbose ? user.email : undefined),
+    displayName: firstString(user.displayName, user.title, user.username, user.plexUsername, user.name, verbose ? user.email : undefined),
     username: firstString(user.username, user.plexUsername),
     email: verbose ? user.email : undefined
   });
@@ -601,7 +634,7 @@ function mediaTitle(media) {
 }
 
 function mediaType(media) {
-  return firstString(media?.mediaType, media?.type, media?.mediaInfo?.mediaType)
+  return firstString(media?.mediaType, media?.type, media?.mediaInfo?.mediaType, media?.metadata?.type)
     || (media?.tvdbId ? "tv" : undefined)
     || (media?.tmdbId ? "movie" : undefined);
 }
@@ -611,12 +644,17 @@ function plexRatingKey(media) {
 }
 
 function summarizeIssueComment(comment, verbose = false) {
+  if (!comment) {
+    return undefined;
+  }
   return compactObject({
     id: comment.id,
     message: comment.message,
     reporter: summarizeUser(comment.user ?? comment.createdBy, verbose),
-    createdAt: comment.createdAt,
-    updatedAt: comment.updatedAt
+    createdAt: comment.createdAt ?? comment.date,
+    updatedAt: comment.updatedAt,
+    rawStatus: verbose ? comment.status : undefined,
+    raw: verbose ? comment : undefined
   });
 }
 
@@ -630,6 +668,7 @@ function summarizeSeerrIssue(issue, verbose = false) {
     category: issueTypeName(issue.issueType ?? issue.type),
     status: seerrIssueStatus(issue),
     subject: firstString(issue.subject, issue.message, comments[0]?.message),
+    message: firstString(issue.message, comments[0]?.message),
     reporter: summarizeUser(issue.createdBy ?? issue.user ?? issue.reportedBy, verbose),
     modifiedBy: summarizeUser(issue.modifiedBy, verbose),
     mediaTitle: mediaTitle(media),
@@ -649,7 +688,197 @@ function summarizeSeerrIssue(issue, verbose = false) {
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
     resolvedAt: issue.resolvedAt,
-    rawStatus: verbose ? issue.status : undefined
+    rawStatus: verbose ? issue.status : undefined,
+    raw: verbose ? issue : undefined
+  });
+}
+
+function summarizePlexUser(user, verbose = false) {
+  if (!user) {
+    return undefined;
+  }
+  return compactObject({
+    id: user.id,
+    displayName: firstString(user.displayName, user.username),
+    username: user.username,
+    avatar: verbose ? user.avatar : undefined,
+    isMuted: verbose ? user.isMuted : undefined,
+    isBlocked: verbose ? user.isBlocked : undefined,
+    isHidden: verbose ? user.isHidden : undefined
+  });
+}
+
+function parsePlexSourceUri(value) {
+  if (!value || typeof value !== "string") {
+    return {};
+  }
+  try {
+    const url = new URL(value);
+    const protocol = url.protocol.toLowerCase();
+    if (protocol === "server:" || protocol === "provider:") {
+      const rawParts = decodeURIComponent(url.pathname || "")
+        .replace(/^\/+|\/+$/g, "")
+        .split("/")
+        .filter(Boolean);
+      const providerIdentifier = protocol === "server:" ? rawParts.shift() : url.host;
+      const key = rawParts.length ? `/${rawParts.join("/")}` : undefined;
+      const ratingKey = key?.match(/\/library\/metadata\/([^/?#]+)/)?.[1] || rawParts.at(-1);
+      return compactObject({
+        sourceUri: value,
+        isServer: protocol === "server:",
+        serverIdentifier: protocol === "server:" ? url.host : undefined,
+        providerIdentifier,
+        key,
+        ratingKey
+      });
+    }
+    if (protocol === "http:" || protocol === "https:") {
+      const hash = url.hash.replace(/^#!/, "").replace(/^#/, "");
+      const [hashPath, hashQuery = ""] = hash.split("?");
+      const params = new URLSearchParams(hashQuery);
+      const key = params.get("key") || params.get("metadataKey") || undefined;
+      const serverIdentifier = hashPath.match(/\/server\/([^/?#]+)/)?.[1];
+      const providerIdentifier = hashPath.match(/\/provider\/([^/?#]+)/)?.[1];
+      return compactObject({
+        sourceUri: value,
+        isServer: Boolean(serverIdentifier),
+        serverIdentifier,
+        providerIdentifier,
+        key,
+        ratingKey: key?.match(/\/library\/metadata\/([^/?#]+)/)?.[1]
+      });
+    }
+  } catch {
+    const ratingKey = value.match(/\/library\/metadata\/([^/?#]+)/)?.[1];
+    return compactObject({ sourceUri: value, ratingKey });
+  }
+  return compactObject({
+    sourceUri: value,
+    ratingKey: value.match(/\/library\/metadata\/([^/?#]+)/)?.[1]
+  });
+}
+
+function plexMetadataItem(body) {
+  const records = body?.MediaContainer?.Metadata;
+  return Array.isArray(records) ? records[0] : undefined;
+}
+
+function plexMetadataDisplayTitle(item) {
+  if (!item) {
+    return undefined;
+  }
+  if (item.type === "episode" && item.grandparentTitle && item.title) {
+    return `${item.grandparentTitle} - ${item.title}`;
+  }
+  if (item.type === "season" && item.parentTitle && item.title) {
+    return `${item.parentTitle} - ${item.title}`;
+  }
+  return firstString(item.title, item.grandparentTitle, item.parentTitle);
+}
+
+function plexMediaTypeName(type) {
+  if (["show", "season", "episode"].includes(type)) {
+    return "tv";
+  }
+  if (type === "movie") {
+    return "movie";
+  }
+  return type;
+}
+
+function summarizePlexMetadata(body) {
+  const item = plexMetadataItem(body);
+  if (!item) {
+    return undefined;
+  }
+  return compactObject({
+    ratingKey: item.ratingKey,
+    key: item.key,
+    guid: item.guid,
+    type: item.type,
+    mediaType: plexMediaTypeName(item.type),
+    title: plexMetadataDisplayTitle(item),
+    itemTitle: item.title,
+    parentTitle: item.parentTitle,
+    grandparentTitle: item.grandparentTitle,
+    parentRatingKey: item.parentRatingKey,
+    grandparentRatingKey: item.grandparentRatingKey,
+    librarySectionID: item.librarySectionID,
+    librarySectionTitle: item.librarySectionTitle,
+    year: item.year,
+    index: item.index,
+    parentIndex: item.parentIndex,
+    originallyAvailableAt: item.originallyAvailableAt
+  });
+}
+
+async function plexMetadataForRatingKey(ratingKey) {
+  if (!ratingKey || !configuredServices.plex) {
+    return { configured: Boolean(configuredServices.plex) };
+  }
+  try {
+    const body = await plexApi(`library/metadata/${encodeURIComponent(String(ratingKey))}`);
+    return { configured: true, body, summary: summarizePlexMetadata(body) };
+  } catch (error) {
+    return { configured: true, error: error.message };
+  }
+}
+
+function issueMediaTitle(issue) {
+  return firstString(
+    issue?.mediaTitle,
+    issue?.metadata?.title,
+    mediaTitle(issue?.media ?? issue?.mediaInfo),
+    issue?.subject
+  );
+}
+
+function issueMediaType(issue) {
+  return firstString(issue?.mediaType, issue?.metadata?.mediaType, mediaType(issue?.media ?? issue?.mediaInfo));
+}
+
+function issuePlexRatingKey(issue) {
+  return firstPresent(
+    issue?.plexRatingKey,
+    issue?.ratingKey,
+    issue?.metadata?.ratingKey,
+    plexRatingKey(issue?.media ?? issue?.mediaInfo)
+  );
+}
+
+function summarizePlexReport(report, options = {}) {
+  const verbose = Boolean(options.verbose);
+  const comments = Array.isArray(options.comments) ? options.comments.map(comment => summarizeIssueComment(comment, verbose)) : [];
+  const sourceInfo = options.sourceInfo || parsePlexSourceUri(report.url);
+  const metadata = options.metadata;
+  const metadataSummary = metadata?.summary;
+  const status = "open";
+  const updatedAt = comments.reduce((latest, comment) => {
+    const candidate = comment.updatedAt || comment.createdAt;
+    return candidate && (!latest || candidate > latest) ? candidate : latest;
+  }, report.date);
+  return compactObject({
+    source: "plex",
+    id: String(report.id),
+    type: "other",
+    category: "other",
+    status,
+    subject: firstString(metadataSummary?.title, report.message, comments[0]?.message),
+    message: report.message,
+    reporter: summarizePlexUser(report.user, verbose),
+    mediaTitle: metadataSummary?.title,
+    mediaType: metadataSummary?.mediaType,
+    plexRatingKey: firstPresent(sourceInfo.ratingKey, metadataSummary?.ratingKey),
+    plexGuid: metadataSummary?.guid,
+    sourceUri: sourceInfo.sourceUri ?? report.url,
+    media: verbose ? metadataSummary : undefined,
+    comments,
+    commentCount: report.commentCount,
+    createdAt: report.date,
+    updatedAt,
+    rawStatus: verbose ? status : undefined,
+    raw: verbose ? compactObject({ report, comments: options.comments, sourceInfo, metadata: metadata?.body }) : undefined,
+    warnings: metadata?.error ? [`Plex metadata lookup failed: ${metadata.error}`] : undefined
   });
 }
 
@@ -658,6 +887,13 @@ function seerrIssueMatchesMediaType(issue, desired) {
     return true;
   }
   return mediaType(issue.media ?? issue.mediaInfo) === desired;
+}
+
+function normalizedIssueMatchesMediaType(issue, desired) {
+  if (!desired || desired === "all") {
+    return true;
+  }
+  return issueMediaType(issue) === desired;
 }
 
 function summarizeQueueRecord(record) {
@@ -1883,6 +2119,104 @@ function seerrIssueRecords(body) {
   return Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [];
 }
 
+const plexReportsQuery = `
+  query getReportedIssues($first: PaginationInt!, $after: String) {
+    reports(after: $after, first: $first) {
+      nodes {
+        __typename
+        id
+        message
+        user {
+          id
+          avatar
+          username
+          displayName
+          isMuted
+          isBlocked
+        }
+        url
+        date
+        commentCount
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+const plexReportByIdQuery = `
+  query reportById($id: ID!) {
+    reportByID(id: $id) {
+      __typename
+      commentCount
+      date
+      id
+      user {
+        id
+        avatar
+        username
+        displayName
+        isMuted
+        isBlocked
+      }
+      message
+      url
+    }
+  }
+`;
+
+const plexReportCommentsQuery = `
+  query reportComments($id: ID!, $first: PaginationInt, $after: String, $last: PaginationInt, $before: String) {
+    reportComments(first: $first, after: $after, id: $id, last: $last, before: $before) {
+      nodes {
+        __typename
+        date
+        id
+        message
+        status
+        user {
+          id
+          avatar
+          username
+          displayName
+          isBlocked
+          isMuted
+          isHidden
+        }
+      }
+      pageInfo {
+        endCursor
+        hasNextPage
+        hasPreviousPage
+        startCursor
+      }
+    }
+  }
+`;
+
+const plexCreateReportCommentMutation = `
+  mutation createReportComment($input: CreateReportCommentInput!) {
+    createReportComment(input: $input) {
+      __typename
+      date
+      id
+      message
+      status
+      user {
+        id
+        avatar
+        username
+        displayName
+        isHidden
+        isMuted
+        isBlocked
+      }
+    }
+  }
+`;
+
 async function listSeerrIssues(input) {
   const status = input.status || "open";
   const body = await seerrApi("issue", {
@@ -1911,23 +2245,337 @@ async function getSeerrIssue(issueId, verbose = false) {
   return summarizeSeerrIssue(await seerrApi(`issue/${issueId}`), verbose);
 }
 
-async function plexReportedIssues(input) {
-  if (input.source && !["all", "seerr"].includes(input.source)) {
-    throw new Error(`issue source ${input.source} is not supported`);
+const seerrIssueMessageFields = new Set(["message", "body", "description"]);
+
+// Overseerr/Jellyseerr edit issue descriptions by updating the initial issue comment.
+const seerrIssueUnsupportedFieldReasons = {
+  subject: "Seerr-family issue records do not expose a separate subject/title update field.",
+  issueType: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  type: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  category: "Issue type/category is only accepted on create; Overseerr/Jellyseerr do not expose an issue metadata update route.",
+  status: "Use seerr_resolve_issue or seerr_reopen_issue; Seerr exposes status transitions as dedicated routes.",
+  mediaId: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  media: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  mediaInfo: "Associated media is only accepted on create; Seerr does not expose a safe issue media update route.",
+  tmdbId: "Associated media identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  tvdbId: "Associated media identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  plexRatingKey: "Plex identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  ratingKey: "Plex identifiers belong to the media record and are not issue-editable through the Seerr issue API.",
+  guid: "Media GUIDs belong to the media record and are not issue-editable through the Seerr issue API.",
+  problemSeason: "Problem season is only accepted on create; Seerr does not expose an issue metadata update route.",
+  problemEpisode: "Problem episode is only accepted on create; Seerr does not expose an issue metadata update route."
+};
+
+function normalizeSeerrIssuePatch(input) {
+  const patch = { ...(input.patch || {}) };
+  for (const field of seerrIssueMessageFields) {
+    if (input[field] !== undefined) {
+      patch[field] = input[field];
+    }
   }
-  if (!configuredServices.seerr) {
+
+  const providedEntries = Object.entries(patch).filter(([, value]) => value !== undefined);
+  const contentEntries = providedEntries.filter(([field]) => seerrIssueMessageFields.has(field));
+  const blockers = [];
+  const unsupportedFields = providedEntries
+    .filter(([field]) => !seerrIssueMessageFields.has(field))
+    .map(([field, value]) => ({
+      field,
+      proposedValue: value,
+      reason: seerrIssueUnsupportedFieldReasons[field] || "Seerr-family servers do not expose this field through a safe issue update API."
+    }));
+
+  const invalidContentFields = contentEntries.filter(([, value]) => typeof value !== "string" || !value.trim());
+  for (const [field] of invalidContentFields) {
+    blockers.push({ field, reason: "Issue message/body/description must be a non-empty string." });
+  }
+
+  const contentValues = contentEntries
+    .filter(([, value]) => typeof value === "string" && value.trim())
+    .map(([field, value]) => ({ field, value }));
+  const distinctContentValues = new Set(contentValues.map(({ value }) => value));
+  if (distinctContentValues.size > 1) {
+    blockers.push({
+      field: "message",
+      reason: "message, body, and description are aliases for the same Seerr first-comment field; provide only one value or matching values."
+    });
+  }
+
+  if (!providedEntries.length) {
+    blockers.push({ field: "patch", reason: "Provide at least one issue field to update." });
+  }
+
+  const message = distinctContentValues.size === 1 ? contentValues[0]?.value : undefined;
+  return { patch, message, unsupportedFields, blockers, contentFields: contentValues.map(({ field }) => field) };
+}
+
+function seerrInitialIssueComment(issue) {
+  if (!Array.isArray(issue?.comments) || !issue.comments.length) {
+    return undefined;
+  }
+  return [...issue.comments]
+    .filter(comment => comment?.id !== undefined && comment?.id !== null)
+    .sort((a, b) => {
+      const aTime = Date.parse(a.createdAt ?? a.date ?? "") || 0;
+      const bTime = Date.parse(b.createdAt ?? b.date ?? "") || 0;
+      if (aTime !== bTime) {
+        return aTime - bTime;
+      }
+      return Number(a.id) - Number(b.id);
+    })[0];
+}
+
+function seerrIssueCurrentEditableFields(rawIssue, normalizedIssue, initialComment) {
+  const media = rawIssue.media ?? rawIssue.mediaInfo ?? {};
+  return compactObject({
+    message: initialComment?.message ?? normalizedIssue.message,
+    body: initialComment?.message ?? normalizedIssue.message,
+    description: initialComment?.message ?? normalizedIssue.message,
+    subject: normalizedIssue.subject,
+    status: normalizedIssue.status,
+    issueType: rawIssue.issueType ?? rawIssue.type,
+    type: normalizedIssue.type,
+    category: normalizedIssue.category,
+    mediaId: media.id ?? rawIssue.mediaId,
+    tmdbId: media.tmdbId,
+    tvdbId: media.tvdbId,
+    plexRatingKey: plexRatingKey(media),
+    problemSeason: rawIssue.problemSeason,
+    problemEpisode: rawIssue.problemEpisode
+  });
+}
+
+function seerrIssueProposedFields(patchInfo) {
+  const proposed = {};
+  if (patchInfo.message !== undefined) {
+    proposed.message = patchInfo.message;
+    for (const field of patchInfo.contentFields) {
+      proposed[field] = patchInfo.message;
+    }
+  }
+  for (const unsupported of patchInfo.unsupportedFields) {
+    proposed[unsupported.field] = unsupported.proposedValue;
+  }
+  return proposed;
+}
+
+async function updateSeerrIssue(input) {
+  const issueId = seerrIssueId(input.issueId);
+  const rawIssue = await seerrApi(`issue/${issueId}`);
+  const issue = summarizeSeerrIssue(rawIssue, input.verbose);
+  const initialComment = seerrInitialIssueComment(rawIssue);
+  const patchInfo = normalizeSeerrIssuePatch(input);
+  const blockers = [...patchInfo.blockers];
+  if (patchInfo.unsupportedFields.length) {
+    blockers.push({
+      field: "patch",
+      reason: "Unsupported fields are present. No partial issue update will be applied."
+    });
+  }
+  if (patchInfo.message !== undefined && !initialComment) {
+    blockers.push({
+      field: "message",
+      reason: "The issue has no editable initial comment to represent its description."
+    });
+  }
+
+  const endpoint = initialComment
+    ? {
+      method: "PUT",
+      path: "/api/v1/issueComment/{commentId}",
+      resolvedPath: `/api/v1/issueComment/${initialComment.id}`,
+      action: "update first issue comment message"
+    }
+    : undefined;
+  const base = {
+    dryRun: input.dryRun !== false,
+    supported: blockers.length === 0,
+    applied: false,
+    issueId,
+    endpoint,
+    current: seerrIssueCurrentEditableFields(rawIssue, issue, initialComment),
+    proposed: seerrIssueProposedFields(patchInfo),
+    unsupportedFields: patchInfo.unsupportedFields.length ? patchInfo.unsupportedFields : undefined,
+    blockers: blockers.length ? blockers : undefined,
+    issue
+  };
+
+  if (base.dryRun || blockers.length) {
+    return base;
+  }
+
+  const comment = await seerrApi(`issueComment/${initialComment.id}`, {
+    method: "PUT",
+    body: { message: patchInfo.message }
+  });
+  return {
+    ...base,
+    dryRun: false,
+    applied: true,
+    updatedComment: summarizeIssueComment(comment, input.verbose),
+    issue: await getSeerrIssue(issueId, input.verbose)
+  };
+}
+
+async function listPlexReportNodes(input) {
+  const take = Math.max(1, Math.min(Number(input.take || 50), 100));
+  const skip = Math.max(0, Number(input.skip || 0));
+  const needed = take + skip;
+  const nodes = [];
+  let after;
+  let pageInfo = {};
+  while (nodes.length < needed) {
+    const first = Math.min(100, needed - nodes.length);
+    const data = await plexCommunityGraphql(plexReportsQuery, { first, after }, "getReportedIssues");
+    const reports = data?.reports;
+    const pageNodes = Array.isArray(reports?.nodes) ? reports.nodes : [];
+    pageInfo = reports?.pageInfo || {};
+    nodes.push(...pageNodes);
+    if (!pageInfo.hasNextPage || !pageInfo.endCursor || pageNodes.length === 0) {
+      break;
+    }
+    after = pageInfo.endCursor;
+  }
+  return {
+    nodes: nodes.slice(skip, skip + take),
+    fetched: nodes.length,
+    pageInfo
+  };
+}
+
+async function summarizePlexReports(reports, input, commentsById = new Map()) {
+  const records = await Promise.all(reports.map(async report => {
+    const sourceInfo = parsePlexSourceUri(report.url);
+    const metadata = await plexMetadataForRatingKey(sourceInfo.ratingKey);
+    return summarizePlexReport(report, {
+      verbose: input.verbose,
+      comments: commentsById.get(String(report.id)) || [],
+      sourceInfo,
+      metadata
+    });
+  }));
+  return records.filter(issue => normalizedIssueMatchesMediaType(issue, input.mediaType));
+}
+
+async function listPlexIssues(input) {
+  const status = input.status || "open";
+  if (status === "resolved") {
     return {
-      sources: [],
-      records: [],
+      source: "plex",
+      status,
+      mediaType: input.mediaType || "all",
+      total: 0,
       returned: 0,
-      note: "Seerr-family issue source is not configured"
+      records: [],
+      note: "Plex native reports do not expose resolved/closed state through the discovered Plex Web community API"
     };
   }
-  const issues = await listSeerrIssues(input);
-  return {
-    sources: ["seerr"],
-    ...issues
-  };
+  const page = await listPlexReportNodes(input);
+  const records = await summarizePlexReports(page.nodes, input);
+  return compactObject({
+    source: "plex",
+    status,
+    mediaType: input.mediaType || "all",
+    pageInfo: page.pageInfo,
+    total: page.fetched,
+    returned: records.length,
+    records
+  });
+}
+
+async function getPlexReportComments(issueId, limit = 250) {
+  const comments = [];
+  let after;
+  let pageInfo = {};
+  while (comments.length < limit) {
+    const first = Math.min(100, limit - comments.length);
+    const data = await plexCommunityGraphql(plexReportCommentsQuery, { id: String(issueId), first, after }, "reportComments");
+    const page = data?.reportComments;
+    const nodes = Array.isArray(page?.nodes) ? page.nodes : [];
+    pageInfo = page?.pageInfo || {};
+    comments.push(...nodes);
+    if (!pageInfo.hasNextPage || !pageInfo.endCursor || nodes.length === 0) {
+      break;
+    }
+    after = pageInfo.endCursor;
+  }
+  return { comments, pageInfo };
+}
+
+async function getPlexIssue(issueId, verbose = false) {
+  const data = await plexCommunityGraphql(plexReportByIdQuery, { id: String(issueId) }, "reportById");
+  const report = data?.reportByID;
+  if (!report) {
+    throw new Error(`Plex native reported issue ${issueId} was not found`);
+  }
+  const { comments } = await getPlexReportComments(issueId);
+  const sourceInfo = parsePlexSourceUri(report.url);
+  const metadata = await plexMetadataForRatingKey(sourceInfo.ratingKey);
+  return summarizePlexReport(report, { verbose, comments, sourceInfo, metadata });
+}
+
+function seerrIssueId(issueId) {
+  const numberId = Number(issueId);
+  if (!Number.isInteger(numberId) || numberId <= 0) {
+    throw new Error(`Seerr issue ID must be a positive integer, got ${issueId}`);
+  }
+  return numberId;
+}
+
+function issueSortDate(issue) {
+  return issue.updatedAt || issue.createdAt || "";
+}
+
+async function plexReportedIssues(input) {
+  if (input.source && !["all", "seerr", "plex"].includes(input.source)) {
+    throw new Error(`issue source ${input.source} is not supported`);
+  }
+  const requestedSource = input.source || "all";
+  const selectedSources = requestedSource === "all" ? ["seerr", "plex"] : [requestedSource];
+  const sources = [];
+  const notes = [];
+  const sourceResults = [];
+  const records = [];
+  const combinedInput = requestedSource === "all"
+    ? { ...input, take: (input.take || 50) + (input.skip || 0), skip: 0 }
+    : input;
+
+  for (const source of selectedSources) {
+    if (!configuredServices[source]) {
+      notes.push(`${source} issue source is not configured`);
+      continue;
+    }
+    const result = source === "seerr" ? await listSeerrIssues(combinedInput) : await listPlexIssues(combinedInput);
+    sources.push(source);
+    sourceResults.push(compactObject({
+      source,
+      total: result.total,
+      returned: result.returned,
+      note: result.note
+    }));
+    records.push(...(result.records || []));
+    if (requestedSource !== "all") {
+      return {
+        sources,
+        ...result,
+        notes: notes.length ? notes : undefined
+      };
+    }
+  }
+
+  const sorted = records.sort((left, right) => issueSortDate(right).localeCompare(issueSortDate(left)));
+  const skip = input.skip || 0;
+  const take = input.take || 50;
+  return compactObject({
+    sources,
+    status: input.status || "open",
+    mediaType: input.mediaType || "all",
+    total: sorted.length,
+    returned: Math.min(take, Math.max(0, sorted.length - skip)),
+    sourceResults,
+    records: sorted.slice(skip, skip + take),
+    notes: notes.length ? notes : undefined
+  });
 }
 
 function tautulliTableRows(data) {
@@ -2178,7 +2826,7 @@ async function tracearrIssueContext(issue) {
   if (!configuredServices.tracearr) {
     return { configured: false };
   }
-  const title = mediaTitle(issue.media ?? issue.mediaInfo);
+  const title = issueMediaTitle(issue);
   try {
     const [streams, violations, history] = await Promise.all([
       tracearrApi("streams", { query: { summary: false } }),
@@ -2193,7 +2841,14 @@ async function tracearrIssueContext(issue) {
       recentHistory: summarizeTracearrHistory(history, 10, title)
     };
   } catch (error) {
-    return { configured: true, error: error.message };
+    const authFailure = /401|403|unauthorized|forbidden/i.test(error.message);
+    return {
+      configured: true,
+      error: error.message,
+      warning: authFailure
+        ? "Tracearr authentication failed; continuing without Tracearr diagnostics"
+        : "Tracearr context unavailable; continuing without Tracearr diagnostics"
+    };
   }
 }
 
@@ -2201,7 +2856,7 @@ async function tautulliIssueContext(issue) {
   if (!configuredServices.tautulli) {
     return { configured: false };
   }
-  const title = mediaTitle(issue.media ?? issue.mediaInfo);
+  const title = issueMediaTitle(issue);
   try {
     const [activity, history] = await Promise.all([
       tautulliApi("get_activity"),
@@ -2217,16 +2872,96 @@ async function tautulliIssueContext(issue) {
   }
 }
 
-async function plexIssueDetails(input) {
-  if (input.source !== "seerr") {
-    throw new Error(`issue source ${input.source} is not supported`);
+function summarizePlexSession(record) {
+  return compactObject({
+    sessionKey: record.sessionKey,
+    ratingKey: record.ratingKey,
+    parentRatingKey: record.parentRatingKey,
+    grandparentRatingKey: record.grandparentRatingKey,
+    title: firstString(record.grandparentTitle, record.title),
+    itemTitle: record.title,
+    type: record.type,
+    user: summarizeUser(record.User),
+    player: record.Player ? compactObject({
+      title: record.Player.title,
+      product: record.Player.product,
+      platform: record.Player.platform,
+      state: record.Player.state,
+      local: record.Player.local
+    }) : undefined,
+    transcode: record.TranscodeSession ? compactObject({
+      key: record.TranscodeSession.key,
+      throttled: record.TranscodeSession.throttled,
+      complete: record.TranscodeSession.complete,
+      videoDecision: record.TranscodeSession.videoDecision,
+      audioDecision: record.TranscodeSession.audioDecision,
+      subtitleDecision: record.TranscodeSession.subtitleDecision,
+      error: record.TranscodeSession.error
+    }) : undefined
+  });
+}
+
+function plexSessionMatchesIssue(record, issue) {
+  const ratingKey = String(issuePlexRatingKey(issue) || "");
+  if (ratingKey && [record.ratingKey, record.parentRatingKey, record.grandparentRatingKey].map(String).includes(ratingKey)) {
+    return true;
   }
-  const rawIssue = await seerrApi(`issue/${input.issueId}`);
-  return {
-    issue: summarizeSeerrIssue(rawIssue, input.verbose),
-    tautulli: await tautulliIssueContext(rawIssue),
-    tracearr: await tracearrIssueContext(rawIssue)
-  };
+  const title = issueMediaTitle(issue);
+  if (!title) {
+    return false;
+  }
+  const sessionTitle = [record.title, record.grandparentTitle, record.parentTitle].filter(Boolean).join(" ").toLowerCase();
+  if (!sessionTitle) {
+    return false;
+  }
+  return sessionTitle.includes(title.toLowerCase()) || title.toLowerCase().includes(sessionTitle);
+}
+
+async function plexIssueContext(issue) {
+  if (!configuredServices.plex) {
+    return { configured: false };
+  }
+  const ratingKey = issuePlexRatingKey(issue);
+  try {
+    const [metadata, sessions] = await Promise.all([
+      plexMetadataForRatingKey(ratingKey),
+      plexApi("status/sessions")
+    ]);
+    const sessionRecords = plexSessionRecords(sessions);
+    return compactObject({
+      configured: true,
+      ratingKey,
+      metadata: metadata.summary,
+      metadataError: metadata.error,
+      activeSessions: sessionRecords.filter(record => plexSessionMatchesIssue(record, issue)).map(summarizePlexSession),
+      activeSessionCount: sessionRecords.length
+    });
+  } catch (error) {
+    return { configured: true, error: error.message };
+  }
+}
+
+async function plexIssueDetails(input) {
+  if (input.source === "seerr") {
+    const rawIssue = await seerrApi(`issue/${seerrIssueId(input.issueId)}`);
+    const issue = summarizeSeerrIssue(rawIssue, input.verbose);
+    return {
+      issue,
+      plex: await plexIssueContext(issue),
+      tautulli: await tautulliIssueContext(issue),
+      tracearr: await tracearrIssueContext(issue)
+    };
+  }
+  if (input.source === "plex") {
+    const issue = await getPlexIssue(input.issueId, input.verbose);
+    return {
+      issue,
+      plex: await plexIssueContext(issue),
+      tautulli: await tautulliIssueContext(issue),
+      tracearr: await tracearrIssueContext(issue)
+    };
+  }
+  throw new Error(`issue source ${input.source} is not supported`);
 }
 
 function arrQueueProblem(record) {
@@ -4110,16 +4845,17 @@ async function updateSeerrRequestStatus(requestId, action, dryRun, verbose = fal
 }
 
 async function commentAndResolveIssue(issueId, message, dryRun, verbose = false) {
+  const id = seerrIssueId(issueId);
   if (dryRun) {
     return {
       dryRun: true,
-      wouldAddComment: { issueId, message },
+      wouldAddComment: { issueId: id, message },
       wouldSetStatus: "resolved",
-      issue: await getSeerrIssue(issueId, verbose)
+      issue: await getSeerrIssue(id, verbose)
     };
   }
-  const commented = await seerrApi(`issue/${issueId}/comment`, { method: "POST", body: { message } });
-  const resolved = await seerrApi(`issue/${issueId}/resolved`, { method: "POST" });
+  const commented = await seerrApi(`issue/${id}/comment`, { method: "POST", body: { message } });
+  const resolved = await seerrApi(`issue/${id}/resolved`, { method: "POST" });
   return {
     dryRun: false,
     commentedIssue: summarizeSeerrIssue(commented, verbose),
@@ -4127,18 +4863,74 @@ async function commentAndResolveIssue(issueId, message, dryRun, verbose = false)
   };
 }
 
-async function diagnoseIssue(source, issueId, verbose = false) {
-  if (source !== "seerr") {
-    throw new Error(`issue source ${source} is not supported`);
+async function addPlexIssueComment(issueId, message, dryRun, verbose = false) {
+  const id = String(issueId);
+  if (dryRun) {
+    return {
+      dryRun: true,
+      wouldAddComment: { issueId: id, message },
+      issue: await getPlexIssue(id, verbose)
+    };
   }
-  const details = await plexIssueDetails({ source, issueId, verbose });
+  const data = await plexCommunityGraphql(
+    plexCreateReportCommentMutation,
+    { input: { report: id, message } },
+    "createReportComment"
+  );
   return {
-    ...details,
-    suggestedActions: [
-      { type: "seerr_add_comment", issueId, message: "Investigated and found a likely fix. Confirm before applying." },
-      { type: "seerr_resolve_issue", issueId }
-    ]
+    dryRun: false,
+    comment: summarizeIssueComment(data?.createReportComment, verbose),
+    issue: await getPlexIssue(id, verbose)
   };
+}
+
+async function updatePlexIssueState(issueId, action, dryRun, verbose = false) {
+  const normalizedAction = {
+    close: "closed",
+    resolve: "resolved",
+    reopen: "open",
+    open: "open",
+    archive: "archived",
+    delete: "deleted",
+    ignore: "ignored"
+  }[action] || action;
+  return {
+    dryRun,
+    applied: false,
+    supported: false,
+    requestedAction: action,
+    wouldSetStatus: normalizedAction,
+    limitation: "The Plex Web community API currently exposes report list/detail/comment operations, but no native report state transition mutation.",
+    issue: await getPlexIssue(issueId, verbose)
+  };
+}
+
+async function diagnoseIssue(source, issueId, verbose = false) {
+  if (source === "seerr") {
+    const id = seerrIssueId(issueId);
+    const details = await plexIssueDetails({ source, issueId: id, verbose });
+    return {
+      ...details,
+      suggestedActions: [
+        { type: "seerr_add_comment", issueId: id, message: "Investigated and found a likely fix. Confirm before applying." },
+        { type: "seerr_resolve_issue", issueId: id }
+      ]
+    };
+  }
+  if (source === "plex") {
+    const id = String(issueId);
+    const details = await plexIssueDetails({ source, issueId: id, verbose });
+    return {
+      ...details,
+      suggestedActions: [
+        { type: "plex_add_reported_issue_comment", issueId: id, message: "Investigated and found a likely cause. Confirm before applying." }
+      ],
+      limitations: [
+        "Plex native reported issues do not expose resolved/closed/reopened state transitions in the discovered Plex Web community API."
+      ]
+    };
+  }
+  throw new Error(`issue source ${source} is not supported`);
 }
 
 async function prowlarrIndexerHealth(limit) {
@@ -4207,7 +4999,15 @@ async function diagnosticsBundle(scope, limit) {
     });
   }
   if (scope === "issues" || scope === "all") {
-    bundle.issues = await serviceResult("seerr", () => plexReportedIssues({ status: "open", source: "seerr", mediaType: "all", take: limit, skip: 0, verbose: false }));
+    if (configuredServices.seerr || configuredServices.plex) {
+      try {
+        bundle.issues = { configured: true, ...(await plexReportedIssues({ status: "open", source: "all", mediaType: "all", take: limit, skip: 0, verbose: false })) };
+      } catch (error) {
+        bundle.issues = { configured: true, error: error.message };
+      }
+    } else {
+      bundle.issues = { configured: false };
+    }
   }
   if (scope === "subtitles" || scope === "all") {
     bundle.subtitles = await serviceResult("bazarr", () => bazarrSubtitleOverview(limit));
@@ -4395,10 +5195,10 @@ function createServer() {
 
   server.registerTool("media_diagnose_issue", {
     title: "Media Diagnose Issue",
-    description: "Diagnose one normalized Seerr-family user-reported issue with optional Plex, Tautulli, and Tracearr context.",
+    description: "Diagnose one normalized Seerr-family or Plex-native user-reported issue with optional Plex, Tautulli, and Tracearr context.",
     inputSchema: {
-      source: z.enum(["seerr"]).default("seerr"),
-      issueId: z.number().int().positive(),
+      source: z.enum(["seerr", "plex"]).default("seerr"),
+      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
       verbose: z.boolean().default(false)
     }
   }, async ({ source, issueId, verbose }) => jsonText(await diagnoseIssue(source, issueId, verbose)));
@@ -4465,7 +5265,7 @@ function createServer() {
     description: "List normalized user-reported Plex/media issues from configured issue sources.",
     inputSchema: {
       status: z.enum(["open", "resolved", "all"]).default("open"),
-      source: z.enum(["all", "seerr"]).default("all"),
+      source: z.enum(["all", "seerr", "plex"]).default("all"),
       take: z.number().int().min(1).max(100).default(50),
       skip: z.number().int().min(0).default(0),
       verbose: z.boolean().default(false)
@@ -4492,11 +5292,35 @@ function createServer() {
     title: "Plex Issue Details",
     description: "Get normalized issue details and optional Tautulli/Tracearr playback context for a reported Plex/media issue.",
     inputSchema: {
-      source: z.enum(["seerr"]).default("seerr"),
-      issueId: z.number().int().positive(),
+      source: z.enum(["seerr", "plex"]).default("seerr"),
+      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
       verbose: z.boolean().default(false)
     }
   }, async (input) => jsonText(await plexIssueDetails(input)));
+
+  server.registerTool("plex_add_reported_issue_comment", {
+    title: "Plex Add Reported Issue Comment",
+    description: "Reply/comment on an exact Plex-native reported issue ID. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
+      message: z.string().min(1),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, message, dryRun, verbose }) => jsonText(await addPlexIssueComment(issueId, message, dryRun, verbose)));
+
+  server.registerTool("plex_update_reported_issue_state", {
+    title: "Plex Update Reported Issue State",
+    description: "Inspect or attempt a Plex-native reported issue state transition. Current Plex Web API discovery reports state transitions as unsupported.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.union([z.number().int().positive(), z.string().min(1)]),
+      action: z.enum(["resolve", "close", "reopen", "open", "archive", "delete", "ignore"]),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ issueId, action, dryRun, verbose }) => jsonText(await updatePlexIssueState(String(issueId), action, dryRun, verbose)));
 
   server.registerTool("tautulli_activity", {
     title: "Tautulli Activity",
@@ -5584,6 +6408,40 @@ function createServer() {
       verbose: z.boolean().default(false)
     }
   }, async ({ issueId, verbose }) => jsonText(await getSeerrIssue(issueId, verbose)));
+
+  server.registerTool("seerr_update_issue", {
+    title: "Seerr Update Issue",
+    description: "Dry-run-first Seerr-family issue metadata update. Only message/body/description is supported, via the first issue comment.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      issueId: z.number().int().positive(),
+      patch: z.object({
+        message: z.string().min(1).optional(),
+        body: z.string().min(1).optional(),
+        description: z.string().min(1).optional(),
+        subject: z.string().min(1).optional(),
+        issueType: z.union([z.string(), z.number()]).optional(),
+        type: z.union([z.string(), z.number()]).optional(),
+        category: z.union([z.string(), z.number()]).optional(),
+        status: z.union([z.string(), z.number()]).optional(),
+        mediaId: z.union([z.string(), z.number()]).optional(),
+        media: z.any().optional(),
+        mediaInfo: z.any().optional(),
+        tmdbId: z.union([z.string(), z.number()]).optional(),
+        tvdbId: z.union([z.string(), z.number()]).optional(),
+        plexRatingKey: z.union([z.string(), z.number()]).optional(),
+        ratingKey: z.union([z.string(), z.number()]).optional(),
+        guid: z.string().optional(),
+        problemSeason: z.union([z.string(), z.number()]).optional(),
+        problemEpisode: z.union([z.string(), z.number()]).optional()
+      }).catchall(z.any()).optional(),
+      message: z.string().min(1).optional(),
+      body: z.string().min(1).optional(),
+      description: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true),
+      verbose: z.boolean().default(false)
+    }
+  }, async (input) => jsonText(await updateSeerrIssue(input)));
 
   server.registerTool("seerr_add_issue_comment", {
     title: "Seerr Add Issue Comment",
