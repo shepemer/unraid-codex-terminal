@@ -13,6 +13,8 @@ function usage() {
   media-issue-agent investigate <snapshot-id> <index> [--force]
   media-issue-agent approve <job-id> [actor]
   media-issue-agent reject <job-id> [actor]
+  media-issue-agent continue <job-id> [actor]
+  media-issue-agent steer <job-id> <message>
   media-issue-agent status`;
 }
 
@@ -74,13 +76,25 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (command === "approve") {
     const jobId = integerArg(argv[1], "job-id");
     const actor = argv[2] || "operator";
-    console.log(redactJson(agent.approve(jobId, actor)));
+    console.log(redactJson(await agent.approve(jobId, actor)));
     return 0;
   }
   if (command === "reject") {
     const jobId = integerArg(argv[1], "job-id");
     const actor = argv[2] || "operator";
     console.log(redactJson(agent.reject(jobId, actor)));
+    return 0;
+  }
+  if (command === "continue") {
+    const jobId = integerArg(argv[1], "job-id");
+    const actor = argv[2] || "operator";
+    console.log(redactJson(await agent.continueJob(jobId, actor)));
+    return 0;
+  }
+  if (command === "steer") {
+    const jobId = integerArg(argv[1], "job-id");
+    const message = argv.slice(2).join(" ");
+    console.log(redactJson(await agent.steerInvestigation(jobId, message, "operator")));
     return 0;
   }
   if (command === "status") {
