@@ -93,6 +93,13 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - a persistent Codex home path mounted to `/codex-home`
    - a persistent state path mounted to `/state`
 
+   The state and Codex home host directories must be writable by the container's `agent` user, which runs as uid/gid `1000`. For the default Unraid template paths:
+
+   ```sh
+   mkdir -p /mnt/user/appdata/media-issue-agent/state /mnt/user/appdata/media-issue-agent/codex
+   chown -R 1000:1000 /mnt/user/appdata/media-issue-agent/state /mnt/user/appdata/media-issue-agent/codex
+   ```
+
    The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`. It is intended to use ChatGPT-managed Codex access, such as a Pro plan, through Codex local authentication. On first start, open the Web UI and use the Codex Auth panel to start a ChatGPT device-login flow. To prepare the mounted Codex home from a trusted shell instead, run:
 
    ```sh
@@ -278,6 +285,8 @@ media-issue-agent status
 ```
 
 Do not mount media libraries, download shares, appdata, Docker sockets, or broad host paths into `media-issue-agent`. It should only need `/state`, `/codex-home`, the internal `media-mcp` URL, and the media MCP bearer token.
+
+The `/state` and `/codex-home` bind mounts must be writable by uid/gid `1000`; otherwise SQLite cannot create `/state/media-issue-agent.sqlite` and Codex cannot refresh ChatGPT auth.
 
 Example media MCP payloads:
 

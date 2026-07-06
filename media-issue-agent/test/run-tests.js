@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, chmod } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -158,6 +158,22 @@ async function testStateTransitions() {
   await rm(dir, { recursive: true, force: true });
 }
 
+async function testDbDirectoryWritablePreflight() {
+  const dir = await tempDir();
+  const lockedDir = path.join(dir, "locked");
+  await mkdir(lockedDir, { recursive: true });
+  await chmod(lockedDir, 0o500);
+  try {
+    await assert.rejects(
+      async () => initDb(path.join(lockedDir, "state.sqlite")),
+      /SQLite state directory is not writable/
+    );
+  } finally {
+    await chmod(lockedDir, 0o700);
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 function testRedaction() {
   const fakeOpenAiToken = "sk-" + "fixturetoken";
   const redacted = redactText(`Bearer abc123 https://internal.example.invalid/path /mnt/user/media/file.mkv ${fakeOpenAiToken}`);
@@ -243,6 +259,7 @@ async function run() {
   testCommentValidation();
   await testAuthConfig();
   await testStateTransitions();
+  await testDbDirectoryWritablePreflight();
   testRedaction();
   await testWebAuthAndApi();
   console.log("media-issue-agent tests passed");
