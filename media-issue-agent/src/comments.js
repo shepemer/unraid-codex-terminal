@@ -1,4 +1,6 @@
 export const AUTOMATED_SUFFIX = "Automated response from Codex.";
+export const CLOSED_MARKER = "Closed.";
+export const REOPENED_MARKER = "Re-opened issue.";
 
 export function countCharacters(value) {
   return [...String(value ?? "")].length;

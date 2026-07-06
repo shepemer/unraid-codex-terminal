@@ -52,7 +52,7 @@ const HTML = `<!doctype html>
         <div class="section-header">
           <div>
             <span class="eyebrow">Triage Queue</span>
-            <h2 id="issues-heading">Open Issues</h2>
+            <h2 id="issues-heading">Issues</h2>
           </div>
           <span id="issue-count" class="badge">0</span>
         </div>
@@ -98,6 +98,7 @@ const HTML = `<!doctype html>
           <h2 id="detail-heading">Investigation</h2>
         </div>
         <div class="toolbar">
+          <button id="reopen-button" type="button" class="secondary hidden">Re-open</button>
           <button id="continue-button" type="button" class="secondary hidden">Continue</button>
           <div id="approval-actions" class="toolbar hidden">
             <button id="approve-button" type="button">Approve</button>
@@ -111,6 +112,24 @@ const HTML = `<!doctype html>
         <button id="steer-button" type="button" class="secondary">Send</button>
       </div>
     </section>
+  </div>
+  <div id="close-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title">
+    <div class="modal-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Manual Closure</span>
+          <h2 id="close-dialog-title">Close Issue</h2>
+        </div>
+      </div>
+      <div class="modal-body">
+        <label for="close-comment">Optional comment</label>
+        <textarea id="close-comment" rows="4" placeholder="Add a note before closing"></textarea>
+      </div>
+      <div class="modal-actions">
+        <button id="close-cancel-button" type="button" class="secondary">Cancel</button>
+        <button id="close-confirm-button" type="button" class="danger">Close Issue</button>
+      </div>
+    </div>
   </div>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
@@ -466,6 +485,14 @@ tbody tr:hover {
   background: color-mix(in srgb, var(--accent-soft) 30%, var(--panel));
 }
 
+tbody tr.issue-closed {
+  background: color-mix(in srgb, var(--success-soft) 42%, var(--panel));
+}
+
+tbody tr.issue-closed:hover {
+  background: color-mix(in srgb, var(--success-soft) 68%, var(--panel));
+}
+
 td {
   max-width: 280px;
   overflow-wrap: anywhere;
@@ -479,7 +506,19 @@ th:first-child {
 
 td:last-child,
 th:last-child {
-  width: 132px;
+  width: 224px;
+}
+
+.issue-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.issue-actions button {
+  min-height: 32px;
+  padding: 0 10px;
 }
 
 .empty {
@@ -623,6 +662,61 @@ pre {
 
 .hidden { display: none; }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.54);
+}
+
+.modal-panel {
+  width: min(520px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.modal-body {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.modal-body label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.modal-body textarea {
+  width: 100%;
+  min-height: 116px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  resize: vertical;
+  padding: 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.modal-backdrop.hidden {
+  display: none;
+}
+
 #toast {
   position: fixed;
   right: 18px;
@@ -719,6 +813,8 @@ const JS = `const state = {
   entries: [],
   jobs: [],
   activeJobId: null,
+  activeEntryIndex: null,
+  closeEntryIndex: null,
   busy: false,
   authOk: false,
   loginRunning: false,
@@ -742,6 +838,7 @@ const el = {
   dryRun: document.getElementById("dry-run"),
   detailHeading: document.getElementById("detail-heading"),
   output: document.getElementById("investigation-output"),
+  reopenButton: document.getElementById("reopen-button"),
   continueButton: document.getElementById("continue-button"),
   approvalActions: document.getElementById("approval-actions"),
   approveButton: document.getElementById("approve-button"),
@@ -749,6 +846,10 @@ const el = {
   steerPanel: document.getElementById("steer-panel"),
   steerInput: document.getElementById("steer-input"),
   steerButton: document.getElementById("steer-button"),
+  closeDialog: document.getElementById("close-dialog"),
+  closeComment: document.getElementById("close-comment"),
+  closeCancelButton: document.getElementById("close-cancel-button"),
+  closeConfirmButton: document.getElementById("close-confirm-button"),
   toast: document.getElementById("toast"),
   themeButtons: [...document.querySelectorAll("[data-theme-choice]")]
 };
@@ -881,6 +982,60 @@ function renderJobs(jobs) {
   \`).join("");
 }
 
+function canReinvestigate(entry) {
+  return Boolean(entry.investigationSummary)
+    && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState);
+}
+
+function isClosedEntry(entry) {
+  return entry?.isClosed === true
+    || entry?.raw?.isClosed === true
+    || entry?.lifecycle === "closed"
+    || entry?.jobState === "closed"
+    || String(entry?.status || "").toLowerCase().includes("closed")
+    || String(entry?.status || "").toLowerCase().includes("resolved");
+}
+
+function canInvestigate(entry) {
+  return !isClosedEntry(entry)
+    && !entry.investigationSummary
+    && (!entry.jobState || ["detected", "queued_for_investigation", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
+}
+
+function issueAction(entry) {
+  if (isClosedEntry(entry)) {
+    return { kind: "summary", label: "View summary" };
+  }
+  if (canReinvestigate(entry)) {
+    return { kind: "investigate", label: "Re-investigate", force: true };
+  }
+  if (canInvestigate(entry)) {
+    return { kind: "investigate", label: "Investigate", force: false };
+  }
+  if (entry.jobId) {
+    return { kind: "open", label: "Open job" };
+  }
+  return { kind: "none", label: "Unavailable" };
+}
+
+function issueActionButton(entry) {
+  const action = issueAction(entry);
+  const closeButton = isClosedEntry(entry)
+    ? ""
+    : \`<button class="secondary" type="button" data-close-issue="\${entry.idx}">Close</button>\`;
+  let primary;
+  if (action.kind === "summary") {
+    primary = \`<button class="secondary" type="button" data-issue-summary="\${entry.idx}">\${action.label}</button>\`;
+  } else if (action.kind === "open") {
+    primary = \`<button class="secondary" type="button" data-open-job="\${escapeHtml(entry.jobId)}">\${action.label}</button>\`;
+  } else if (action.kind === "investigate") {
+    primary = \`<button class="secondary" type="button" data-investigate="\${entry.idx}" data-force="\${action.force ? "true" : "false"}" \${state.authOk ? "" : "disabled"}>\${action.label}</button>\`;
+  } else {
+    primary = \`<button class="secondary" type="button" disabled>\${action.label}</button>\`;
+  }
+  return \`<div class="issue-actions">\${primary}\${closeButton}</div>\`;
+}
+
 function setSteerVisible(visible) {
   el.steerPanel.classList.toggle("hidden", !visible);
   el.steerButton.disabled = !visible || state.busy || !state.authOk;
@@ -915,11 +1070,11 @@ function renderSnapshot(snapshot) {
   el.snapshotMeta.textContent = \`Snapshot \${snapshot.id} · \${snapshot.generatedAt}\`;
   el.issueCount.textContent = String(snapshot.entries.length);
   if (!snapshot.entries.length) {
-    el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No open issues.</td></tr>';
+    el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No issues.</td></tr>';
     return;
   }
   el.issueRows.innerHTML = snapshot.entries.map(entry => \`
-    <tr data-entry-index="\${entry.idx}">
+    <tr data-entry-index="\${entry.idx}" class="\${isClosedEntry(entry) ? "issue-closed" : ""}">
       <td>\${entry.idx}</td>
       <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
       <td>\${escapeHtml(entry.issueId)}</td>
@@ -928,7 +1083,7 @@ function renderSnapshot(snapshot) {
       <td>\${escapeHtml(entry.mediaTitle)}</td>
       <td><span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span></td>
       <td>\${escapeHtml(entry.description)}</td>
-      <td><button class="secondary" type="button" data-investigate="\${entry.idx}" \${state.authOk ? "" : "disabled"}>\${entry.investigationSummary ? "Re-investigate" : "Investigate"}</button></td>
+      <td>\${issueActionButton(entry)}</td>
     </tr>
   \`).join("");
 }
@@ -936,8 +1091,18 @@ function renderSnapshot(snapshot) {
 function showEntry(index) {
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   if (!entry) return;
+  state.activeEntryIndex = Number(index);
+  if (isClosedEntry(entry)) {
+    showIssueSummary(index);
+    return;
+  }
+  if (issueAction(entry).kind === "open") {
+    showJob(entry.jobId);
+    return;
+  }
   state.activeJobId = entry.jobId || null;
   el.detailHeading.textContent = "Investigation";
+  el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   setSteerVisible(Boolean(entry.jobId) && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
   if (entry.investigationSummary) {
@@ -1039,11 +1204,13 @@ function startJobPolling() {
 
 async function showJob(jobId, options = {}) {
   state.activeJobId = Number(jobId);
+  state.activeEntryIndex = null;
   el.detailHeading.textContent = "Job Detail";
   if (!options.quiet) {
     el.output.textContent = "Loading job detail...";
   }
   el.approvalActions.classList.add("hidden");
+  el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   try {
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
@@ -1073,6 +1240,26 @@ async function refresh() {
   renderSnapshot(snapshot.snapshot);
   renderJobs(jobs.jobs);
   scheduleAuthRefresh();
+}
+
+async function showIssueSummary(index) {
+  state.activeEntryIndex = Number(index);
+  const entry = state.entries.find(row => Number(row.idx) === Number(index));
+  state.activeJobId = entry?.jobId || null;
+  el.detailHeading.textContent = "Issue Summary";
+  el.approvalActions.classList.add("hidden");
+  el.continueButton.classList.add("hidden");
+  setSteerVisible(false);
+  el.reopenButton.classList.toggle("hidden", !entry || !isClosedEntry(entry));
+  el.output.textContent = "Loading issue summary...";
+  try {
+    const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/summary\`);
+    el.output.textContent = result.summary;
+    el.reopenButton.classList.toggle("hidden", !result.closed);
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  }
 }
 
 function scheduleAuthRefresh() {
@@ -1111,6 +1298,63 @@ async function poll() {
   }
 }
 
+function openCloseDialog(index) {
+  state.closeEntryIndex = Number(index);
+  el.closeComment.value = "";
+  el.closeDialog.classList.remove("hidden");
+  el.closeComment.focus();
+}
+
+function closeCloseDialog() {
+  state.closeEntryIndex = null;
+  el.closeDialog.classList.add("hidden");
+  el.closeComment.value = "";
+}
+
+async function closeIssueFromDialog() {
+  if (!state.snapshotId || !state.closeEntryIndex) return;
+  const index = state.closeEntryIndex;
+  const comment = el.closeComment.value;
+  setBusy(true);
+  try {
+    const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/close\`, {
+      method: "POST",
+      body: JSON.stringify({ comment })
+    });
+    closeCloseDialog();
+    toast("Issue closed");
+    await refresh();
+    el.output.textContent = formatJson(result.result);
+    await showIssueSummary(index);
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function reopenIssue() {
+  if (!state.snapshotId || !state.activeEntryIndex) return;
+  const index = state.activeEntryIndex;
+  setBusy(true);
+  try {
+    const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/reopen\`, {
+      method: "POST",
+      body: "{}"
+    });
+    toast("Issue re-opened");
+    await refresh();
+    el.output.textContent = formatJson(result.result);
+    showEntry(index);
+  } catch (error) {
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function investigate(index, force = false) {
   if (!state.snapshotId) return;
   setBusy(true);
@@ -1126,6 +1370,7 @@ async function investigate(index, force = false) {
     el.approvalActions.classList.toggle("hidden", !result.result.approvalId);
     toast(\`Job \${state.activeJobId} ready\`);
     await refresh();
+    await showJob(state.activeJobId);
   } catch (error) {
     el.output.textContent = error.message;
     toast(error.message);
@@ -1213,9 +1458,24 @@ for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
 el.issueRows.addEventListener("click", event => {
+  const summaryButton = event.target.closest("[data-issue-summary]");
+  if (summaryButton) {
+    showIssueSummary(Number(summaryButton.dataset.issueSummary));
+    return;
+  }
+  const closeButton = event.target.closest("[data-close-issue]");
+  if (closeButton) {
+    openCloseDialog(Number(closeButton.dataset.closeIssue));
+    return;
+  }
+  const openButton = event.target.closest("[data-open-job]");
+  if (openButton) {
+    showJob(Number(openButton.dataset.openJob));
+    return;
+  }
   const button = event.target.closest("[data-investigate]");
   if (button) {
-    investigate(Number(button.dataset.investigate), true);
+    investigate(Number(button.dataset.investigate), button.dataset.force === "true");
     return;
   }
   const row = event.target.closest("[data-entry-index]");
@@ -1225,11 +1485,19 @@ el.issueRows.addEventListener("click", event => {
 });
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
+el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
 el.steerButton.addEventListener("click", steerInvestigation);
 el.steerInput.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     steerInvestigation();
+  }
+});
+el.closeCancelButton.addEventListener("click", closeCloseDialog);
+el.closeConfirmButton.addEventListener("click", closeIssueFromDialog);
+el.closeDialog.addEventListener("click", event => {
+  if (event.target === el.closeDialog) {
+    closeCloseDialog();
   }
 });
 el.jobList.addEventListener("click", event => {
@@ -1449,6 +1717,27 @@ export function createWebHandler(agent, config) {
         sendJson(res, 200, { ok: true, result: await agent.investigate(Number(body.snapshotId), Number(body.index), {
           force: Boolean(body.force)
         }) });
+        return;
+      }
+      const issueSummaryMatch = url.pathname.match(/^\/api\/issues\/(\d+)\/(\d+)\/summary$/);
+      if (req.method === "GET" && issueSummaryMatch) {
+        const [, snapshotId, index] = issueSummaryMatch;
+        const result = await agent.issueSummary(Number(snapshotId), Number(index));
+        sendJson(res, 200, { ok: true, ...result });
+        return;
+      }
+      const issueCloseMatch = url.pathname.match(/^\/api\/issues\/(\d+)\/(\d+)\/close$/);
+      if (req.method === "POST" && issueCloseMatch) {
+        const body = await readJson(req);
+        const [, snapshotId, index] = issueCloseMatch;
+        sendJson(res, 200, { ok: true, result: await agent.closeIssue(Number(snapshotId), Number(index), body.comment || "", "web") });
+        return;
+      }
+      const issueReopenMatch = url.pathname.match(/^\/api\/issues\/(\d+)\/(\d+)\/reopen$/);
+      if (req.method === "POST" && issueReopenMatch) {
+        await readJson(req);
+        const [, snapshotId, index] = issueReopenMatch;
+        sendJson(res, 200, { ok: true, result: await agent.reopenIssue(Number(snapshotId), Number(index), "web") });
         return;
       }
       const approvalMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/(approve|reject)$/);

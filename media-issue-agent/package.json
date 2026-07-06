@@ -9,10 +9,16 @@
   },
   "scripts": {
     "check": "node --check src/*.js test/*.js",
-    "test": "node test/run-tests.js",
+    "test": "node test/run-tests.js && node test/comprehensive-tests.js",
+    "test:comprehensive": "node test/comprehensive-tests.js",
+    "test:web": "node test/web-e2e.js",
+    "sil": "node test/sil-runner.js",
     "start": "node src/cli.js serve"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
   }
 }

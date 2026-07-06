@@ -1,5 +1,5 @@
 import { MediaMcpClient } from "./mcp-client.js";
-import { filterOpenIssues, issueTableMarkdown } from "./issues.js";
+import { issueQueue, issueTableMarkdown } from "./issues.js";
 import {
   createApproval,
   createPlannedAction,
@@ -17,6 +17,7 @@ import {
   pendingApprovalForJobAnyKind,
   recordAudit,
   setPendingApprovals,
+  setJobState,
   snapshotEntries,
   snapshotEntry,
   statusSummary,
@@ -26,7 +27,7 @@ import {
 } from "./db.js";
 import { commentDraftPrompt, investigationPrompt, runCodex, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
-import { AUTOMATED_SUFFIX, validateDraftComment } from "./comments.js";
+import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
 
 function sleep(ms) {
@@ -102,6 +103,78 @@ function closeActionsFor(source, issueId, message) {
   throw new Error(`Unsupported issue source ${source}`);
 }
 
+function directCloseActionsFor(source, issueId, comment = "") {
+  const trimmed = String(comment || "").trim();
+  if (source === "plex") {
+    return [
+      ...(trimmed ? [{ toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: trimmed, dryRun: false, verbose: false } }] : []),
+      { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: CLOSED_MARKER, dryRun: false, verbose: false } }
+    ];
+  }
+  if (source === "seerr") {
+    return [
+      ...(trimmed ? [{ toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message: trimmed, dryRun: false, verbose: false } }] : []),
+      { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message: CLOSED_MARKER, dryRun: false, verbose: false } },
+      { toolName: "seerr_resolve_issue", args: { issueId: Number(issueId), dryRun: false, verbose: false } }
+    ];
+  }
+  throw new Error(`Unsupported issue source ${source}`);
+}
+
+function reopenActionsFor(source, issueId) {
+  if (source === "plex") {
+    return [
+      { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: REOPENED_MARKER, dryRun: false, verbose: false } }
+    ];
+  }
+  if (source === "seerr") {
+    return [
+      { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message: REOPENED_MARKER, dryRun: false, verbose: false } },
+      { toolName: "seerr_reopen_issue", args: { issueId: Number(issueId), dryRun: false, verbose: false } }
+    ];
+  }
+  throw new Error(`Unsupported issue source ${source}`);
+}
+
+function validateOperatorComment(source, comment) {
+  const trimmed = String(comment || "").trim();
+  if (source === "plex" && countCharacters(trimmed) > 300) {
+    throw new Error(`Plex-native comments must be 300 characters or fewer; got ${countCharacters(trimmed)}.`);
+  }
+  return trimmed;
+}
+
+function commentsFromDetails(details) {
+  const issue = details?.issue || details || {};
+  return Array.isArray(issue.comments) ? issue.comments : [];
+}
+
+function entryIsClosed(entry) {
+  const status = String(entry?.status || "").toLowerCase();
+  return Boolean(entry?.raw?.isClosed)
+    || entry?.jobState === "closed"
+    || status === "closed"
+    || status === "resolved"
+    || status.includes("closed")
+    || status.includes("resolved");
+}
+
+function supersedeAllPendingApprovals(dbPath, jobId) {
+  supersedePendingApprovals(dbPath, jobId, "action");
+  supersedePendingApprovals(dbPath, jobId, "resolution");
+}
+
+function commentSummary(comments) {
+  if (!comments.length) {
+    return "No comments are available from the issue source.";
+  }
+  return comments.slice(-8).map(comment => {
+    const date = comment.createdAt || comment.updatedAt || comment.date || "unknown time";
+    const message = String(comment.message || "").trim() || "(empty comment)";
+    return `- ${date}: ${message}`;
+  }).join("\n");
+}
+
 export class MediaIssueAgent {
   constructor(config, client = new MediaMcpClient(config)) {
     this.config = config;
@@ -115,23 +188,30 @@ export class MediaIssueAgent {
   async pollOnce() {
     await this.init();
     const listed = await this.client.callTool("plex_reported_issues", {
-      status: "open",
+      status: "all",
       source: "all",
       take: 100,
       skip: 0,
       verbose: false
     });
     const records = Array.isArray(listed?.records) ? listed.records : [];
-    const openIssues = await filterOpenIssues(records, this.client);
-    const markdown = issueTableMarkdown(openIssues);
-    const snapshot = insertSnapshot(this.config.dbPath, markdown, openIssues);
-    for (const issue of openIssues) {
+    const issues = await issueQueue(records, this.client);
+    const markdown = issueTableMarkdown(issues);
+    const snapshot = insertSnapshot(this.config.dbPath, markdown, issues);
+    for (const issue of issues) {
       const job = ensureJob(this.config.dbPath, issue.source, issue.issueId);
+      if (issue.isClosed && job.state !== "closed") {
+        setJobState(this.config.dbPath, job.id, "closed");
+      } else if (!issue.isClosed && job.state === "closed") {
+        setJobState(this.config.dbPath, job.id, "detected");
+      }
       recordAudit(this.config.dbPath, "issue_seen", sanitizeValue(issue), job.id);
     }
     return {
       snapshotId: snapshot.id,
-      issueCount: openIssues.length,
+      issueCount: issues.length,
+      openIssueCount: issues.filter(issue => !issue.isClosed).length,
+      closedIssueCount: issues.filter(issue => issue.isClosed).length,
       markdown
     };
   }
@@ -177,6 +257,134 @@ export class MediaIssueAgent {
 
   async codexAuthStatus() {
     return inspectCodexAuth(this.config.codexHome);
+  }
+
+  async issueSummary(snapshotId, index) {
+    await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) {
+      throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
+    }
+    const details = await this.client.callTool("plex_issue_details", {
+      source: entry.source,
+      issueId: entry.issueId,
+      verbose: false
+    });
+    const comments = commentsFromDetails(details);
+    const jobDetail = entry.jobId ? readJobDetails(this.config.dbPath, entry.jobId) : null;
+    const significantAudit = (jobDetail?.auditEvents || []).filter(event => event.eventType !== "issue_seen");
+    const hasLocalHistory = Boolean(jobDetail?.investigation)
+      || Boolean(jobDetail?.plannedActions?.length)
+      || Boolean(jobDetail?.approvals?.length)
+      || significantAudit.length > 0;
+    const lines = [
+      `${entry.source} issue ${entry.issueId}`,
+      `Status: ${entry.status || "unknown"}`,
+      `Media/title: ${entry.mediaTitle || "(unknown)"}`,
+      `Reporter: ${entry.reporter || "(unknown)"}`
+    ];
+    if (hasLocalHistory) {
+      lines.push("", "Local workflow history:");
+      if (jobDetail?.job) {
+        lines.push(`- Job ${jobDetail.job.id}: ${jobDetail.job.state}`);
+      }
+      if (jobDetail?.investigation?.summary) {
+        lines.push("", "Investigation:", jobDetail.investigation.summary);
+      }
+      if (jobDetail?.plannedActions?.length) {
+        lines.push("", "Actions:");
+        for (const action of jobDetail.plannedActions.slice(0, 8)) {
+          lines.push(`- ${action.toolName}: ${action.executedAt ? "executed" : "planned"}`);
+        }
+      }
+      if (significantAudit.length) {
+        lines.push("", "Recent activity:");
+        for (const event of significantAudit.slice(0, 8)) {
+          lines.push(`- ${event.createdAt} ${event.eventType}`);
+        }
+      }
+    } else {
+      lines.push("", "No local workflow history exists. Summary derived from issue comments:", commentSummary(comments));
+    }
+    return {
+      snapshotId,
+      index,
+      issue: sanitizeValue(entry),
+      closed: entryIsClosed(entry),
+      summary: lines.join("\n")
+    };
+  }
+
+  async runIssueActions(jobId, actions, auditPrefix, actor) {
+    const results = [];
+    for (const action of actions) {
+      const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, auditPrefix);
+      recordAudit(this.config.dbPath, `${auditPrefix}_action_started`, sanitizeValue({ actor, action: planned }), jobId);
+      const result = await this.client.callTool(action.toolName, action.args);
+      const sanitized = sanitizeValue(result);
+      markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
+      results.push({ action: planned, result: sanitized });
+    }
+    return results;
+  }
+
+  async closeIssue(snapshotId, index, comment = "", actor = "operator") {
+    await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) {
+      throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
+    }
+    if (entryIsClosed(entry)) {
+      throw new Error(`Issue ${entry.source} ${entry.issueId} is already closed`);
+    }
+    const message = validateOperatorComment(entry.source, comment);
+    const job = ensureJob(this.config.dbPath, entry.source, entry.issueId);
+    supersedeAllPendingApprovals(this.config.dbPath, job.id);
+    recordAudit(this.config.dbPath, "direct_close_requested", sanitizeValue({ actor, commentProvided: Boolean(message) }), job.id);
+    try {
+      const results = await this.runIssueActions(job.id, directCloseActionsFor(entry.source, entry.issueId, message), "direct_close", actor);
+      setJobState(this.config.dbPath, job.id, "closed");
+      recordAudit(this.config.dbPath, "direct_close_completed", sanitizeValue({ actor, results }), job.id);
+      return {
+        jobId: job.id,
+        status: "closed",
+        results
+      };
+    } catch (error) {
+      const messageText = redactText(error.message);
+      setJobState(this.config.dbPath, job.id, "failed_retryable", messageText);
+      recordAudit(this.config.dbPath, "direct_close_failed", sanitizeValue({ actor, error: error.message }), job.id);
+      throw error;
+    }
+  }
+
+  async reopenIssue(snapshotId, index, actor = "operator") {
+    await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) {
+      throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
+    }
+    if (!entryIsClosed(entry)) {
+      throw new Error(`Issue ${entry.source} ${entry.issueId} is already open`);
+    }
+    const job = ensureJob(this.config.dbPath, entry.source, entry.issueId);
+    supersedeAllPendingApprovals(this.config.dbPath, job.id);
+    recordAudit(this.config.dbPath, "reopen_requested", sanitizeValue({ actor }), job.id);
+    try {
+      const results = await this.runIssueActions(job.id, reopenActionsFor(entry.source, entry.issueId), "reopen", actor);
+      setJobState(this.config.dbPath, job.id, "detected");
+      recordAudit(this.config.dbPath, "reopen_completed", sanitizeValue({ actor, results }), job.id);
+      return {
+        jobId: job.id,
+        status: "open",
+        results
+      };
+    } catch (error) {
+      const messageText = redactText(error.message);
+      setJobState(this.config.dbPath, job.id, "failed_retryable", messageText);
+      recordAudit(this.config.dbPath, "reopen_failed", sanitizeValue({ actor, error: error.message }), job.id);
+      throw error;
+    }
   }
 
   async investigate(snapshotId, index, options = {}) {
@@ -258,7 +466,6 @@ export class MediaIssueAgent {
 
   async steerInvestigation(jobId, message, actor = "operator") {
     await this.init();
-    await validateCodexHome(this.config.codexHome);
     const job = jobForId(this.config.dbPath, jobId);
     if (!job) {
       throw new Error(`Job ${jobId} was not found`);
@@ -271,6 +478,15 @@ export class MediaIssueAgent {
     if (!operatorMessage) {
       throw new Error("Steering message is required");
     }
+    const allowedStates = new Set([
+      "awaiting_action_approval",
+      "failed_retryable",
+      "blocked_needs_human"
+    ]);
+    if (!allowedStates.has(job.state)) {
+      throw new Error(`Cannot transition job ${jobId} from ${job.state} to investigating`);
+    }
+    await validateCodexHome(this.config.codexHome);
     transitionJob(this.config.dbPath, jobId, [
       "awaiting_action_approval",
       "failed_retryable",
@@ -467,7 +683,7 @@ export class MediaIssueAgent {
     for (;;) {
       try {
         const result = await this.pollOnce();
-        log(`media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.issueCount} open issues`);
+        log(`media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.openIssueCount} open and ${result.closedIssueCount} closed issues`);
       } catch (error) {
         log(`media-issue-agent: poll failed: ${error.message}`);
       }
