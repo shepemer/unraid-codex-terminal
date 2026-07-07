@@ -395,18 +395,27 @@ async function testFullBrowserWorkflow(browser) {
     const page = pageHandle.page;
 
     await expect(page.locator("#codex-settings-panel")).toBeVisible();
+    const topbarHeight = await page.locator(".topbar").evaluate(node => node.getBoundingClientRect().height);
+    assert.ok(topbarHeight <= 76, `topbar too tall: ${topbarHeight}`);
     await page.locator("#codex-model").fill("gpt-5");
     await page.locator("#codex-reasoning").selectOption("high");
     await page.locator("#codex-fast-mode").setChecked(false);
     await page.locator("#codex-service-tier").fill("");
+    await page.locator("#repair-context-button").click();
+    await expect(page.locator("#repair-context-dialog")).toBeVisible();
     await page.locator("#codex-repair-context").fill("Prefer exact IDs in browser tests.");
-    await page.locator("#codex-settings-save").click();
+    await page.locator("#repair-context-save-button").click();
     await expect(page.locator("#toast")).toContainText("Codex settings saved");
+    await expect(page.locator("#repair-context-dialog")).toBeHidden();
     await page.getByRole("button", { name: "Reload" }).click();
     await expect(page.locator("#codex-model")).toHaveValue("gpt-5");
     await expect(page.locator("#codex-reasoning")).toHaveValue("high");
     await expect(page.locator("#codex-fast-mode")).not.toBeChecked();
+    await expect(page.locator("#repair-context-button")).toHaveText("Context Set");
+    await page.locator("#repair-context-button").click();
     await expect(page.locator("#codex-repair-context")).toHaveValue("Prefer exact IDs in browser tests.");
+    await page.locator("#repair-context-cancel-button").click();
+    await expect(page.locator("#repair-context-dialog")).toBeHidden();
 
     await page.getByRole("button", { name: "Poll Now" }).click();
     await expect(row(page, 1)).toContainText("Browser Flow Fixture");
@@ -418,6 +427,8 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    await expect(page.locator("#investigation-output")).toContainText("Action summary");
+    await expect(page.locator("#investigation-output")).toContainText("Full repair context");
     await expect(page.locator("#detail-processing")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
     assert.equal(await codexInvocationCount(harness.codexLogPath), 1);
@@ -431,6 +442,7 @@ async function testFullBrowserWorkflow(browser) {
     await page.locator("#steer-button").click();
     await expect(page.locator("#investigation-output")).toContainText("Revised investigation");
     await expect(page.locator("#investigation-output")).toContainText("Pending action approval");
+    await expect(page.locator("#investigation-output")).toContainText("No server-side repair will run");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 3);
 
     await page.locator("#approve-button").click();

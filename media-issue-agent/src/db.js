@@ -491,6 +491,28 @@ LIMIT 1;
   }))[0] || null;
 }
 
+export function recoverInterruptedAgentRuns(dbPath, message = "Media issue agent restarted while repair was running. Retry the repair from the job detail pane.") {
+  const runs = sqliteExec(dbPath, sql`
+SELECT id, job_id AS jobId
+FROM agent_runs
+WHERE status = 'running';
+`, { json: true });
+  for (const run of runs) {
+    completeAgentRun(dbPath, run.id, "failed_retryable", null, message);
+    recordAgentRunEvent(dbPath, run.id, run.jobId, "repair_recovered_after_restart", { error: message });
+    recordAudit(dbPath, "interrupted_repair_run_recovered", { runId: run.id, error: message }, run.jobId);
+    sqliteExec(dbPath, sql`
+UPDATE jobs
+SET state = 'failed_retryable',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    last_error = ${message}
+WHERE id = ${run.jobId}
+  AND state IN ('approved_for_execution', 'executing', 'waiting_for_plex_verification', 'drafting_comment');
+`);
+  }
+  return runs.length;
+}
+
 export function recordAgentRunEvent(dbPath, runId, jobId, eventType, payload) {
   sqliteExec(dbPath, sql`
 INSERT INTO agent_run_events (run_id, job_id, event_type, payload_json)

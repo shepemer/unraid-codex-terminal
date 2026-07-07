@@ -23,6 +23,7 @@ import {
   pruneSnapshots,
   recordAgentRunEvent,
   recordAudit,
+  recoverInterruptedAgentRuns,
   setPendingApprovals,
   setJobState,
   setSetting,
@@ -86,6 +87,137 @@ function buildRepairPrompt(entry, evidence, summary, operatorMessage = "") {
   }, approvedPlan);
 }
 
+function compactLine(value, maxLength = 180) {
+  const text = String(value || "")
+    .replace(/[*_`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength - 1).trim()}...`;
+}
+
+function cleanActionStep(value) {
+  const text = compactLine(String(value || "")
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "")
+    .replace(/^\s*(?:then|and then)\s+/i, "")
+    .replace(/[.;]\s*$/g, ""));
+  if (!text) {
+    return "";
+  }
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}.`;
+}
+
+function splitInlineActionText(value) {
+  return String(value || "")
+    .split(/\s*(?:;|\band then\b|\bthen\b)\s*/i)
+    .map(cleanActionStep)
+    .filter(Boolean);
+}
+
+function extractInvestigationActionSteps(summary) {
+  const lines = String(summary || "").split(/\r?\n/);
+  const steps = [];
+  let collecting = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (collecting && steps.length) {
+        break;
+      }
+      continue;
+    }
+    const inlineMatch = trimmed.match(/^(?:#+\s*)?(?:\*\*)?(?:exact\s+safe\s+next\s+actions?|safe\s+next\s+actions?|next\s+actions?|recommended\s+actions?|repair\s+plan)(?:\*\*)?\s*:\s*(.+)$/i);
+    if (inlineMatch) {
+      steps.push(...splitInlineActionText(inlineMatch[1]));
+      collecting = true;
+      continue;
+    }
+    const headerMatch = /^(?:#+\s*)?(?:\*\*)?(?:exact\s+safe\s+next\s+actions?|safe\s+next\s+actions?|next\s+actions?|recommended\s+actions?|repair\s+plan)(?:\*\*)?\s*:?\s*$/i.test(trimmed);
+    if (headerMatch) {
+      collecting = true;
+      continue;
+    }
+    if (!collecting) {
+      continue;
+    }
+    if (/^(?:#+\s+|\*\*[^*]+\*\*\s*$)/.test(trimmed) && !/^\s*(?:[-*+]|\d+[.)])\s+/.test(trimmed)) {
+      break;
+    }
+    if (/^\s*(?:[-*+]|\d+[.)])\s+/.test(trimmed)) {
+      const step = cleanActionStep(trimmed);
+      if (step) {
+        steps.push(step);
+      }
+      continue;
+    }
+    if (!steps.length) {
+      steps.push(...splitInlineActionText(trimmed));
+    } else {
+      break;
+    }
+  }
+  return [...new Set(steps)].slice(0, 5);
+}
+
+function buildActionSummary(entry, summary, plan) {
+  const source = entry?.source || plan?.source || "media";
+  const issueId = entry?.issueId || plan?.issueId || "unknown";
+  if (plan?.classification === "client_side" || plan?.executionMode === "none") {
+    return {
+      mode: "client_side",
+      headline: "No server-side repair will run",
+      bullets: [
+        "Approve to skip media mutations and move directly to final resolution comment review.",
+        "The issue will be treated as client-side or as not requiring a server-side media change.",
+        "The reporter-facing resolution still requires your final approval before posting or closing."
+      ],
+      expectedSteps: extractInvestigationActionSteps(summary)
+    };
+  }
+  return {
+    mode: "server_action",
+    headline: `Run autonomous media repair for ${source} issue ${issueId}`,
+    bullets: [
+      "Approve to start the autonomous Codex repair runner inside the issue-agent container.",
+      "It will use media-mcp to inspect the issue and media, choose appropriate repair tools, make the media-side changes it can, and verify the result.",
+      "It will not post reporter comments or close the issue until you approve the final resolution."
+    ],
+    expectedSteps: extractInvestigationActionSteps(summary)
+  };
+}
+
+function addActionSummaries(details) {
+  const approvals = (details.approvals || []).map(approval => {
+    const plan = approval.payload?.plan;
+    if (!plan) {
+      return approval;
+    }
+    const actionSummary = plan.actionSummary || buildActionSummary({
+      source: approval.payload?.source || details.job?.source,
+      issueId: approval.payload?.issueId || details.job?.issueId
+    }, approval.payload?.summary || details.investigation?.summary || "", plan);
+    return {
+      ...approval,
+      payload: {
+        ...approval.payload,
+        plan: {
+          ...plan,
+          actionSummary
+        }
+      }
+    };
+  });
+  const pendingActionSummary = approvals.find(approval => approval.kind === "action" && approval.status === "pending")
+    ?.payload?.plan?.actionSummary || null;
+  return {
+    ...details,
+    approvals,
+    pendingActionSummary
+  };
+}
+
 function fallbackDraftComment(source, executionResult = null) {
   const outcome = executionResult?.outcome || "";
   if (source === "plex") {
@@ -118,20 +250,22 @@ function buildPlan(entry, evidence, summary, operatorMessage = "") {
   const serverSide = textSuggestsServerSide(summary, operatorMessage) || !clientSideText;
   const clientSide = !serverSide && clientSideText;
   const repairPrompt = serverSide ? buildRepairPrompt(effectiveEntry, evidence, summary, operatorMessage) : undefined;
+  const plan = {
+    classification: serverSide ? "server_action" : "client_side",
+    executionMode: serverSide ? "approved_repair_agent" : "none",
+    actions: [],
+    requiresServerAction: serverSide,
+    repairPrompt,
+    note: serverSide
+      ? "Approval will run the autonomous Codex repair runner with this exact prompt."
+      : "Determination is client-side or no server-side action is required."
+  };
+  plan.actionSummary = buildActionSummary(effectiveEntry, summary, plan);
   return {
     source: effectiveEntry.source,
     issueId: effectiveEntry.issueId,
     summary,
-    plan: {
-      classification: serverSide ? "server_action" : "client_side",
-      executionMode: serverSide ? "approved_repair_agent" : "none",
-      actions: [],
-      requiresServerAction: serverSide,
-      repairPrompt,
-      note: serverSide
-        ? "Approval will run the autonomous Codex repair runner with this exact prompt."
-        : "Determination is client-side or no server-side action is required."
-    },
+    plan,
     evidence
   };
 }
@@ -465,10 +599,20 @@ export class MediaIssueAgent {
   constructor(config, client = new MediaMcpClient(config)) {
     this.config = config;
     this.client = client;
+    this.initPromise = null;
   }
 
   async init() {
-    await initDb(this.config.dbPath);
+    if (!this.initPromise) {
+      this.initPromise = (async () => {
+        await initDb(this.config.dbPath);
+        const recovered = recoverInterruptedAgentRuns(this.config.dbPath);
+        if (recovered) {
+          recordAudit(this.config.dbPath, "interrupted_repair_runs_recovered", sanitizeValue({ count: recovered }));
+        }
+      })();
+    }
+    await this.initPromise;
   }
 
   async pollOnce() {
@@ -531,7 +675,7 @@ export class MediaIssueAgent {
     if (!details) {
       throw new Error(`Job ${jobId} was not found`);
     }
-    return details;
+    return addActionSummaries(details);
   }
 
   status() {

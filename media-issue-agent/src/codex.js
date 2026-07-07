@@ -16,12 +16,23 @@ function runProcess(command, args, options) {
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
+    const rejectOnce = error => {
+      clearTimeout(timeout);
       if (!settled) {
         settled = true;
-        reject(new Error(`Codex timed out after ${options.timeoutMs}ms`));
+        reject(error);
       }
+    };
+    const handleStdinError = error => {
+      if (["EPIPE", "EOF", "ERR_STREAM_DESTROYED"].includes(error?.code)) {
+        return;
+      }
+      child.kill("SIGTERM");
+      rejectOnce(error);
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      rejectOnce(new Error(`Codex timed out after ${options.timeoutMs}ms`));
     }, options.timeoutMs);
     child.stdout.on("data", chunk => {
       stdout += chunk;
@@ -30,16 +41,13 @@ function runProcess(command, args, options) {
       stderr += chunk;
     });
     child.on("error", error => {
-      clearTimeout(timeout);
-      if (!settled) {
-        settled = true;
-        reject(error);
-      }
+      rejectOnce(error);
     });
-    if (options.input) {
-      child.stdin.end(options.input);
-    } else {
-      child.stdin.end();
+    child.stdin.on("error", handleStdinError);
+    try {
+      child.stdin.end(options.input || "");
+    } catch (error) {
+      handleStdinError(error);
     }
     child.on("close", code => {
       clearTimeout(timeout);
@@ -253,8 +261,6 @@ export function buildRepairCodexArgs(config, settings = {}, options = {}) {
   const args = [
     "exec",
     "--dangerously-bypass-approvals-and-sandbox",
-    "--ask-for-approval",
-    "never",
     "--skip-git-repo-check",
     "--ephemeral",
     "--json",
@@ -544,15 +550,26 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       let stdoutBuffer = "";
       let finalMessage = "";
       let settled = false;
+      const rejectOnce = error => {
+        clearTimeout(timeout);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      };
+      const handleStdinError = error => {
+        if (["EPIPE", "EOF", "ERR_STREAM_DESTROYED"].includes(error?.code)) {
+          return;
+        }
+        child.kill("SIGTERM");
+        rejectOnce(error);
+      };
       const emit = event => {
         hooks.onEvent?.(sanitizeValue(event));
       };
       const timeout = setTimeout(() => {
         child.kill("SIGTERM");
-        if (!settled) {
-          settled = true;
-          reject(new Error(`Codex repair timed out after ${config.codexRepairTimeoutMs || config.codexTimeoutMs}ms`));
-        }
+        rejectOnce(new Error(`Codex repair timed out after ${config.codexRepairTimeoutMs || config.codexTimeoutMs}ms`));
       }, config.codexRepairTimeoutMs || config.codexTimeoutMs);
       const handleStdoutLine = line => {
         const trimmed = line.trim();
@@ -585,13 +602,14 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
         emit({ type: "stderr", text: redactText(text).slice(-4000) });
       });
       child.on("error", error => {
-        clearTimeout(timeout);
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        rejectOnce(error);
       });
-      child.stdin.end(prompt);
+      child.stdin.on("error", handleStdinError);
+      try {
+        child.stdin.end(prompt);
+      } catch (error) {
+        handleStdinError(error);
+      }
       child.on("close", async code => {
         clearTimeout(timeout);
         if (stdoutBuffer.trim()) {
