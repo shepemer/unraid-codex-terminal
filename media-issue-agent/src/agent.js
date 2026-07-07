@@ -25,7 +25,7 @@ import {
   transitionJob,
   upsertInvestigation
 } from "./db.js";
-import { commentDraftPrompt, investigationPrompt, runCodex, steeredInvestigationPrompt } from "./codex.js";
+import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
@@ -34,11 +34,213 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const REPAIR_AGENT_TOOLS = [
+  {
+    toolName: "bazarr_download_movie_subtitles_for_plex",
+    description: "Resolve one Plex movie rating key to one exact Radarr movie and ask Bazarr to download subtitles.",
+    requiredArgs: ["plexRatingKey", "language"],
+    optionalArgs: ["title", "year", "forced", "hi"]
+  },
+  {
+    toolName: "plex_refresh_metadata",
+    description: "Refresh Plex metadata for one exact rating key after a repair.",
+    requiredArgs: ["ratingKey"]
+  },
+  {
+    toolName: "plex_analyze_metadata",
+    description: "Analyze Plex media for one exact rating key after a repair.",
+    requiredArgs: ["ratingKey"]
+  }
+];
+
+const EXECUTION_ALLOWLIST = new Set(REPAIR_AGENT_TOOLS.map(tool => tool.toolName));
+
+const LANGUAGE_ALIASES = [
+  { code: "ko", label: "Korean", patterns: [/\bkorean\b/i, /\bkor\b/i] },
+  { code: "en", label: "English", patterns: [/\benglish\b/i, /\beng\b/i] },
+  { code: "es", label: "Spanish", patterns: [/\bspanish\b/i, /\bespanol\b/i, /\bspa\b/i] },
+  { code: "fr", label: "French", patterns: [/\bfrench\b/i, /\bfre\b/i, /\bfra\b/i] },
+  { code: "de", label: "German", patterns: [/\bgerman\b/i, /\bger\b/i, /\bdeu\b/i] },
+  { code: "it", label: "Italian", patterns: [/\bitalian\b/i, /\bita\b/i] },
+  { code: "ja", label: "Japanese", patterns: [/\bjapanese\b/i, /\bjpn\b/i] },
+  { code: "zh", label: "Chinese", patterns: [/\bchinese\b/i, /\bmandarin\b/i, /\bcantonese\b/i, /\bchi\b/i, /\bzho\b/i] },
+  { code: "pt", label: "Portuguese", patterns: [/\bportuguese\b/i, /\bpor\b/i] },
+  { code: "ar", label: "Arabic", patterns: [/\barabic\b/i, /\bara\b/i] },
+  { code: "hi", label: "Hindi", patterns: [/\bhindi\b/i, /\bhin\b/i] },
+  { code: "ru", label: "Russian", patterns: [/\brussian\b/i, /\brus\b/i] }
+];
+
+function firstPresent(...values) {
+  return values.find(value => value !== undefined && value !== null && value !== "") ?? undefined;
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null && entry !== ""));
+}
+
+function valueAtPath(value, path) {
+  return path.split(".").reduce((current, key) => current?.[key], value);
+}
+
+function firstPathValue(value, paths) {
+  return firstPresent(...paths.map(path => valueAtPath(value, path)));
+}
+
+function stringifySearchText(...values) {
+  return values.map(value => {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (value === undefined || value === null) {
+      return "";
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }).join(" ");
+}
+
+function languageFromText(text) {
+  for (const language of LANGUAGE_ALIASES) {
+    if (language.patterns.some(pattern => pattern.test(text))) {
+      return { code: language.code, label: language.label };
+    }
+  }
+  return null;
+}
+
 function textSuggestsClientSide(...values) {
   const text = values.join(" ").toLowerCase();
-  return /\b(client|device|app|browser|network|wifi|user-side|user side|client-side|client side)\b/.test(text)
-    || /\bno server(?:-side| side)? action\b/.test(text)
-    || /\bno automated (?:server )?(?:fix|action)\b/.test(text);
+  return /\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
+    || /\bno automated (?:server )?(?:fix|action|repair)\b/.test(text)
+    || /\b(?:determination|conclusion|classification)\s+(?:is|:)\s+(?:client-side|client side)\b/.test(text)
+    || /\b(?:client-side|client side|user-side|user side)\b.{0,120}\b(?:only|no server|without server|not a server)\b/.test(text);
+}
+
+function textSuggestsServerSide(...values) {
+  const text = values.join(" ").toLowerCase();
+  const squashed = text.replace(/[^a-z0-9]+/g, "");
+  return /\b(?:server-side|server side|server)\b.{0,140}\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b/.test(text)
+    || /\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b.{0,140}\b(?:server-side|server side|server)\b/.test(text)
+    || squashed.includes("requiresserveractiontrue")
+    || /\bclassification\b.{0,60}\bserver[_ -]?side\b/.test(text)
+    || /\b(?:bazarr|managed subtitle|subtitle workflow)\b/.test(text);
+}
+
+function textSuggestsNoSupportedServerAction(...values) {
+  const text = values.join(" ").toLowerCase();
+  return /\bno exact allowlisted server-side repair action is available\b/.test(text)
+    || /\bno supported (?:server-side|server side|server) (?:repair )?action\b/.test(text)
+    || /\bunsupported (?:server-side|server side|server) (?:repair )?action\b/.test(text);
+}
+
+function textSuggestsSubtitleRequest(text) {
+  return /\b(subtitle|subtitles|subs|caption|captions|cc)\b/i.test(text);
+}
+
+function mediaTypeIsMovie(value) {
+  const type = String(value || "").toLowerCase();
+  if (!type) {
+    return true;
+  }
+  return /\b(movie|film)\b/.test(type);
+}
+
+function subtitleRepairActionsFor(entry, evidence, summary, operatorMessage = "") {
+  const searchText = stringifySearchText(summary, operatorMessage, entry, evidence?.details?.issue, evidence?.diagnosis?.issue, evidence?.details?.plex, evidence?.diagnosis?.plex);
+  if (!textSuggestsSubtitleRequest(searchText)) {
+    return [];
+  }
+  const language = languageFromText(searchText);
+  if (!language) {
+    return [];
+  }
+  const mediaType = firstPathValue({ entry, evidence }, [
+    "entry.raw.mediaType",
+    "entry.mediaType",
+    "evidence.details.issue.mediaType",
+    "evidence.details.plex.metadata.mediaType",
+    "evidence.diagnosis.issue.mediaType",
+    "evidence.diagnosis.plex.metadata.mediaType"
+  ]);
+  if (!mediaTypeIsMovie(mediaType)) {
+    return [];
+  }
+  const ratingKey = firstPathValue({ entry, evidence }, [
+    "entry.raw.plexRatingKey",
+    "entry.raw.ratingKey",
+    "entry.plexRatingKey",
+    "entry.ratingKey",
+    "evidence.details.issue.plexRatingKey",
+    "evidence.details.issue.ratingKey",
+    "evidence.details.plex.ratingKey",
+    "evidence.details.plex.metadata.ratingKey",
+    "evidence.diagnosis.issue.plexRatingKey",
+    "evidence.diagnosis.issue.ratingKey",
+    "evidence.diagnosis.plex.ratingKey",
+    "evidence.diagnosis.plex.metadata.ratingKey"
+  ]);
+  if (!ratingKey) {
+    return [];
+  }
+  const title = firstPathValue({ entry, evidence }, [
+    "entry.raw.mediaTitle",
+    "entry.mediaTitle",
+    "evidence.details.issue.mediaTitle",
+    "evidence.details.plex.metadata.title",
+    "evidence.diagnosis.issue.mediaTitle",
+    "evidence.diagnosis.plex.metadata.title"
+  ]);
+  const yearValue = firstPathValue({ entry, evidence }, [
+    "entry.raw.year",
+    "entry.year",
+    "evidence.details.plex.metadata.year",
+    "evidence.diagnosis.plex.metadata.year"
+  ]);
+  const year = Number.isInteger(Number(yearValue)) && Number(yearValue) > 0 ? Number(yearValue) : undefined;
+  return [
+    {
+      toolName: "bazarr_download_movie_subtitles_for_plex",
+      riskLevel: "repair",
+      description: `Download ${language.label} subtitles for the exact Plex movie item via Bazarr.`,
+      args: compactObject({
+        plexRatingKey: String(ratingKey),
+        language: language.code,
+        title,
+        year,
+        dryRun: false
+      })
+    },
+    {
+      toolName: "plex_refresh_metadata",
+      riskLevel: "verification",
+      description: "Refresh the exact Plex metadata item so newly downloaded subtitles are visible.",
+      args: {
+        ratingKey: String(ratingKey),
+        dryRun: false
+      }
+    }
+  ];
+}
+
+function buildRepairPrompt(entry, evidence, summary, operatorMessage = "", candidateActions = []) {
+  const effectiveEntry = evidence?.entry || entry || {};
+  return [
+    `Repair ${effectiveEntry.source || "media"} issue ${effectiveEntry.issueId || "(unknown issue)"}.`,
+    "Follow the human-approved investigation and use the sanitized evidence only.",
+    operatorMessage ? `Operator steering: ${operatorMessage}` : "",
+    "",
+    "Investigation:",
+    summary,
+    "",
+    candidateActions.length
+      ? `Candidate exact media actions inferred from evidence:\n${JSON.stringify(candidateActions, null, 2)}`
+      : "Infer the exact supported media actions from the investigation and evidence.",
+    "",
+    "Return exact allowlisted media MCP actions for the orchestrator. Do not close or comment on the issue during repair execution."
+  ].filter(Boolean).join("\n");
 }
 
 function fallbackDraftComment(source, executionResult = null) {
@@ -68,22 +270,79 @@ function normalizeDraftComment(source, draft) {
 }
 
 function buildPlan(entry, evidence, summary, operatorMessage = "") {
-  const clientSide = textSuggestsClientSide(summary, operatorMessage);
-  const actions = [];
+  const effectiveEntry = evidence?.entry || entry || {};
+  const candidateActions = subtitleRepairActionsFor(effectiveEntry, evidence, summary, operatorMessage);
+  const clientSideText = textSuggestsClientSide(summary, operatorMessage);
+  const noSupportedServerAction = candidateActions.length === 0 && textSuggestsNoSupportedServerAction(summary, operatorMessage);
+  const serverSide = candidateActions.length > 0 || (!clientSideText && !noSupportedServerAction && textSuggestsServerSide(summary, operatorMessage));
+  const clientSide = !serverSide && clientSideText;
+  const repairPrompt = serverSide ? buildRepairPrompt(effectiveEntry, evidence, summary, operatorMessage, candidateActions) : undefined;
   return {
-    source: entry.source,
-    issueId: entry.issueId,
+    source: effectiveEntry.source,
+    issueId: effectiveEntry.issueId,
     summary,
     plan: {
-      classification: clientSide ? "client_side" : "no_supported_server_action",
-      actions,
-      requiresServerAction: actions.length > 0,
-      note: clientSide
-        ? "Determination is client-side or no server-side action is required."
-        : "No exact allowlisted server-side repair action is available for this issue yet."
+      classification: serverSide ? "server_action" : clientSide ? "client_side" : "no_supported_server_action",
+      executionMode: serverSide ? "approved_repair_agent" : "none",
+      actions: [],
+      candidateActions,
+      requiresServerAction: serverSide,
+      repairPrompt,
+      note: serverSide
+        ? "Approval will run the repair agent with this prompt and execute only exact allowlisted media actions."
+        : clientSide
+          ? "Determination is client-side or no server-side action is required."
+          : "No exact allowlisted server-side repair action is available for this issue yet."
     },
     evidence
   };
+}
+
+function parseRepairAgentOutput(output) {
+  const trimmed = String(output || "").trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  const candidates = [trimmed];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) {
+        return { summary: "Repair agent returned exact actions.", actions: parsed };
+      }
+      return {
+        summary: String(parsed.summary || parsed.note || "Repair agent returned exact actions."),
+        actions: Array.isArray(parsed.actions) ? parsed.actions : []
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`Repair agent did not return valid JSON: ${lastError?.message || "unknown parse error"}`);
+}
+
+function normalizeRepairActions(actions) {
+  return actions.map((action, index) => {
+    const toolName = action?.toolName || action?.tool || action?.name;
+    if (!toolName) {
+      throw new Error(`Repair action ${index + 1} is missing toolName`);
+    }
+    const args = action.args && typeof action.args === "object" && !Array.isArray(action.args)
+      ? action.args
+      : {};
+    return {
+      toolName,
+      riskLevel: action.riskLevel || action.risk || "repair",
+      description: action.description || action.summary,
+      args
+    };
+  });
 }
 
 function closeActionsFor(source, issueId, message) {
@@ -151,8 +410,10 @@ function commentsFromDetails(details) {
 
 function entryIsClosed(entry) {
   const status = String(entry?.status || "").toLowerCase();
+  if (entry?.jobState) {
+    return entry.jobState === "closed";
+  }
   return Boolean(entry?.raw?.isClosed)
-    || entry?.jobState === "closed"
     || status === "closed"
     || status === "resolved"
     || status.includes("closed")
@@ -578,24 +839,83 @@ export class MediaIssueAgent {
     }
     transitionJob(this.config.dbPath, jobId, ["approved_for_execution"], "executing");
     recordAudit(this.config.dbPath, "execution_started", sanitizeValue({ actor, plan: actionApproval.payload.plan }), jobId);
-    const actions = Array.isArray(actionApproval.payload?.plan?.actions) ? actionApproval.payload.plan.actions : [];
+    const plan = actionApproval.payload?.plan || {};
+    let actions = Array.isArray(plan.actions) ? plan.actions : [];
+    const classification = plan.classification;
     const executionResult = {
-      outcome: actionApproval.payload?.plan?.classification === "client_side" ? "client_side" : "no_supported_action",
-      summary: actionApproval.payload?.plan?.classification === "client_side"
+      outcome: classification === "client_side" ? "client_side" : "no_supported_action",
+      summary: classification === "client_side"
         ? "Determination was client-side or no server-side action was required. No server-side media action was executed."
         : "No exact allowlisted server-side repair action is available for this issue yet. No media action was executed.",
-      actionsRequested: actions.length,
+      actionsRequested: 0,
       actionsExecuted: 0,
       actions: []
     };
-    if (actions.length) {
+    if (!actions.length && plan.executionMode === "approved_repair_agent") {
+      try {
+        const repairOutput = await runCodex(this.config, repairExecutionPrompt({
+          job: details.job,
+          investigation: details.investigation,
+          approvedBy: actor,
+          originalEvidence: actionApproval.payload?.evidence
+        }, actionApproval.payload, REPAIR_AGENT_TOOLS));
+        const parsed = parseRepairAgentOutput(repairOutput);
+        actions = normalizeRepairActions(parsed.actions);
+        executionResult.repairAgentSummary = parsed.summary;
+        executionResult.repairAgentActionsRequested = actions.length;
+        recordAudit(this.config.dbPath, "repair_agent_plan_ready", sanitizeValue({ actor, summary: parsed.summary, actions }), jobId);
+      } catch (error) {
+        const message = redactText(error.message);
+        executionResult.outcome = "failed_retryable";
+        executionResult.summary = `Repair agent could not produce an executable plan: ${message}`;
+        recordAudit(this.config.dbPath, "repair_agent_plan_failed", sanitizeValue({ actor, error: error.message }), jobId);
+        transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
+        throw error;
+      }
+    }
+    actions = normalizeRepairActions(actions);
+    executionResult.actionsRequested = actions.length;
+    const unsupported = actions.filter(action => !EXECUTION_ALLOWLIST.has(action?.toolName));
+    if (unsupported.length) {
       executionResult.outcome = "unsupported_actions";
-      executionResult.summary = "The approved plan contained actions, but none are on the media issue agent execution allowlist yet. No media action was executed.";
+      executionResult.summary = "The approved plan contained actions outside the media issue agent execution allowlist. No media action was executed.";
       executionResult.actions = actions.map(action => ({
         requested: action,
-        status: "not_executed",
-        reason: "unsupported action for media issue agent v1"
+        status: EXECUTION_ALLOWLIST.has(action?.toolName) ? "skipped" : "not_executed",
+        reason: EXECUTION_ALLOWLIST.has(action?.toolName) ? "skipped because the plan included unsupported actions" : "unsupported action for media issue agent"
       }));
+      const message = "Approved plan contains unsupported actions";
+      recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, executionResult }), jobId);
+      transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
+      throw new Error(message);
+    }
+    if (actions.length) {
+      executionResult.outcome = "server_action_completed";
+      executionResult.summary = "Executed the approved server-side media repair actions.";
+      try {
+        for (const action of actions) {
+          const args = { ...(action.args || {}), dryRun: false };
+          const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, args, action.riskLevel || "repair");
+          recordAudit(this.config.dbPath, "execution_action_started", sanitizeValue({ actor, action: planned }), jobId);
+          const result = await this.client.callTool(action.toolName, args);
+          const sanitized = sanitizeValue(result);
+          markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
+          executionResult.actionsExecuted += 1;
+          executionResult.actions.push({
+            requested: action,
+            executed: { id: planned.id, toolName: planned.toolName, args },
+            status: "executed",
+            result: sanitized
+          });
+        }
+      } catch (error) {
+        const message = redactText(error.message);
+        executionResult.outcome = "failed_retryable";
+        executionResult.summary = `Execution failed before all approved actions completed: ${message}`;
+        recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, error: error.message, executionResult }), jobId);
+        transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
+        throw error;
+      }
     }
     recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
     transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");

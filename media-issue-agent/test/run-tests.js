@@ -82,14 +82,14 @@ async function testPlexClosedFilter() {
     }
   };
   const queued = await issueQueue([
-    { source: "plex", id: "plex-fixture-1", status: "open", commentCount: 1, message: "Already handled" },
-    { source: "plex", id: "plex-reopened", status: "open", commentCount: 2, message: "Reopened" },
-    { source: "seerr", id: 22, status: "resolved", message: "Needs attention", mediaTitle: "Fixture Movie" }
+    { source: "plex", id: "plex-fixture-1", status: "open", commentCount: 1, message: "Already handled", updatedAt: "2026-01-05T00:00:00Z" },
+    { source: "plex", id: "plex-reopened", status: "open", commentCount: 2, message: "Reopened", updatedAt: "2026-01-04T00:00:00Z" },
+    { source: "seerr", id: 22, status: "resolved", message: "Needs attention", mediaTitle: "Fixture Movie", updatedAt: "2026-01-06T00:00:00Z" }
   ], client);
   assert.deepEqual(queued.map(issue => [issue.issueId, issue.status, issue.isClosed]), [
-    ["plex-fixture-1", "closed", true],
     ["plex-reopened", "open", false],
-    ["22", "closed", true]
+    ["22", "closed", true],
+    ["plex-fixture-1", "closed", true]
   ]);
   const open = await filterOpenIssues([
     { source: "plex", id: "plex-fixture-1", status: "open", commentCount: 1, message: "Already handled" },
@@ -253,6 +253,148 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
   await rm(dir, { recursive: true, force: true });
   await rm(codexHome, { recursive: true, force: true });
   await rm(fakeCodex.dir, { recursive: true, force: true });
+}
+
+async function testSubtitleServerActionPlanExecutesRepair() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-subtitle-fixture");
+  await writeFile(codexBin, [
+    "#!/bin/sh",
+    "prompt=\"$(cat)\"",
+    "case \"$prompt\" in",
+    "  *\"Draft a reporter-facing\"*)",
+    "    printf '%s\\n' 'Added the requested Korean subtitles and refreshed Plex. Automated response from Codex.'",
+    "    ;;",
+    "  *\"Approved media repair execution\"*)",
+    "    printf '%s\\n' '{\"summary\":\"Download Korean subtitles and refresh Plex.\",\"actions\":[{\"toolName\":\"bazarr_download_movie_subtitles_for_plex\",\"riskLevel\":\"repair\",\"args\":{\"plexRatingKey\":\"109444\",\"language\":\"ko\"}},{\"toolName\":\"plex_refresh_metadata\",\"riskLevel\":\"verification\",\"args\":{\"ratingKey\":\"109444\"}}]}'",
+    "    ;;",
+    "  *)",
+    "    printf '%s\\n' '**Investigation Summary**'",
+    "    printf '%s\\n' 'The previous pending approval said classification: client_side, but that should not remain fixed.'",
+    "    printf '%s\\n' 'This is a Korean subtitle request for a movie. Server-side action is required.'",
+    "    printf '%s\\n' 'Exact safe next actions: download Korean subtitles with Bazarr for Plex item 109444, then refresh Plex metadata.'",
+    "    printf '%s\\n' 'User-side: the viewer may need to restart playback after the server action completes.'",
+    "    ;;",
+    "esac"
+  ].join("\n"));
+  await chmod(codexBin, 0o700);
+  const calls = [];
+  const client = {
+    async callTool(name, args) {
+      calls.push({ name, args });
+      if (name === "plex_issue_details") {
+        return {
+          issue: {
+            source: "plex",
+            id: args.issueId,
+            status: "open",
+            message: "Please add Korean subtitles.",
+            mediaTitle: "Fixture Movie",
+            mediaType: "movie",
+            plexRatingKey: "109444",
+            comments: []
+          },
+          plex: {
+            ratingKey: "109444",
+            metadata: {
+              ratingKey: "109444",
+              mediaType: "movie",
+              title: "Fixture Movie",
+              year: 2026
+            }
+          }
+        };
+      }
+      if (name === "media_diagnose_issue") {
+        return {
+          issue: {
+            source: "plex",
+            id: args.issueId,
+            status: "open",
+            message: "Please add Korean subtitles.",
+            mediaTitle: "Fixture Movie",
+            mediaType: "movie",
+            plexRatingKey: "109444"
+          },
+          plex: {
+            ratingKey: "109444",
+            metadata: {
+              ratingKey: "109444",
+              mediaType: "movie",
+              title: "Fixture Movie",
+              year: 2026
+            }
+          }
+        };
+      }
+      if (name === "bazarr_download_movie_subtitles_for_plex") {
+        assert.equal(args.plexRatingKey, "109444");
+        assert.equal(args.language, "ko");
+        assert.equal(args.dryRun, false);
+        return { dryRun: false, language: "ko", radarrMovie: { id: 44, title: "Fixture Movie" } };
+      }
+      if (name === "plex_refresh_metadata") {
+        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.dryRun, false);
+        return { dryRun: false, ratingKey: "109444" };
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  };
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      codexTimeoutMs: 10000,
+      dryRun: false
+    }, client);
+    await agent.init();
+    const entries = [{
+      source: "plex",
+      issueId: "plex-subtitle-1001",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Movie",
+      mediaType: "movie",
+      plexRatingKey: "109444",
+      status: "open",
+      description: "Please add Korean subs."
+    }];
+    const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+    const investigated = await agent.investigate(snapshot.id, 1, { force: true });
+    const actionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
+    assert.equal(actionApproval.payload.plan.classification, "server_action");
+    assert.equal(actionApproval.payload.plan.requiresServerAction, true);
+    assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
+    assert.equal(actionApproval.payload.plan.actions.length, 0);
+    assert.match(actionApproval.payload.plan.repairPrompt, /Server-side action is required/);
+    assert.deepEqual(actionApproval.payload.plan.candidateActions.map(action => action.toolName), [
+      "bazarr_download_movie_subtitles_for_plex",
+      "plex_refresh_metadata"
+    ]);
+    assert.equal(actionApproval.payload.plan.candidateActions[0].args.language, "ko");
+
+    const resolutionReview = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(resolutionReview.status, "awaiting_resolution_approval");
+    assert.equal(resolutionReview.executionResult.outcome, "server_action_completed");
+    assert.equal(resolutionReview.executionResult.actionsRequested, 2);
+    assert.equal(resolutionReview.executionResult.actionsExecuted, 2);
+    assert.match(resolutionReview.executionResult.repairAgentSummary, /Download Korean subtitles/);
+    assert.equal(calls.filter(call => call.name === "bazarr_download_movie_subtitles_for_plex").length, 1);
+    assert.equal(calls.filter(call => call.name === "plex_refresh_metadata").length, 1);
+    const details = jobDetails(dbPath, investigated.jobId);
+    assert.deepEqual(details.plannedActions.map(action => action.toolName).sort(), [
+      "bazarr_download_movie_subtitles_for_plex",
+      "plex_refresh_metadata"
+    ].sort());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
 }
 
 function testCommentValidation() {
@@ -452,6 +594,11 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /<html lang="en" data-theme="dark">/);
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
+    assert.match(pageText, /id="app-shell"/);
+    assert.match(pageText, /id="work-area"/);
+    assert.match(pageText, /id="detail-band"/);
+    assert.match(pageText, /id="detail-close-button"/);
+    assert.match(pageText, /id="detail-processing"/);
     assert.match(pageText, /id="continue-button"/);
     assert.match(pageText, /id="reopen-button"/);
     assert.match(pageText, /id="steer-panel"/);
@@ -464,7 +611,11 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /justify-self: end;/);
     assert.match(cssText, /white-space: nowrap;/);
     assert.match(cssText, /tbody tr\.issue-closed/);
+    assert.match(cssText, /tbody tr\.issue-active/);
     assert.match(cssText, /\.modal-backdrop/);
+    assert.match(cssText, /\.work-area\.detail-open/);
+    assert.match(cssText, /\.detail-band\.processing::before/);
+    assert.match(cssText, /@keyframes processingSweep/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
     assert.equal(js.status, 200);
     const jsText = await js.text();
@@ -480,6 +631,9 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function openCloseDialog/);
     assert.match(jsText, /function showIssueSummary/);
     assert.match(jsText, /function reopenIssue/);
+    assert.match(jsText, /function closeDetail/);
+    assert.match(jsText, /function setDetailProcessing/);
+    assert.match(jsText, /function updateIssueRowHighlights/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
     assert.match(jsText, /data-job-id/);
     assert.match(jsText, /data-close-issue/);
@@ -545,6 +699,7 @@ async function run() {
   testCommentValidation();
   await testInvestigationCacheAndStaleApprovalSuperseding();
   await testApprovedJobContinuesToDryRunCommentPosting();
+  await testSubtitleServerActionPlanExecutesRepair();
   await testAuthConfig();
   await testStateTransitions();
   await testDbDirectoryWritablePreflight();

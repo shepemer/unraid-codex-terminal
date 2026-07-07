@@ -88,6 +88,7 @@ async function createFakeCodexBin(root, logPath) {
     "#!/usr/bin/env node",
     "import { appendFileSync, readFileSync } from 'node:fs';",
     "const prompt = readFileSync(0, 'utf8');",
+    "await new Promise(resolve => setTimeout(resolve, 300));",
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
@@ -314,6 +315,7 @@ async function testIssueStateActionMatrix(browser) {
 
     await row(page, 3).getByRole("button", { name: "Open job" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
+    await expect(row(page, 3)).toHaveClass(/issue-active/);
     await expect(page.locator("#investigation-output")).toContainText("Job");
     await expect(page.locator("#investigation-output")).toContainText("Approved");
     await expect(page.locator("#continue-button")).toBeVisible();
@@ -327,11 +329,33 @@ async function testIssueStateActionMatrix(browser) {
 
     await row(page, 5).click();
     await expect(page.locator("#detail-heading")).toHaveText("Issue Summary");
+    await expect(row(page, 5)).toHaveClass(/issue-active/);
+    await expect(page.locator("#work-area")).toHaveClass(/detail-open/);
+    await expect(page.locator("#detail-band")).toBeVisible();
     await expect(page.locator("#investigation-output")).toContainText("Local workflow history");
     await expect(page.locator("#investigation-output")).toContainText("Closed");
     await expect(page.locator("#reopen-button")).toBeVisible();
     await expect(page.locator("#approval-actions")).toBeHidden();
     await expect(page.locator("#continue-button")).toBeHidden();
+
+    const layout = await page.evaluate(() => {
+      const workspace = document.querySelector(".workspace").getBoundingClientRect();
+      const detail = document.querySelector("#detail-band").getBoundingClientRect();
+      return {
+        bodyScrollHeight: document.body.scrollHeight,
+        viewportHeight: window.innerHeight,
+        workspaceHeight: workspace.height,
+        detailHeight: detail.height
+      };
+    });
+    assert.ok(layout.bodyScrollHeight <= layout.viewportHeight + 2, JSON.stringify(layout));
+    const ratio = layout.detailHeight / (layout.workspaceHeight + layout.detailHeight);
+    assert.ok(ratio > 0.38 && ratio < 0.62, JSON.stringify(layout));
+
+    await page.locator("#detail-close-button").click();
+    await expect(page.locator("#detail-band")).toBeHidden();
+    await expect(page.locator("#work-area")).not.toHaveClass(/detail-open/);
+    await expect(row(page, 5)).not.toHaveClass(/issue-active/);
   } finally {
     await context?.close();
     await harness?.close();
@@ -361,7 +385,11 @@ async function testFullBrowserWorkflow(browser) {
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
 
     await row(page, 1).getByRole("button", { name: "Investigate" }).click();
+    await expect(page.locator("#detail-processing")).toBeVisible();
+    await expect(page.locator("#detail-processing")).toContainText("Investigating");
+    await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    await expect(page.locator("#detail-processing")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
     assert.equal(await codexInvocationCount(harness.codexLogPath), 1);
 
@@ -400,6 +428,16 @@ async function testFullBrowserWorkflow(browser) {
     assert.equal(commentCalls[1].args.message, "Closed.");
     const resolveCall = fakeMcp.calls.find(call => call.name === "seerr_resolve_issue");
     assert.equal(resolveCall.args.dryRun, false);
+
+    await row(page, 1).getByRole("button", { name: "View summary" }).click();
+    await expect(page.locator("#reopen-button")).toBeVisible();
+    await page.locator("#reopen-button").click();
+    await expect(row(page, 1)).not.toHaveClass(/issue-closed/);
+    await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
+
+    await row(page, 1).getByRole("button", { name: "Re-investigate" }).click();
+    await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    assert.equal(await codexInvocationCount(harness.codexLogPath), 5);
   } finally {
     await context?.close();
     await harness?.close();

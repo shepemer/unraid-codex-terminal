@@ -55,6 +55,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3
 
+      - name: Run media MCP checks
+        run: |
+          npm --prefix media-mcp ci
+          npm --prefix media-mcp run check
+          npm --prefix media-mcp run test:plex-issues
+          npm --prefix media-mcp run test:seerr-issues
+          npm --prefix media-mcp run test:arr-commands
+          npm --prefix media-mcp run test:bazarr-subtitles
+          npm --prefix media-mcp run test:threadfin
+
       - name: Run media issue agent checks
         run: |
           npm --prefix media-issue-agent ci

@@ -328,7 +328,12 @@ async function bazarrApi(path, options = {}) {
     "X-API-KEY": service.apiKey,
     Accept: "application/json"
   };
-  return fetchJson(url, { method: "GET", headers });
+  let body;
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.body);
+  }
+  return fetchJson(url, { method: options.method || "GET", headers, body });
 }
 
 async function arrApi(serviceName, apiVersion, path, options = {}) {
@@ -1033,6 +1038,163 @@ async function plexMetadataForRatingKey(ratingKey) {
   } catch (error) {
     return { configured: true, error: error.message };
   }
+}
+
+function plexMetadataGuidValues(metadataResult) {
+  const item = plexMetadataItem(metadataResult?.body);
+  return [
+    metadataResult?.summary?.guid,
+    item?.guid,
+    ...(Array.isArray(item?.Guid) ? item.Guid.map(guid => guid.id) : []),
+    ...(Array.isArray(item?.Guides) ? item.Guides.map(guid => guid.id) : [])
+  ].filter(value => typeof value === "string" && value.trim());
+}
+
+function plexMetadataTmdbId(metadataResult) {
+  for (const value of plexMetadataGuidValues(metadataResult)) {
+    const match = value.match(/(?:tmdb|themoviedb)[^\d]*(\d+)/i);
+    if (match) {
+      return Number(match[1]);
+    }
+  }
+  return undefined;
+}
+
+function normalizeMediaMatchTitle(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function summarizeRadarrMovieForRepair(movie) {
+  if (!movie) {
+    return undefined;
+  }
+  return compactObject({
+    id: movie.id,
+    title: movie.title,
+    year: movie.year,
+    tmdbId: movie.tmdbId,
+    monitored: movie.monitored,
+    hasFile: Boolean(movie.hasFile || movie.movieFile)
+  });
+}
+
+async function resolveRadarrMovieForPlex(input) {
+  const plexRatingKey = String(input.plexRatingKey || "").trim();
+  if (!plexRatingKey) {
+    throw new Error("plexRatingKey is required");
+  }
+  if (!configuredServices.radarr) {
+    throw new Error("radarr is not configured");
+  }
+  const metadata = await plexMetadataForRatingKey(plexRatingKey);
+  if (metadata.configured === false) {
+    throw new Error("plex is not configured");
+  }
+  if (metadata.error) {
+    throw new Error(`Plex metadata lookup failed for rating key ${plexRatingKey}: ${metadata.error}`);
+  }
+  const summary = metadata.summary || {};
+  if (!summary.ratingKey) {
+    throw new Error(`Plex metadata lookup did not return an exact item for rating key ${plexRatingKey}`);
+  }
+  const targetTitle = firstString(input.title, summary.title, summary.itemTitle);
+  const targetYear = Number(firstPresent(input.year, summary.year)) || undefined;
+  const tmdbId = plexMetadataTmdbId(metadata);
+  const moviesBody = await arrApi("radarr", "v3", "movie");
+  const movies = Array.isArray(moviesBody) ? moviesBody : Array.isArray(moviesBody?.records) ? moviesBody.records : [];
+  let movie = tmdbId ? movies.find(record => Number(record.tmdbId) === Number(tmdbId)) : undefined;
+  if (!movie && targetTitle) {
+    const normalizedTarget = normalizeMediaMatchTitle(targetTitle);
+    const titleMatches = movies.filter(record => {
+      const normalizedMovie = normalizeMediaMatchTitle(record.title);
+      const yearMatches = !targetYear || !record.year || Number(record.year) === Number(targetYear);
+      return yearMatches && normalizedMovie && (
+        normalizedMovie === normalizedTarget
+        || normalizedMovie.includes(normalizedTarget)
+        || normalizedTarget.includes(normalizedMovie)
+      );
+    });
+    if (titleMatches.length === 1) {
+      movie = titleMatches[0];
+    }
+  }
+  if (!movie?.id) {
+    throw new Error(`Could not resolve Plex rating key ${plexRatingKey} to one exact Radarr movie`);
+  }
+  return {
+    plexRatingKey,
+    plexMetadata: compactObject({
+      ratingKey: summary.ratingKey,
+      title: summary.title,
+      mediaType: summary.mediaType,
+      year: summary.year,
+      tmdbId
+    }),
+    radarrMovie: summarizeRadarrMovieForRepair(movie)
+  };
+}
+
+function bazarrMovieSubtitleQuery(radarrId, language, forced = false, hi = false) {
+  return {
+    radarrid: Number(radarrId),
+    language,
+    forced: Boolean(forced),
+    hi: Boolean(hi)
+  };
+}
+
+async function downloadBazarrMovieSubtitlesForPlex(input) {
+  const language = String(input.language || "").trim();
+  if (!language) {
+    throw new Error("language is required");
+  }
+  const resolved = await resolveRadarrMovieForPlex(input);
+  const query = bazarrMovieSubtitleQuery(resolved.radarrMovie.id, language, input.forced, input.hi);
+  const endpoint = { method: "PATCH", path: "/api/movies/subtitles", query };
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      ...resolved,
+      language,
+      endpoint,
+      note: "Set dryRun to false to ask Bazarr to download the exact movie subtitle."
+    };
+  }
+  const result = await bazarrApi("movies/subtitles", { method: "PATCH", query });
+  return {
+    dryRun: false,
+    ...resolved,
+    language,
+    endpoint,
+    result
+  };
+}
+
+async function plexMetadataMaintenance(ratingKey, operation, dryRun) {
+  const key = String(ratingKey || "").trim();
+  if (!key) {
+    throw new Error("ratingKey is required");
+  }
+  const endpoint = { method: "PUT", path: `/library/metadata/${key}/${operation}` };
+  if (dryRun) {
+    return {
+      dryRun: true,
+      ratingKey: key,
+      endpoint,
+      note: `Set dryRun to false to run Plex metadata ${operation}.`
+    };
+  }
+  return {
+    dryRun: false,
+    ratingKey: key,
+    endpoint,
+    result: await plexApi(`library/metadata/${encodeURIComponent(key)}/${operation}`, { method: "PUT" })
+  };
 }
 
 function issueMediaTitle(issue) {
@@ -7183,6 +7345,26 @@ function createServer() {
     }
   }, async ({ ratingKey }) => jsonText(await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}`)));
 
+  server.registerTool("plex_refresh_metadata", {
+    title: "Plex Refresh Metadata",
+    description: "Refresh Plex metadata for one exact rating key. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ ratingKey, dryRun }) => jsonText(await plexMetadataMaintenance(ratingKey, "refresh", dryRun)));
+
+  server.registerTool("plex_analyze_metadata", {
+    title: "Plex Analyze Metadata",
+    description: "Analyze Plex media for one exact rating key. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ ratingKey, dryRun }) => jsonText(await plexMetadataMaintenance(ratingKey, "analyze", dryRun)));
+
   server.registerTool("plex_active_sessions", {
     title: "Plex Active Sessions",
     description: "List active Plex playback sessions."
@@ -7359,6 +7541,21 @@ function createServer() {
     title: "Bazarr Status",
     description: "Get Bazarr system status."
   }, async () => jsonText(await bazarrApi("system/status")));
+
+  server.registerTool("bazarr_download_movie_subtitles_for_plex", {
+    title: "Bazarr Download Movie Subtitles For Plex",
+    description: "Resolve one Plex movie rating key to one exact Radarr movie and ask Bazarr to download subtitles. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      plexRatingKey: z.union([z.string(), z.number()]),
+      language: z.string().min(1),
+      title: z.string().optional(),
+      year: z.number().int().positive().optional(),
+      forced: z.boolean().default(false),
+      hi: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await downloadBazarrMovieSubtitlesForPlex(input)));
 
   server.registerTool("bazarr_wanted_movies", {
     title: "Bazarr Wanted Movies",

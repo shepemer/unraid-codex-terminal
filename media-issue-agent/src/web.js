@@ -18,7 +18,7 @@ const HTML = `<!doctype html>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
-  <div class="app-shell">
+  <div id="app-shell" class="app-shell">
     <header class="topbar">
       <div class="brand-block">
         <div class="app-mark" aria-hidden="true">MI</div>
@@ -47,71 +47,75 @@ const HTML = `<!doctype html>
       <pre id="login-output" class="login-output hidden"></pre>
     </section>
 
-    <main class="workspace">
-      <section class="issue-section panel" aria-labelledby="issues-heading">
+    <div id="work-area" class="work-area">
+      <main class="workspace">
+        <section class="issue-section panel" aria-labelledby="issues-heading">
+          <div class="section-header">
+            <div>
+              <span class="eyebrow">Triage Queue</span>
+              <h2 id="issues-heading">Issues</h2>
+            </div>
+            <span id="issue-count" class="badge">0</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Source</th>
+                  <th>Issue ID</th>
+                  <th>Date</th>
+                  <th>Reporter</th>
+                  <th>Media/title</th>
+                  <th>Status</th>
+                  <th>Description</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="issue-rows">
+                <tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="side-panel panel" aria-labelledby="activity-heading">
+          <div class="section-header">
+            <div>
+              <span class="eyebrow">Operations</span>
+              <h2 id="activity-heading">Activity</h2>
+            </div>
+            <span id="dry-run" class="badge warning">approval-gated</span>
+          </div>
+          <div class="stats-grid" id="stats-grid"></div>
+          <div class="job-list" id="job-list"></div>
+        </aside>
+      </main>
+
+      <section id="detail-band" class="detail-band panel hidden" aria-live="polite">
         <div class="section-header">
           <div>
-            <span class="eyebrow">Triage Queue</span>
-            <h2 id="issues-heading">Issues</h2>
+            <span class="eyebrow">Decision Detail</span>
+            <h2 id="detail-heading">Investigation</h2>
           </div>
-          <span id="issue-count" class="badge">0</span>
+          <div class="toolbar">
+            <span id="detail-processing" class="processing-pill hidden">Processing</span>
+            <button id="detail-close-button" type="button" class="secondary">Close</button>
+            <button id="reopen-button" type="button" class="secondary hidden">Re-open</button>
+            <button id="continue-button" type="button" class="secondary hidden">Continue</button>
+            <div id="approval-actions" class="toolbar hidden">
+              <button id="approve-button" type="button">Approve</button>
+              <button id="reject-button" type="button" class="danger">Reject</button>
+            </div>
+          </div>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Source</th>
-                <th>Issue ID</th>
-                <th>Date</th>
-                <th>Reporter</th>
-                <th>Media/title</th>
-                <th>Status</th>
-                <th>Description</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody id="issue-rows">
-              <tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>
-            </tbody>
-          </table>
+        <pre id="investigation-output">Select an issue to investigate.</pre>
+        <div id="steer-panel" class="steer-panel hidden">
+          <textarea id="steer-input" rows="3" placeholder="Steer the investigation"></textarea>
+          <button id="steer-button" type="button" class="secondary">Send</button>
         </div>
       </section>
-
-      <aside class="side-panel panel" aria-labelledby="activity-heading">
-        <div class="section-header">
-          <div>
-            <span class="eyebrow">Operations</span>
-            <h2 id="activity-heading">Activity</h2>
-          </div>
-          <span id="dry-run" class="badge warning">approval-gated</span>
-        </div>
-        <div class="stats-grid" id="stats-grid"></div>
-        <div class="job-list" id="job-list"></div>
-      </aside>
-    </main>
-
-    <section class="detail-band panel" aria-live="polite">
-      <div class="section-header">
-        <div>
-          <span class="eyebrow">Decision Detail</span>
-          <h2 id="detail-heading">Investigation</h2>
-        </div>
-        <div class="toolbar">
-          <button id="reopen-button" type="button" class="secondary hidden">Re-open</button>
-          <button id="continue-button" type="button" class="secondary hidden">Continue</button>
-          <div id="approval-actions" class="toolbar hidden">
-            <button id="approve-button" type="button">Approve</button>
-            <button id="reject-button" type="button" class="danger">Reject</button>
-          </div>
-        </div>
-      </div>
-      <pre id="investigation-output">Select an issue to investigate.</pre>
-      <div id="steer-panel" class="steer-panel hidden">
-        <textarea id="steer-input" rows="3" placeholder="Steer the investigation"></textarea>
-        <button id="steer-button" type="button" class="secondary">Send</button>
-      </div>
-    </section>
+    </div>
   </div>
   <div id="close-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title">
     <div class="modal-panel">
@@ -195,7 +199,8 @@ html {
 
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   background:
     radial-gradient(circle at top left, color-mix(in srgb, var(--accent-soft) 72%, transparent), transparent 32rem),
     linear-gradient(145deg, var(--bg), var(--bg-soft));
@@ -244,9 +249,10 @@ button.danger {
 button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .topbar {
@@ -362,12 +368,24 @@ p { color: var(--muted); margin-top: 4px; }
   border-top: 1px solid var(--line);
 }
 
+.work-area {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.work-area.detail-open {
+  grid-template-rows: minmax(240px, 1fr) minmax(240px, 1fr);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 344px;
   gap: 16px;
   padding: 16px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .panel {
@@ -380,12 +398,21 @@ p { color: var(--muted); margin-top: 4px; }
 
 .issue-section,
 .side-panel {
-  min-height: 430px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .detail-band {
   margin: 0 16px 16px;
-  min-height: 224px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.detail-band.hidden {
+  display: none;
 }
 
 .section-header {
@@ -448,7 +475,9 @@ p { color: var(--muted); margin-top: 4px; }
 
 .table-wrap {
   overflow: auto;
-  max-height: calc(100vh - 290px);
+  flex: 1;
+  min-height: 0;
+  max-height: none;
 }
 
 table {
@@ -491,6 +520,15 @@ tbody tr.issue-closed {
 
 tbody tr.issue-closed:hover {
   background: color-mix(in srgb, var(--success-soft) 68%, var(--panel));
+}
+
+tbody tr.issue-active {
+  background: color-mix(in srgb, var(--accent-soft) 54%, var(--panel));
+  box-shadow: inset 3px 0 0 var(--accent-strong);
+}
+
+tbody tr.issue-active:hover {
+  background: color-mix(in srgb, var(--accent-soft) 72%, var(--panel));
 }
 
 td {
@@ -562,9 +600,12 @@ th:last-child {
 
 .job-list {
   display: grid;
+  align-content: start;
   gap: 9px;
   padding: 12px;
-  max-height: calc(100vh - 354px);
+  flex: 1;
+  min-height: 0;
+  max-height: none;
   overflow: auto;
 }
 
@@ -623,7 +664,8 @@ pre {
   margin: 0;
   padding: 16px;
   min-height: 164px;
-  max-height: 360px;
+  max-height: none;
+  flex: 1;
   overflow: auto;
   white-space: pre-wrap;
   color: var(--text);
@@ -658,6 +700,43 @@ pre {
 .steer-panel textarea:focus-visible {
   outline: none;
   box-shadow: var(--focus);
+}
+
+.processing-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: var(--text);
+  background:
+    linear-gradient(100deg,
+      color-mix(in srgb, var(--accent) 22%, transparent),
+      color-mix(in srgb, var(--warning) 24%, transparent),
+      color-mix(in srgb, var(--accent-strong) 26%, transparent),
+      color-mix(in srgb, var(--accent) 22%, transparent));
+  background-size: 260% 100%;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+  animation: processingSweep 1.5s linear infinite;
+}
+
+.detail-band.processing::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--warning), var(--accent-strong), var(--accent));
+  background-size: 240% 100%;
+  animation: processingSweep 1.2s linear infinite;
+}
+
+@keyframes processingSweep {
+  from { background-position: 0% 50%; }
+  to { background-position: 200% 50%; }
 }
 
 .hidden { display: none; }
@@ -748,6 +827,23 @@ pre {
   .workspace {
     display: block;
     padding: 12px;
+    overflow: visible;
+  }
+
+  body {
+    height: auto;
+    overflow: auto;
+  }
+
+  .app-shell,
+  .work-area {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .work-area.detail-open {
+    display: block;
   }
 
   .toolbar {
@@ -823,6 +919,8 @@ const JS = `const state = {
 };
 
 const el = {
+  appShell: document.getElementById("app-shell"),
+  workArea: document.getElementById("work-area"),
   authPanel: document.getElementById("auth-panel"),
   authHeading: document.getElementById("auth-heading"),
   authMessage: document.getElementById("auth-message"),
@@ -836,8 +934,11 @@ const el = {
   statsGrid: document.getElementById("stats-grid"),
   jobList: document.getElementById("job-list"),
   dryRun: document.getElementById("dry-run"),
+  detailBand: document.getElementById("detail-band"),
   detailHeading: document.getElementById("detail-heading"),
   output: document.getElementById("investigation-output"),
+  detailCloseButton: document.getElementById("detail-close-button"),
+  detailProcessing: document.getElementById("detail-processing"),
   reopenButton: document.getElementById("reopen-button"),
   continueButton: document.getElementById("continue-button"),
   approvalActions: document.getElementById("approval-actions"),
@@ -859,6 +960,43 @@ function toast(message) {
   el.toast.classList.add("show");
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => el.toast.classList.remove("show"), 2800);
+}
+
+function setDetailOpen(open) {
+  el.detailBand.classList.toggle("hidden", !open);
+  el.workArea.classList.toggle("detail-open", open);
+}
+
+function setDetailProcessing(active, label = "Processing") {
+  el.detailBand.classList.toggle("processing", active);
+  el.detailProcessing.classList.toggle("hidden", !active);
+  el.detailProcessing.textContent = label;
+}
+
+function entryIndexForJob(jobId) {
+  return state.entries.find(entry => Number(entry.jobId) === Number(jobId))?.idx || null;
+}
+
+function updateIssueRowHighlights() {
+  for (const row of el.issueRows.querySelectorAll("[data-entry-index]")) {
+    row.classList.toggle("issue-active", Number(row.dataset.entryIndex) === Number(state.activeEntryIndex));
+  }
+}
+
+function closeDetail() {
+  clearJobPolling();
+  state.activeJobId = null;
+  state.activeEntryIndex = null;
+  setDetailProcessing(false);
+  setDetailOpen(false);
+  el.detailHeading.textContent = "Investigation";
+  el.output.textContent = "Select an issue to investigate.";
+  el.reopenButton.classList.add("hidden");
+  el.continueButton.classList.add("hidden");
+  el.approvalActions.classList.add("hidden");
+  setSteerVisible(false);
+  renderJobs(state.jobs);
+  updateIssueRowHighlights();
 }
 
 function setBusy(value) {
@@ -984,10 +1122,13 @@ function renderJobs(jobs) {
 
 function canReinvestigate(entry) {
   return Boolean(entry.investigationSummary)
-    && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState);
+    && ["detected", "queued_for_investigation", "awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState);
 }
 
 function isClosedEntry(entry) {
+  if (entry?.jobState) {
+    return entry.jobState === "closed";
+  }
   return entry?.isClosed === true
     || entry?.raw?.isClosed === true
     || entry?.lifecycle === "closed"
@@ -1074,7 +1215,7 @@ function renderSnapshot(snapshot) {
     return;
   }
   el.issueRows.innerHTML = snapshot.entries.map(entry => \`
-    <tr data-entry-index="\${entry.idx}" class="\${isClosedEntry(entry) ? "issue-closed" : ""}">
+    <tr data-entry-index="\${entry.idx}" class="\${[isClosedEntry(entry) ? "issue-closed" : "", Number(state.activeEntryIndex) === Number(entry.idx) ? "issue-active" : ""].filter(Boolean).join(" ")}">
       <td>\${entry.idx}</td>
       <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
       <td>\${escapeHtml(entry.issueId)}</td>
@@ -1092,6 +1233,9 @@ function showEntry(index) {
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   if (!entry) return;
   state.activeEntryIndex = Number(index);
+  setDetailOpen(true);
+  setDetailProcessing(false);
+  updateIssueRowHighlights();
   if (isClosedEntry(entry)) {
     showIssueSummary(index);
     return;
@@ -1104,6 +1248,7 @@ function showEntry(index) {
   el.detailHeading.textContent = "Investigation";
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  renderJobs(state.jobs);
   setSteerVisible(Boolean(entry.jobId) && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
   if (entry.investigationSummary) {
     const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
@@ -1204,25 +1349,32 @@ function startJobPolling() {
 
 async function showJob(jobId, options = {}) {
   state.activeJobId = Number(jobId);
-  state.activeEntryIndex = null;
+  state.activeEntryIndex = entryIndexForJob(jobId);
+  setDetailOpen(true);
   el.detailHeading.textContent = "Job Detail";
   if (!options.quiet) {
     el.output.textContent = "Loading job detail...";
+    setDetailProcessing(true, "Loading");
   }
   el.approvalActions.classList.add("hidden");
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  updateIssueRowHighlights();
   try {
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
     el.output.textContent = formatJobDetail(result.detail);
     updateJobControls(result.detail);
+    const processing = shouldPollJob(result.detail);
+    setDetailProcessing(processing, processing ? stateLabel(result.detail.job.state) : "Processing");
     renderJobs(state.jobs);
-    if (shouldPollJob(result.detail)) {
+    updateIssueRowHighlights();
+    if (processing) {
       if (!state.jobPollTimer) startJobPolling();
     } else {
       clearJobPolling();
     }
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   }
@@ -1246,12 +1398,16 @@ async function showIssueSummary(index) {
   state.activeEntryIndex = Number(index);
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   state.activeJobId = entry?.jobId || null;
+  setDetailOpen(true);
+  setDetailProcessing(false);
   el.detailHeading.textContent = "Issue Summary";
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   setSteerVisible(false);
   el.reopenButton.classList.toggle("hidden", !entry || !isClosedEntry(entry));
   el.output.textContent = "Loading issue summary...";
+  renderJobs(state.jobs);
+  updateIssueRowHighlights();
   try {
     const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/summary\`);
     el.output.textContent = result.summary;
@@ -1316,6 +1472,8 @@ async function closeIssueFromDialog() {
   const index = state.closeEntryIndex;
   const comment = el.closeComment.value;
   setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Closing");
   try {
     const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/close\`, {
       method: "POST",
@@ -1327,6 +1485,7 @@ async function closeIssueFromDialog() {
     el.output.textContent = formatJson(result.result);
     await showIssueSummary(index);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1338,6 +1497,7 @@ async function reopenIssue() {
   if (!state.snapshotId || !state.activeEntryIndex) return;
   const index = state.activeEntryIndex;
   setBusy(true);
+  setDetailProcessing(true, "Re-opening");
   try {
     const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/reopen\`, {
       method: "POST",
@@ -1348,6 +1508,7 @@ async function reopenIssue() {
     el.output.textContent = formatJson(result.result);
     showEntry(index);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1358,6 +1519,10 @@ async function reopenIssue() {
 async function investigate(index, force = false) {
   if (!state.snapshotId) return;
   setBusy(true);
+  state.activeEntryIndex = Number(index);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Investigating");
+  updateIssueRowHighlights();
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");
   try {
@@ -1372,6 +1537,7 @@ async function investigate(index, force = false) {
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1382,6 +1548,8 @@ async function investigate(index, force = false) {
 async function approval(action) {
   if (!state.activeJobId) return;
   setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, action === "approve" ? "Processing approval" : "Rejecting");
   const polling = setInterval(() => {
     if (state.activeJobId) {
       showJob(state.activeJobId, { quiet: true }).catch(() => {});
@@ -1395,6 +1563,7 @@ async function approval(action) {
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1406,6 +1575,8 @@ async function approval(action) {
 async function continueJob() {
   if (!state.activeJobId) return;
   setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Executing");
   const polling = setInterval(() => {
     if (state.activeJobId) {
       showJob(state.activeJobId, { quiet: true }).catch(() => {});
@@ -1418,6 +1589,7 @@ async function continueJob() {
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1431,6 +1603,8 @@ async function steerInvestigation() {
   const message = el.steerInput.value.trim();
   if (!message) return;
   setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Revising");
   el.output.textContent = "Revising investigation...";
   el.approvalActions.classList.add("hidden");
   try {
@@ -1444,6 +1618,7 @@ async function steerInvestigation() {
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
+    setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -1485,6 +1660,7 @@ el.issueRows.addEventListener("click", event => {
 });
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
+el.detailCloseButton.addEventListener("click", closeDetail);
 el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
 el.steerButton.addEventListener("click", steerInvestigation);

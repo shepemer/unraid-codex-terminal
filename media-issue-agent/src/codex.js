@@ -65,6 +65,27 @@ export function commentDraftPrompt(evidence) {
   ].join("\n");
 }
 
+export function repairExecutionPrompt(evidence, approvedPlan, availableTools) {
+  return [
+    "Approved media repair execution.",
+    "You are Codex running inside media-issue-agent after a human approved the investigation plan.",
+    "You still cannot call media tools directly. Return only the exact JSON action plan for the orchestrator to execute.",
+    "Use only the available media MCP tools listed below. Do not invent tools, endpoints, URLs, tokens, hostnames, paths, or identifiers.",
+    "Prefer exact IDs from the sanitized evidence. If the repair cannot be expressed with these tools, return an empty actions array and explain why.",
+    "Return strict JSON only, with this shape:",
+    "{\"summary\":\"short execution summary\",\"actions\":[{\"toolName\":\"tool_name\",\"riskLevel\":\"repair\",\"args\":{}}]}",
+    "",
+    "Available media MCP tools:",
+    JSON.stringify(sanitizeValue(availableTools), null, 2),
+    "",
+    "Human-approved repair plan:",
+    JSON.stringify(sanitizeValue(approvedPlan), null, 2),
+    "",
+    "Sanitized evidence JSON:",
+    JSON.stringify(sanitizeValue(evidence), null, 2)
+  ].join("\n");
+}
+
 export function steeredInvestigationPrompt(evidence, previousSummary, operatorMessage) {
   return [
     "You are Codex running inside media-issue-agent.",

@@ -95,8 +95,11 @@ function fixtureIssues() {
       createdAt: "2026-01-01T00:00:00Z",
       updatedAt: "2026-01-04T00:00:00Z",
       reporter: { username: "fixture-reporter-c" },
-      mediaTitle: "SIL Plex Fixture",
-      message: "Audio track is missing."
+      mediaTitle: "SIL Subtitle Fixture",
+      mediaType: "movie",
+      plexRatingKey: "109444",
+      year: 2026,
+      message: "subtitle-repair-fixture: Please add Korean subtitles."
     }],
     ["1002", {
       source: "seerr",
@@ -237,6 +240,24 @@ async function startFakeMediaMcp() {
           message: args.message,
           dryRun: args.dryRun
         };
+      } else if (toolName === "bazarr_download_movie_subtitles_for_plex") {
+        assert.equal(args.plexRatingKey, "109444");
+        assert.equal(args.language, "ko");
+        assert.equal(args.dryRun, false);
+        result = {
+          dryRun: false,
+          language: "ko",
+          plexRatingKey: "109444",
+          radarrMovie: { id: 44, title: "SIL Subtitle Fixture" }
+        };
+      } else if (toolName === "plex_refresh_metadata") {
+        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.dryRun, false);
+        result = {
+          dryRun: false,
+          ratingKey: "109444",
+          refreshed: true
+        };
       } else {
         throw new Error(`Unexpected SIL media-mcp tool ${toolName}`);
       }
@@ -286,15 +307,24 @@ async function createFakeCodexBin(root, logPath) {
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
+    "if (prompt.includes('Approved media repair execution')) kind = 'repair-execution';",
     "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
     "  process.exit(42);",
     "}",
     "if (kind === 'comment-draft') {",
-    "  process.stdout.write('Reviewed as a client-side playback problem. No server-side media action was applied.\\nAutomated response from Codex.\\n');",
+    "  if (prompt.includes('server_action_completed')) {",
+    "    process.stdout.write('Downloaded the requested Korean subtitles and refreshed Plex. Automated response from Codex.\\n');",
+    "  } else {",
+    "    process.stdout.write('Reviewed as a client-side playback problem. No server-side media action was applied.\\nAutomated response from Codex.\\n');",
+    "  }",
+    "} else if (kind === 'repair-execution') {",
+    "  process.stdout.write(JSON.stringify({ summary: 'Download Korean subtitles and refresh Plex.', actions: [{ toolName: 'bazarr_download_movie_subtitles_for_plex', riskLevel: 'repair', args: { plexRatingKey: '109444', language: 'ko' } }, { toolName: 'plex_refresh_metadata', riskLevel: 'verification', args: { ratingKey: '109444' } }] }));",
     "} else if (kind === 'steered-investigation') {",
     "  process.stdout.write('Revised investigation: this appears to be a client-side playback problem. No server-side action is required.\\nNext action: explain that no media repair was applied.\\n');",
+    "} else if (prompt.includes('subtitle-repair-fixture')) {",
+    "  process.stdout.write('Investigation summary: this is a Korean subtitle request for a movie. Server-side action is required.\\nExact safe next actions: download Korean subtitles with Bazarr for Plex item 109444, then refresh Plex metadata.\\nUser-side: restart playback after the server action completes.\\n');",
     "} else {",
     "  process.stdout.write('Investigation summary: fixture diagnostics show no exact allowlisted server repair yet.\\nLikely cause: playback metadata mismatch in fixture evidence.\\nNext action: request approval for the proposed no-op follow-up.\\n');",
     "}"
@@ -387,9 +417,9 @@ async function assertPolling(baseUrl, fakeMcp) {
 
   const latest = await api(baseUrl, "/api/snapshot/latest");
   assert.equal(latest.snapshot.id, polled.result.snapshotId);
-  assert.deepEqual(latest.snapshot.entries.map(entry => entry.issueId), ["plex-sil-closed", "1001", "plex-sil-open", "1002", "1003", "1004"]);
+  assert.deepEqual(latest.snapshot.entries.map(entry => entry.issueId), ["1001", "plex-sil-open", "1002", "1003", "1004", "plex-sil-closed"]);
   assert.equal(latest.snapshot.entries[0].idx, 1);
-  assert.equal(latest.snapshot.entries[0].status, "closed");
+  assert.equal(latest.snapshot.entries.at(-1).status, "closed");
   return polled.result.snapshotId;
 }
 
@@ -407,14 +437,14 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
   const before = await codexInvocations(logPath);
   const investigated = await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 2 })
+    body: JSON.stringify({ snapshotId, index: 1 })
   });
   assert.equal(investigated.result.cached, false);
   assert.equal((await codexInvocations(logPath)).length, before.length + 1);
 
   const cached = await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 2 })
+    body: JSON.stringify({ snapshotId, index: 1 })
   });
   assert.equal(cached.result.cached, true);
   assert.equal((await codexInvocations(logPath)).length, before.length + 1);
@@ -425,7 +455,7 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
 
   await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 2, force: true })
+    body: JSON.stringify({ snapshotId, index: 1, force: true })
   });
   assert.equal((await codexInvocations(logPath)).length, before.length + 2);
   details = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
@@ -480,10 +510,58 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
   assert.equal(resolveCall.args.dryRun, false);
 }
 
+async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId) {
+  const before = await codexInvocations(logPath);
+  const investigated = await api(baseUrl, "/api/investigate", {
+    method: "POST",
+    body: JSON.stringify({ snapshotId, index: 2, force: true })
+  });
+  assert.equal(investigated.result.cached, false);
+  assert.equal((await codexInvocations(logPath)).length, before.length + 1);
+
+  let details = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
+  const actionApproval = pendingApproval(details, "action");
+  assert.equal(actionApproval.payload.plan.classification, "server_action");
+  assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
+  assert.equal(actionApproval.payload.plan.actions.length, 0);
+  assert.deepEqual(actionApproval.payload.plan.candidateActions.map(action => action.toolName), [
+    "bazarr_download_movie_subtitles_for_plex",
+    "plex_refresh_metadata"
+  ]);
+
+  const resolution = await api(baseUrl, `/api/jobs/${investigated.result.jobId}/approve`, {
+    method: "POST",
+    body: "{}"
+  });
+  assert.equal(resolution.result.status, "awaiting_resolution_approval");
+  assert.equal(resolution.result.executionResult.outcome, "server_action_completed");
+  assert.equal(resolution.result.executionResult.actionsRequested, 2);
+  assert.equal(resolution.result.executionResult.actionsExecuted, 2);
+  assert.match(resolution.result.executionResult.repairAgentSummary, /Download Korean subtitles/);
+  assert.match(resolution.result.message, /Automated response from Codex\.$/);
+  assert.equal((await codexInvocations(logPath)).length, before.length + 3);
+
+  details = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
+  assert.equal(details.job.state, "awaiting_resolution_approval");
+  assert.equal(pendingApproval(details, "resolution").payload.executionResult.outcome, "server_action_completed");
+  assert.deepEqual(details.plannedActions.map(action => action.toolName).sort(), [
+    "bazarr_download_movie_subtitles_for_plex",
+    "plex_refresh_metadata"
+  ].sort());
+
+  const downloadCall = fakeMcp.calls.find(call => call.name === "bazarr_download_movie_subtitles_for_plex");
+  assert.equal(downloadCall.args.plexRatingKey, "109444");
+  assert.equal(downloadCall.args.language, "ko");
+  assert.equal(downloadCall.args.dryRun, false);
+  const refreshCall = fakeMcp.calls.find(call => call.name === "plex_refresh_metadata");
+  assert.equal(refreshCall.args.ratingKey, "109444");
+  assert.equal(refreshCall.args.dryRun, false);
+}
+
 async function assertRejectPath(baseUrl, snapshotId) {
   const investigated = await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 3 })
+    body: JSON.stringify({ snapshotId, index: 5 })
   });
   const rejected = await api(baseUrl, `/api/jobs/${investigated.result.jobId}/reject`, {
     method: "POST",
@@ -497,7 +575,7 @@ async function assertRejectPath(baseUrl, snapshotId) {
 async function assertClosureFailurePath(baseUrl, fakeMcp, snapshotId) {
   const investigated = await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 4 })
+    body: JSON.stringify({ snapshotId, index: 3 })
   });
   await api(baseUrl, `/api/jobs/${investigated.result.jobId}/approve`, {
     method: "POST",
@@ -523,7 +601,7 @@ async function assertClosureFailurePath(baseUrl, fakeMcp, snapshotId) {
 async function assertCodexFailurePath(baseUrl, snapshotId) {
   const investigated = await api(baseUrl, "/api/investigate", {
     method: "POST",
-    body: JSON.stringify({ snapshotId, index: 5 })
+    body: JSON.stringify({ snapshotId, index: 4 })
   });
   assert.equal(investigated.result.status, "failed");
   assert.equal(investigated.result.approvalId, null);
@@ -535,7 +613,7 @@ async function assertCodexFailurePath(baseUrl, snapshotId) {
 }
 
 async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
-  const closed = await api(baseUrl, `/api/issues/${snapshotId}/6/close`, {
+  const closed = await api(baseUrl, `/api/issues/${snapshotId}/5/close`, {
     method: "POST",
     body: JSON.stringify({ comment: "Operator reviewed and closed this fixture." })
   });
@@ -549,7 +627,7 @@ async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
     "seerr_resolve_issue"
   ].sort());
 
-  const summary = await api(baseUrl, `/api/issues/${snapshotId}/6/summary`);
+  const summary = await api(baseUrl, `/api/issues/${snapshotId}/5/summary`);
   assert.equal(summary.closed, true);
   assert.match(summary.summary, /Local workflow history/);
   assert.match(summary.summary, /direct_close_completed/);
@@ -559,7 +637,7 @@ async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
   assert.equal(directComments[1].args.message, "Closed.");
   assert.ok(fakeMcp.calls.some(call => call.name === "seerr_resolve_issue" && call.args.issueId === 1004));
 
-  const reopened = await api(baseUrl, `/api/issues/${snapshotId}/6/reopen`, {
+  const reopened = await api(baseUrl, `/api/issues/${snapshotId}/5/reopen`, {
     method: "POST",
     body: "{}"
   });
@@ -617,6 +695,7 @@ async function run() {
     const snapshotId = await assertPolling(baseUrl, fakeMcp);
     await assertCliAccess(env, snapshotId);
     await assertInvestigationSteeringAndClosure(baseUrl, codexLogPath, fakeMcp, snapshotId);
+    await assertServerActionExecution(baseUrl, codexLogPath, fakeMcp, snapshotId);
     await assertRejectPath(baseUrl, snapshotId);
     await assertClosureFailurePath(baseUrl, fakeMcp, snapshotId);
     await assertCodexFailurePath(baseUrl, snapshotId);
