@@ -115,11 +115,14 @@ export async function issueQueue(records, client) {
         issueId: String(record.id ?? record.issueId),
         verbose: false
       });
-      issue = details.issue || details;
+      issue = { ...record, ...(details.issue || details) };
     }
     queued.push(normalizeIssue(issue));
   }
   return queued.sort((left, right) => {
+    if (left.isClosed !== right.isClosed) {
+      return left.isClosed ? 1 : -1;
+    }
     const leftDate = left.updatedAt || left.createdAt || left.date || "";
     const rightDate = right.updatedAt || right.createdAt || right.date || "";
     return rightDate.localeCompare(leftDate);

@@ -7,6 +7,7 @@
   "scripts": {
     "check": "node --check server.js",
     "test:arr-commands": "node test-arr-command-tools.js",
+    "test:bazarr-subtitles": "node test-bazarr-subtitle-tools.js",
     "test:plex-issues": "node test-plex-reported-issues.js",
     "test:seerr-issues": "node test-seerr-update-issue.js",
     "test:threadfin": "node test-threadfin-tools.js"
