@@ -145,6 +145,10 @@ services:
       TRACEARR_API_KEY: ${TRACEARR_API_KEY:-}
       BAZARR_URL: ${BAZARR_URL:-}
       BAZARR_API_KEY: ${BAZARR_API_KEY:-}
+      THREADFIN_URL: ${THREADFIN_URL:-}
+      THREADFIN_USERNAME: ${THREADFIN_USERNAME:-}
+      THREADFIN_PASSWORD: ${THREADFIN_PASSWORD:-}
+      THREADFIN_TOKEN: ${THREADFIN_TOKEN:-}
       MEDIA_MCP_PATH_MAPS: ${MEDIA_MCP_PATH_MAPS:-/downloads=/mnt/unraid/downloads}
     volumes:
       - ${MEDIA_MCP_DOWNLOADS_DIR:-/mnt/user/downloads}:/mnt/unraid/downloads:rw

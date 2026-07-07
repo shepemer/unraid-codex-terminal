@@ -18,7 +18,7 @@ For full configuration, validation, local development, and security notes, see [
 
 - `codex-terminal`: SSH on container port `2222`, WebUI on `7681`, Codex CLI, persistent `/config`, and `/workspace`.
 - `unraid-mcp`: internal HTTP MCP sidecar for Unraid API access.
-- `media-mcp`: optional internal HTTP MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-mcp`: optional internal HTTP MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, Threadfin, and Seerr-family media automation.
 - `media-issue-agent`: optional internal worker for human-approved triage and follow-up of Plex-native reports and Seerr-family issues, using `media-mcp` and Codex ChatGPT auth.
 - `utilities-mcp`: optional internal HTTP MCP sidecar for Scrutiny storage health monitoring.
 - `codex-mgmt`: private Docker bridge network shared by the containers.
@@ -60,11 +60,11 @@ For full configuration, validation, local development, and security notes, see [
    Required settings:
 
    - `MEDIA_MCP_BEARER_TOKEN`
-   - at least one complete media app credential pair, such as `SONARR_URL` and `SONARR_API_KEY`
+   - at least one complete media app credential pair, such as `SONARR_URL` and `SONARR_API_KEY`, or `THREADFIN_URL` with optional Threadfin credentials
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `media` MCP server to Codex config.
 
-   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, archive extraction with filesystem fallback, command trigger, interactive search, and release-grab tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first. For archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports another path.
+   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, archive extraction with filesystem fallback, command trigger, interactive search, release-grab tools, and Threadfin read/write configuration tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first. Threadfin uses its own API/websocket control surfaces, not appdata mounts. For archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports another path.
 
 6. Optional: install `utilities-mcp` on the same network.
 
@@ -128,5 +128,5 @@ The WebUI attaches to a persistent `tmux` session and starts Codex automatically
 - Never mount `/var/run/docker.sock`, `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Keep optional media/download mounts narrow. Use read/write downloads mounts only when you intentionally enable archive extraction.
 - Use a scoped Unraid API key, not an unrestricted admin key.
-- Keep media app API keys only on `media-mcp`, and enable only the services you want Codex to manage.
+- Keep media app API keys and Threadfin credentials only on `media-mcp`, and enable only the services you want Codex to manage.
 - Keep Scrutiny endpoints only on `utilities-mcp`, and do not expose MCP sidecar ports to the host.
