@@ -31,7 +31,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
 - `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, Threadfin, and Seerr-family media automation.
-- `media-issue-agent`: optional human-in-the-loop worker on the internal `codex-mgmt` network for Plex-native reports and Seerr-family issue triage. It uses `media-mcp` for media API access and local Codex ChatGPT auth for investigation summaries and comment drafts.
+- `media-issue-agent`: optional human-in-the-loop worker on the internal `codex-mgmt` network for Plex-native reports and Seerr-family issue triage and repair. It uses `media-mcp` for media API access and local Codex ChatGPT auth for investigation summaries, autonomous repair runs, and comment drafts.
 - `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
 
@@ -115,7 +115,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    http://<unraid-ip>:6983/
    ```
 
-   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, steer investigations with operator notes, inspect jobs, and approve or reject pending work. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Each steering note supersedes the previous pending plan approval and creates a new one. Action approval executes the approved job flow, then moves to an approve-fix state with the execution result and a drafted resolution comment. Final approval posts the resolution, adds `Closed.`, and resolves Seerr-family issues when applicable. The CLI remains available for the same workflow:
+   Use `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, steer investigations with operator notes, inspect jobs, configure Codex model/speed defaults and non-secret repair context, and approve or reject pending work. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Each steering note supersedes the previous pending repair prompt approval and creates a new one. Action approval either records a client-side/no-op determination or launches an autonomous `codex exec --json` repair run with full access inside the issue-agent container and direct `media-mcp` access. After the repair run returns verified final JSON, the job moves to approve-fix with the execution result and a drafted resolution comment. If a repair fails retryably or asks for an operator decision, the Web UI can retry the approved repair with a trusted note. Final approval posts the resolution, adds `Closed.`, and resolves Seerr-family issues when applicable. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
@@ -270,17 +270,20 @@ Important behavior:
 
 - Plex-native reports with any comment exactly `Closed.` are treated as resolved. Matching is case-insensitive and ignores leading or trailing whitespace.
 - If a Plex list response does not include comments, or `commentCount` shows comments may exist, the agent fetches issue details before deciding whether the report is open.
-- Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, and redacted audit events.
+- Local SQLite state never overrides Plex or Seerr truth. It stores snapshots, job state, locks, approval records, retries, timestamps, redacted audit events, and per-job repair runner history. `ISSUE_AGENT_SNAPSHOT_RETENTION` controls how many recent snapshots are kept before older snapshot rows are pruned.
 - Investigation summaries and sanitized evidence are cached per job. Selecting an issue in the Web UI shows the cached investigation when one exists; Re-investigate or CLI `--force` reruns Codex and replaces the cached result.
-- The agent uses Codex local through ChatGPT auth for investigation summaries and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
+- The agent uses Codex local through ChatGPT auth for investigation summaries, autonomous repair runs, and comment drafts. It refuses OpenAI API key auth, so `OPENAI_API_KEY` and `CODEX_API_KEY` must be unset.
 - The Web UI requires Basic auth through `ISSUE_AGENT_WEB_USERNAME` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against the mounted `CODEX_HOME`.
 - The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
-- Job rows in the Activity panel are clickable. The detail pane shows the current state, pending approval kind, approved plan, execution result, draft resolution comment, planned action results, and recent audit events.
+- Job rows in the Activity panel are clickable. The detail pane shows the current state, pending approval kind, approved repair prompt, execution result, draft resolution comment, autonomous repair run events, planned closure actions, and recent audit events.
 - The investigation pane includes a steering box. Each steering note reruns Codex against sanitized evidence and the previous summary, updates the investigation, supersedes the old action approval, and creates a fresh approval for the new plan.
-- Action approval starts the job flow. If the approved determination is client-side or has no exact supported server action, the job records that no server-side media action was executed and moves directly to approve-fix with a drafted resolution comment. Supported future repair actions stay behind exact allowlists.
+- Action approval starts the job flow. If the approved determination is client-side or requires no server-side action, the job records that no server-side media action was executed and moves directly to approve-fix with a drafted resolution comment. Otherwise it launches Codex as an autonomous repair runner with `--dangerously-bypass-approvals-and-sandbox`, `--skip-git-repo-check`, `--ephemeral`, `--json`, selected model/reasoning settings, a live `tools/list` briefing from `media-mcp`, the configured non-secret repair context, and the configured `media` MCP server.
+- The repair runner is intentionally broad for media-side repair work. It can choose the `media-mcp` tools that fit the evidence instead of going through an issue-agent repair allowlist. During that autonomous phase, the issue agent routes Codex through a repair-scoped MCP proxy that blocks reporter comments, issue resolve/reopen, and issue delete tools; those lifecycle changes stay behind the final human approval.
+- Each repair run gets a persistent per-job scratch workspace under `ISSUE_AGENT_REPAIR_WORKSPACE_ROOT`, defaulting to `/state/repair-workspaces`. Codex sessions remain ephemeral, but retry runs can inspect prior scratch files and operator retry notes.
+- The repair runner must return strict final JSON with status, summary, actions taken, verification, draft comment, and close recommendation. It may return `needs_operator_decision` with proposed choices when multiple risky valid repairs need human selection. Invalid JSON, failed runs, decision requests, or output that asks the server owner/operator to do media-side repair work becomes `failed_retryable` and does not create a success resolution approval.
 - Final resolution approval posts the drafted comment, posts the exact `Closed.` marker, and resolves Seerr-family issues when applicable. These final closure actions run live after approval.
-- Mutating media actions stay behind explicit approvals and exact allowlists.
+- Mutating media repairs are performed by the approved autonomous Codex runner through `media-mcp`; final reporter comments and issue closure still require explicit approval in the issue agent.
 - Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`
 
 The Web UI is the primary approval surface. The CLI remains available for the same operations:
@@ -545,6 +548,8 @@ npm --prefix media-mcp run test:arr-commands
 npm --prefix media-mcp run test:threadfin
 npm --prefix media-issue-agent run check
 npm --prefix media-issue-agent test
+npm --prefix media-issue-agent run test:web
+npm --prefix media-issue-agent run sil
 npm --prefix utilities-mcp run check
 python3 -c 'import xml.etree.ElementTree as ET; [ET.parse(p) for p in ("templates/codex-terminal.xml", "templates/unraid-mcp.xml", "templates/media-mcp.xml", "templates/media-issue-agent.xml", "templates/utilities-mcp.xml")]'
 docker compose config

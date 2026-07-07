@@ -23,13 +23,10 @@ import {
 import { issueTableMarkdown } from "../src/issues.js";
 import { MediaMcpClient } from "../src/mcp-client.js";
 import { createWebHandler } from "../src/web.js";
+import { closeServer, jsonRpcError as rpcError, jsonRpcResult as rpcResult, readBody } from "./helpers.js";
 
 async function tempDir(prefix = "media-issue-agent-comprehensive-") {
   return mkdtemp(path.join(os.tmpdir(), prefix));
-}
-
-async function closeServer(server) {
-  await new Promise(resolve => server.close(resolve));
 }
 
 async function writeAuthHome(authJson) {
@@ -50,24 +47,6 @@ async function writeFakeCodex(root, handlerSource) {
   return bin;
 }
 
-async function readBody(req) {
-  let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-  }
-  return body;
-}
-
-function rpcResult(id, value) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    result: {
-      content: [{ type: "text", text: JSON.stringify(value) }]
-    }
-  };
-}
-
 function rpcToolError(id, message) {
   return {
     jsonrpc: "2.0",
@@ -76,14 +55,6 @@ function rpcToolError(id, message) {
       isError: true,
       content: [{ type: "text", text: message }]
     }
-  };
-}
-
-function rpcError(id, message) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    error: { code: -32000, message }
   };
 }
 
@@ -148,14 +119,14 @@ async function testCodexAuthInspectionEdges() {
 
     const loaded = await loadConfig({
       ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
-      ISSUE_AGENT_DRY_RUN: "yes",
       ISSUE_AGENT_WEB_ENABLED: "false",
       ISSUE_AGENT_POLL_INTERVAL_SECONDS: "30",
+      ISSUE_AGENT_SNAPSHOT_RETENTION: "3",
       CODEX_HOME: chatGptAuth
     });
-    assert.equal(loaded.dryRun, true);
     assert.equal(loaded.webEnabled, false);
     assert.equal(loaded.pollIntervalSeconds, 30);
+    assert.equal(loaded.issueSnapshotRetention, 3);
 
     await assert.rejects(
       () => loadConfig({
@@ -191,6 +162,20 @@ async function testMediaMcpClientResponsesAndRedaction() {
       accept: req.headers.accept,
       body
     });
+    if (body.method === "tools/list") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          tools: [
+            { name: "json_ok", description: "Fixture JSON tool." },
+            { name: "sse_ok", description: "Fixture SSE tool." }
+          ]
+        }
+      }));
+      return;
+    }
     const name = body.params.name;
     if (name === "json_ok") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -200,6 +185,24 @@ async function testMediaMcpClientResponsesAndRedaction() {
     if (name === "sse_ok") {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(`event: message\ndata: ${JSON.stringify(rpcResult(body.id, { ok: true, via: "sse" }))}\n\n`);
+      return;
+    }
+    if (name === "sse_multi") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end([
+        `event: progress\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress" })}`,
+        `event: message\ndata: ${JSON.stringify(rpcResult(body.id, { ok: true, via: "sse_multi" }))}`,
+        ""
+      ].join("\n\n"));
+      return;
+    }
+    if (name === "sse_result_then_progress") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end([
+        `event: message\ndata: ${JSON.stringify(rpcResult(body.id, { ok: true, via: "result_then_progress" }))}`,
+        `event: progress\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { done: true } })}`,
+        ""
+      ].join("\n\n"));
       return;
     }
     const privateError = `${["Bearer", "sil-secret-token"].join(" ")} https://service.example.invalid/private /mnt/user/private/file.mkv`;
@@ -227,6 +230,9 @@ async function testMediaMcpClientResponsesAndRedaction() {
     });
     assert.deepEqual(await client.callTool("json_ok", { one: 1 }), { ok: true, via: "json" });
     assert.deepEqual(await client.callTool("sse_ok"), { ok: true, via: "sse" });
+    assert.deepEqual(await client.callTool("sse_multi"), { ok: true, via: "sse_multi" });
+    assert.deepEqual(await client.callTool("sse_result_then_progress"), { ok: true, via: "result_then_progress" });
+    assert.deepEqual((await client.listTools()).map(tool => tool.name), ["json_ok", "sse_ok"]);
     assert.equal(requests[0].authorization, ["Bearer", "fixture-token"].join(" "));
     assert.match(requests[0].accept, /text\/event-stream/);
     assert.equal(requests[0].body.id, 1);
@@ -260,6 +266,14 @@ async function testCliHelpAndUnknownCommand() {
       assert.doesNotMatch(error.message, /CODEX_HOME/);
       return true;
     }
+  );
+
+  await assert.rejects(
+    () => main(["approve", "1"], {
+      ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
+      ISSUE_AGENT_WEB_ENABLED: "false"
+    }),
+    /CODEX_HOME is required/
   );
 }
 
@@ -306,6 +320,7 @@ async function testAgentGuardRails() {
     });
     const job = ensureJob(dbPath, "seerr", "fixture-2001");
     await assert.rejects(() => agent.approve(job.id, "fixture"), /no pending approval/);
+    assert.throws(() => agent.reject(job.id, "fixture"), /no pending approval/);
     await assert.rejects(() => agent.continueJob(job.id, "fixture"), /cannot continue from detected/);
     await assert.rejects(() => agent.steerInvestigation(job.id, "client-side", "fixture"), /has no investigation to steer/);
 
@@ -331,7 +346,7 @@ async function testPlexResolutionFallbackAndClosure() {
       "if (prompt.includes('Draft a reporter-facing')) {",
       "  process.stdout.write(`${'x'.repeat(320)}\\nAutomated response from Codex.\\n`);",
       "} else {",
-      "  process.stdout.write('Investigation summary: no exact allowlisted server-side repair action is available.\\n');",
+      "  process.stdout.write('Investigation summary: client-side playback issue; no server-side action is needed.\\n');",
       "}"
     ].join("\n"));
     const client = {
@@ -371,7 +386,7 @@ async function testPlexResolutionFallbackAndClosure() {
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const resolution = await agent.approve(investigated.jobId, "fixture");
     assert.equal(resolution.status, "awaiting_resolution_approval");
-    assert.equal(resolution.executionResult.outcome, "no_supported_action");
+    assert.equal(resolution.executionResult.outcome, "client_side");
     assert.match(resolution.message, /Automated response from Codex\.$/);
     assert.ok(countCharacters(resolution.message) <= 300);
     assert.doesNotMatch(resolution.message, /^x{20}/);
@@ -385,6 +400,62 @@ async function testPlexResolutionFallbackAndClosure() {
     assert.match(commentCalls[0].args.message, new RegExp(`${AUTOMATED_SUFFIX.replaceAll(".", "\\.")}$`));
     assert.equal(commentCalls[1].args.message, "Closed.");
     assert.equal(calls.some(call => call.name === "seerr_resolve_issue"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function testDelegatingDraftRejectedBeforeFallback() {
+  const root = await tempDir();
+  const dbPath = path.join(root, "state.sqlite");
+  const codexHome = await writeAuthHome({ chatgpt: { account: "fixture" } });
+  try {
+    const codexBin = await writeFakeCodex(root, [
+      "if (prompt.includes('Draft a reporter-facing')) {",
+      "  process.stdout.write('Server owner should replace this manually before closing. ' + 'x'.repeat(260) + '\\nAutomated response from Codex.\\n');",
+      "} else {",
+      "  process.stdout.write('Investigation summary: client-side playback issue; no server-side action is needed.\\n');",
+      "}"
+    ].join("\n"));
+    const client = {
+      async callTool(name, args) {
+        if (name === "plex_issue_details") {
+          return { issue: { source: "plex", id: args.issueId, status: "open", message: "Fixture Plex issue", comments: [] } };
+        }
+        if (name === "media_diagnose_issue") {
+          return { issue: { source: "plex", id: args.issueId }, suggestedActions: [] };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    };
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(root, "workspace"),
+      codexTimeoutMs: 10000,
+      dryRun: false
+    }, client);
+    await agent.init();
+    const entries = [{
+      source: "plex",
+      issueId: "plex-delegating-draft",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Plex Title",
+      status: "open",
+      description: "Fixture Plex issue"
+    }];
+    const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+    const investigated = await agent.investigate(snapshot.id, 1, { force: true });
+    await assert.rejects(
+      () => agent.approve(investigated.jobId, "fixture"),
+      /Draft resolution delegated/
+    );
+    const details = jobDetails(dbPath, investigated.jobId);
+    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -536,6 +607,7 @@ async function run() {
   await testDbApprovalAndActionPersistence();
   await testAgentGuardRails();
   await testPlexResolutionFallbackAndClosure();
+  await testDelegatingDraftRejectedBeforeFallback();
   await testManualCloseReopenAndClosedCommentSummary();
   await testWebErrorRedactionAndRouteEdges();
   console.log("media-issue-agent comprehensive tests passed");

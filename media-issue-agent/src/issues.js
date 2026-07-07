@@ -105,9 +105,27 @@ function needsCommentDetails(issue) {
   return !Array.isArray(issue.comments) && Number(issue.commentCount || 0) > 0;
 }
 
-export async function issueQueue(records, client) {
-  const queued = [];
-  for (const record of records) {
+async function mapWithConcurrency(values, concurrency, mapper) {
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  async function worker() {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) {
+        return;
+      }
+      results[index] = await mapper(values[index], index);
+    }
+  }
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, values.length || 1)) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+export async function issueQueue(records, client, options = {}) {
+  const detailConcurrency = Math.max(1, Math.min(Number(options.detailConcurrency || 4), 16));
+  const queued = await mapWithConcurrency(records, detailConcurrency, async record => {
     let issue = record;
     if (needsCommentDetails(record)) {
       const details = await client.callTool("plex_issue_details", {
@@ -117,8 +135,8 @@ export async function issueQueue(records, client) {
       });
       issue = { ...record, ...(details.issue || details) };
     }
-    queued.push(normalizeIssue(issue));
-  }
+    return normalizeIssue(issue);
+  });
   return queued.sort((left, right) => {
     if (left.isClosed !== right.isClosed) {
       return left.isClosed ? 1 : -1;

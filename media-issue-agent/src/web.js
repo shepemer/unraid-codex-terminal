@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import http from "node:http";
 import { inspectCodexAuth } from "./config.js";
+import { buildCodexSubprocessEnv } from "./codex.js";
 import { redactText, sanitizeValue } from "./redact.js";
 
 const HTML = `<!doctype html>
@@ -47,6 +48,40 @@ const HTML = `<!doctype html>
       <pre id="login-output" class="login-output hidden"></pre>
     </section>
 
+    <section id="codex-settings-panel" class="settings-panel panel" aria-labelledby="codex-settings-heading">
+      <div>
+        <span class="eyebrow">Codex Runner</span>
+        <h2 id="codex-settings-heading">Model Settings</h2>
+      </div>
+      <label>
+        <span>Model</span>
+        <input id="codex-model" type="text" autocomplete="off">
+      </label>
+      <label>
+        <span>Reasoning</span>
+        <select id="codex-reasoning">
+          <option value="minimal">Minimal</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">Very High</option>
+        </select>
+      </label>
+      <label class="toggle-label">
+        <input id="codex-fast-mode" type="checkbox">
+        <span>Fast mode</span>
+      </label>
+      <label>
+        <span>Service tier</span>
+        <input id="codex-service-tier" type="text" autocomplete="off">
+      </label>
+      <label class="settings-wide">
+        <span>Repair context</span>
+        <textarea id="codex-repair-context" rows="2" placeholder="Non-secret operating preferences for repair runs"></textarea>
+      </label>
+      <button id="codex-settings-save" type="button" class="secondary">Save</button>
+    </section>
+
     <div id="work-area" class="work-area">
       <main class="workspace">
         <section class="issue-section panel" aria-labelledby="issues-heading">
@@ -85,7 +120,7 @@ const HTML = `<!doctype html>
               <span class="eyebrow">Operations</span>
               <h2 id="activity-heading">Activity</h2>
             </div>
-            <span id="dry-run" class="badge warning">approval-gated</span>
+            <span id="approval-mode" class="badge warning">approval-gated</span>
           </div>
           <div class="stats-grid" id="stats-grid"></div>
           <div class="job-list" id="job-list"></div>
@@ -113,6 +148,10 @@ const HTML = `<!doctype html>
         <div id="steer-panel" class="steer-panel hidden">
           <textarea id="steer-input" rows="3" placeholder="Steer the investigation"></textarea>
           <button id="steer-button" type="button" class="secondary">Send</button>
+        </div>
+        <div id="repair-retry-panel" class="steer-panel hidden">
+          <textarea id="repair-retry-input" rows="3" placeholder="Retry repair with trusted guidance"></textarea>
+          <button id="repair-retry-button" type="button" class="secondary">Retry repair</button>
         </div>
       </section>
     </div>
@@ -366,6 +405,67 @@ p { color: var(--muted); margin-top: 4px; }
   min-height: 96px;
   max-height: 220px;
   border-top: 1px solid var(--line);
+}
+
+.settings-panel {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.2fr) minmax(130px, 0.8fr) minmax(130px, 0.8fr) auto minmax(110px, 0.7fr) auto;
+  align-items: end;
+  gap: 12px;
+  margin: 16px 16px 0;
+  padding: 14px;
+}
+
+.settings-panel label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.settings-panel label span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.settings-panel input[type="text"],
+.settings-panel select,
+.settings-panel textarea {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.settings-panel input[type="text"]:focus-visible,
+.settings-panel select:focus-visible,
+.settings-panel textarea:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+.settings-wide {
+  grid-column: 1 / -2;
+}
+
+.settings-panel .toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+}
+
+.settings-panel .toggle-label input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
 }
 
 .work-area {
@@ -914,6 +1014,15 @@ pre {
     width: 100%;
   }
 
+  .settings-panel {
+    grid-template-columns: 1fr;
+    margin: 12px 12px 0;
+  }
+
+  .settings-panel > button {
+    width: 100%;
+  }
+
   .stats-grid {
     grid-template-columns: 1fr;
   }
@@ -929,6 +1038,7 @@ const JS = `const state = {
   busy: false,
   authOk: false,
   loginRunning: false,
+  codexSettings: null,
   authTimer: null,
   jobPollTimer: null
 };
@@ -941,6 +1051,12 @@ const el = {
   authMessage: document.getElementById("auth-message"),
   loginButton: document.getElementById("login-button"),
   loginOutput: document.getElementById("login-output"),
+  codexModel: document.getElementById("codex-model"),
+  codexReasoning: document.getElementById("codex-reasoning"),
+  codexFastMode: document.getElementById("codex-fast-mode"),
+  codexServiceTier: document.getElementById("codex-service-tier"),
+  codexRepairContext: document.getElementById("codex-repair-context"),
+  codexSettingsSave: document.getElementById("codex-settings-save"),
   snapshotMeta: document.getElementById("snapshot-meta"),
   issueCount: document.getElementById("issue-count"),
   issueRows: document.getElementById("issue-rows"),
@@ -948,7 +1064,7 @@ const el = {
   reloadButton: document.getElementById("reload-button"),
   statsGrid: document.getElementById("stats-grid"),
   jobList: document.getElementById("job-list"),
-  dryRun: document.getElementById("dry-run"),
+  approvalMode: document.getElementById("approval-mode"),
   detailBand: document.getElementById("detail-band"),
   detailHeading: document.getElementById("detail-heading"),
   output: document.getElementById("investigation-output"),
@@ -962,6 +1078,9 @@ const el = {
   steerPanel: document.getElementById("steer-panel"),
   steerInput: document.getElementById("steer-input"),
   steerButton: document.getElementById("steer-button"),
+  repairRetryPanel: document.getElementById("repair-retry-panel"),
+  repairRetryInput: document.getElementById("repair-retry-input"),
+  repairRetryButton: document.getElementById("repair-retry-button"),
   closeDialog: document.getElementById("close-dialog"),
   closeComment: document.getElementById("close-comment"),
   closeCancelButton: document.getElementById("close-cancel-button"),
@@ -1104,12 +1223,34 @@ function statusBadgeClass(status) {
   return "status-pill";
 }
 
+function issueLifecycleFromEntryComments(entry) {
+  const comments = Array.isArray(entry?.raw?.comments) ? entry.raw.comments : [];
+  const markers = [];
+  comments.forEach((comment, index) => {
+    const message = String(comment?.message || "").trim().toLowerCase();
+    if (message === "closed.") {
+      markers.push({ type: "closed", index, timestamp: Date.parse(comment.createdAt || comment.updatedAt || comment.date || "") });
+    }
+    if (message === "re-opened issue.") {
+      markers.push({ type: "open", index, timestamp: Date.parse(comment.createdAt || comment.updatedAt || comment.date || "") });
+    }
+  });
+  if (!markers.length) {
+    return null;
+  }
+  const allTimed = markers.every(marker => Number.isFinite(marker.timestamp));
+  const latest = allTimed
+    ? markers.toSorted((left, right) => left.timestamp - right.timestamp || left.index - right.index).at(-1)
+    : markers.at(-1);
+  return latest.type === "closed";
+}
+
 function renderStats(status) {
   const jobTotal = (status.jobs || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
   const pending = (status.approvals || []).find(row => row.status === "pending")?.count || 0;
   const latest = status.snapshots?.latestId || "-";
-  el.dryRun.textContent = "approval-gated";
-  el.dryRun.className = "badge warning";
+  el.approvalMode.textContent = "approval-gated";
+  el.approvalMode.className = "badge warning";
   el.statsGrid.innerHTML = [
     ["Snapshots", status.snapshots?.count || 0],
     ["Latest", latest],
@@ -1141,15 +1282,25 @@ function canReinvestigate(entry) {
 }
 
 function isClosedEntry(entry) {
-  if (entry?.jobState) {
-    return entry.jobState === "closed";
+  const lifecycle = String(entry?.lifecycle || entry?.raw?.lifecycle || "").toLowerCase();
+  if (lifecycle === "closed") {
+    return true;
   }
-  return entry?.isClosed === true
-    || entry?.raw?.isClosed === true
-    || entry?.lifecycle === "closed"
-    || entry?.jobState === "closed"
-    || String(entry?.status || "").toLowerCase().includes("closed")
-    || String(entry?.status || "").toLowerCase().includes("resolved");
+  if (lifecycle === "open") {
+    return false;
+  }
+  const commentLifecycle = issueLifecycleFromEntryComments(entry);
+  if (commentLifecycle !== null) {
+    return commentLifecycle;
+  }
+  if (entry?.isClosed === true || entry?.raw?.isClosed === true) {
+    return true;
+  }
+  const status = String(entry?.status || entry?.raw?.status || entry?.raw?.rawStatus || "").toLowerCase();
+  if (status === "closed" || status === "resolved" || status.includes("closed") || status.includes("resolved")) {
+    return true;
+  }
+  return entry?.jobState === "closed";
 }
 
 function canInvestigate(entry) {
@@ -1197,6 +1348,11 @@ function setSteerVisible(visible) {
   el.steerButton.disabled = !visible || state.busy || !state.authOk;
 }
 
+function setRepairRetryVisible(visible) {
+  el.repairRetryPanel.classList.toggle("hidden", !visible);
+  el.repairRetryButton.disabled = !visible || state.busy || !state.authOk;
+}
+
 function renderAuth(auth, login) {
   state.authOk = Boolean(auth?.ok);
   state.loginRunning = login?.status === "running";
@@ -1209,6 +1365,16 @@ function renderAuth(auth, login) {
   const output = login?.output || "";
   el.loginOutput.classList.toggle("hidden", !output);
   el.loginOutput.textContent = output;
+}
+
+function renderCodexSettings(settings) {
+  state.codexSettings = settings || null;
+  const effective = settings?.effective || settings?.defaults || {};
+  el.codexModel.value = effective.model || "gpt-5.5";
+  el.codexReasoning.value = effective.reasoningEffort || "xhigh";
+  el.codexFastMode.checked = effective.fastMode !== false;
+  el.codexServiceTier.value = effective.serviceTier || "";
+  el.codexRepairContext.value = effective.repairContext || "";
 }
 
 function renderSnapshot(snapshot) {
@@ -1263,6 +1429,7 @@ function showEntry(index) {
   el.detailHeading.textContent = "Investigation";
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  setRepairRetryVisible(false);
   renderJobs(state.jobs);
   setSteerVisible(Boolean(entry.jobId) && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
   if (entry.investigationSummary) {
@@ -1299,7 +1466,12 @@ function formatJobDetail(detail) {
   if (pending) {
     lines.push("", \`Pending \${pending.kind} approval #\${pending.id}\`);
     if (pending.payload?.plan) {
-      lines.push("", "Approved plan waiting for your decision:", formatJson(pending.payload.plan));
+      lines.push("", "Approved repair prompt waiting for your decision:");
+      if (pending.payload.plan.repairPrompt) {
+        lines.push(pending.payload.plan.repairPrompt);
+      } else {
+        lines.push(formatJson(pending.payload.plan));
+      }
     }
     if (pending.payload?.executionResult) {
       lines.push("", "Fix result:", formatJson(pending.payload.executionResult));
@@ -1335,6 +1507,30 @@ function formatJobDetail(detail) {
       }));
     }
   }
+  if (detail.agentRuns?.length) {
+    lines.push("", "Autonomous Codex repair runs:");
+    for (const run of detail.agentRuns) {
+      lines.push(formatJson({
+        id: run.id,
+        kind: run.kind,
+        status: run.status,
+        model: run.config?.model,
+        reasoningEffort: run.config?.reasoningEffort,
+        fastMode: run.config?.fastMode,
+        serviceTier: run.config?.serviceTier,
+        startedAt: run.startedAt,
+        completedAt: run.completedAt,
+        error: run.error,
+        finalResult: run.finalResult
+      }));
+    }
+  }
+  if (detail.agentRunEvents?.length) {
+    lines.push("", "Live repair activity:");
+    for (const event of detail.agentRunEvents.slice(0, 12).reverse()) {
+      lines.push(\`- \${event.createdAt} run \${event.runId} \${event.eventType}: \${formatJson(event.payload)}\`);
+    }
+  }
   if (detail.auditEvents?.length) {
     lines.push("", "Recent activity:");
     for (const event of detail.auditEvents.slice(0, 8)) {
@@ -1347,9 +1543,17 @@ function formatJobDetail(detail) {
 function updateJobControls(detail) {
   const pending = pendingApproval(detail);
   const stateName = detail.job.state;
-  const canApprove = Boolean(pending) && ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"].includes(stateName);
+  const canApprove = Boolean(pending) && (
+    ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"].includes(stateName)
+    || (stateName === "failed_retryable" && pending.kind === "resolution")
+  );
+  const hasApprovedRepair = (detail.approvals || []).some(approval => approval.kind === "action"
+    && approval.status === "approved"
+    && approval.payload?.plan?.executionMode === "approved_repair_agent");
+  const hasPendingResolution = pending?.kind === "resolution";
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
+  setRepairRetryVisible(stateName === "failed_retryable" && hasApprovedRepair && !hasPendingResolution);
   setSteerVisible(stateName === "awaiting_action_approval");
 }
 
@@ -1408,17 +1612,41 @@ async function showJob(jobId, options = {}) {
 }
 
 async function refresh() {
-  const [status, snapshot, jobs, auth] = await Promise.all([
+  const [status, snapshot, jobs, auth, codexSettings] = await Promise.all([
     api("/api/status"),
     api("/api/snapshot/latest"),
     api("/api/jobs"),
-    api("/api/auth")
+    api("/api/auth"),
+    api("/api/settings/codex")
   ]);
   renderStats(status.status);
   renderAuth(auth.auth, auth.login);
+  renderCodexSettings(codexSettings.settings);
   renderSnapshot(snapshot.snapshot);
   renderJobs(jobs.jobs);
   scheduleAuthRefresh();
+}
+
+async function saveCodexSettings() {
+  setBusy(true);
+  try {
+    const result = await api("/api/settings/codex", {
+      method: "POST",
+      body: JSON.stringify({
+        model: el.codexModel.value,
+        reasoningEffort: el.codexReasoning.value,
+        fastMode: el.codexFastMode.checked,
+        serviceTier: el.codexServiceTier.value,
+        repairContext: el.codexRepairContext.value
+      })
+    });
+    renderCodexSettings(result.settings);
+    toast("Codex settings saved");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function showIssueSummary(index) {
@@ -1431,6 +1659,7 @@ async function showIssueSummary(index) {
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   setSteerVisible(false);
+  setRepairRetryVisible(false);
   el.reopenButton.classList.toggle("hidden", !entry || !isClosedEntry(entry));
   el.output.textContent = "Loading issue summary...";
   renderJobs(state.jobs);
@@ -1552,6 +1781,7 @@ async function investigate(index, force = false) {
   updateIssueRowHighlights();
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");
+  setRepairRetryVisible(false);
   try {
     const result = await api("/api/investigate", {
       method: "POST",
@@ -1625,6 +1855,38 @@ async function continueJob() {
   }
 }
 
+async function retryRepair() {
+  if (!state.activeJobId) return;
+  const note = el.repairRetryInput.value.trim();
+  if (!note) return;
+  setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Retrying repair");
+  const polling = setInterval(() => {
+    if (state.activeJobId) {
+      showJob(state.activeJobId, { quiet: true }).catch(() => {});
+    }
+  }, 1500);
+  try {
+    const result = await api(\`/api/jobs/\${state.activeJobId}/retry-repair\`, {
+      method: "POST",
+      body: JSON.stringify({ note })
+    });
+    el.repairRetryInput.value = "";
+    toast(\`Job \${state.activeJobId} repair retried\`);
+    el.output.textContent = result.result?.message || formatJson(result.result);
+    await refresh();
+    await showJob(state.activeJobId);
+  } catch (error) {
+    setDetailProcessing(false);
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    clearInterval(polling);
+    setBusy(false);
+  }
+}
+
 async function steerInvestigation() {
   if (!state.activeJobId) return;
   const message = el.steerInput.value.trim();
@@ -1656,6 +1918,7 @@ async function steerInvestigation() {
 el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
 el.loginButton.addEventListener("click", startLogin);
+el.codexSettingsSave.addEventListener("click", saveCodexSettings);
 for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
@@ -1690,7 +1953,13 @@ el.rejectButton.addEventListener("click", () => approval("reject"));
 el.detailCloseButton.addEventListener("click", closeDetail);
 el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
+el.repairRetryButton.addEventListener("click", retryRepair);
 el.steerButton.addEventListener("click", steerInvestigation);
+el.repairRetryInput.addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    retryRepair();
+  }
+});
 el.steerInput.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     steerInvestigation();
@@ -1827,13 +2096,7 @@ async function startCodexLogin(config) {
     output: ""
   };
   loginSession = session;
-  const env = {
-    ...process.env,
-    CODEX_HOME: config.codexHome,
-    HOME: process.env.HOME || "/home/agent"
-  };
-  delete env.OPENAI_API_KEY;
-  delete env.CODEX_API_KEY;
+  const env = buildCodexSubprocessEnv(config);
   const child = spawn(config.codexBin, ["login", "--device-auth"], {
     cwd: config.codexWorkspace,
     env,
@@ -1891,6 +2154,15 @@ export function createWebHandler(agent, config) {
         await readJson(req);
         const login = await startCodexLogin(config);
         sendPublicJson(res, 200, { ok: true, auth: await currentAuthStatus(config), login });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/settings/codex") {
+        sendJson(res, 200, { ok: true, settings: agent.codexSettings() });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/settings/codex") {
+        const body = await readJson(req);
+        sendJson(res, 200, { ok: true, settings: agent.updateCodexSettings(body) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/status") {
@@ -1955,6 +2227,13 @@ export function createWebHandler(agent, config) {
       if (req.method === "POST" && continueMatch) {
         await readJson(req);
         const result = await agent.continueJob(Number(continueMatch[1]), "web");
+        sendJson(res, 200, { ok: true, result });
+        return;
+      }
+      const retryRepairMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/retry-repair$/);
+      if (req.method === "POST" && retryRepairMatch) {
+        const body = await readJson(req);
+        const result = await agent.retryRepair(Number(retryRepairMatch[1]), body.note, "web");
         sendJson(res, 200, { ok: true, result });
         return;
       }

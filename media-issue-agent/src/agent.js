@@ -1,11 +1,14 @@
 import { MediaMcpClient } from "./mcp-client.js";
-import { issueQueue, issueTableMarkdown } from "./issues.js";
+import { appendFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { issueLifecycleFromComments, issueQueue, issueTableMarkdown } from "./issues.js";
 import {
-  completeVerificationCheck,
+  completeAgentRun,
   createApproval,
+  createAgentRun,
   createPlannedAction,
-  createVerificationCheck,
   ensureJob,
+  getSetting,
   initDb,
   insertSnapshot,
   investigationForJob,
@@ -17,9 +20,12 @@ import {
   markPlannedActionExecuted,
   pendingApprovalForJob,
   pendingApprovalForJobAnyKind,
+  pruneSnapshots,
+  recordAgentRunEvent,
   recordAudit,
   setPendingApprovals,
   setJobState,
+  setSetting,
   snapshotEntries,
   snapshotEntry,
   statusSummary,
@@ -27,90 +33,13 @@ import {
   transitionJob,
   upsertInvestigation
 } from "./db.js";
-import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, steeredInvestigationPrompt } from "./codex.js";
+import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, runCodexRepair, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-const REPAIR_AGENT_TOOLS = [
-  {
-    toolName: "bazarr_download_movie_subtitles_for_plex",
-    description: "Resolve one Plex movie rating key to one exact Radarr movie and ask Bazarr to download subtitles.",
-    requiredArgs: ["plexRatingKey", "language"],
-    optionalArgs: ["title", "year", "forced", "hi"]
-  },
-  {
-    toolName: "plex_refresh_metadata",
-    description: "Refresh Plex metadata for one exact rating key after a repair.",
-    requiredArgs: ["ratingKey"]
-  },
-  {
-    toolName: "plex_analyze_metadata",
-    description: "Analyze Plex media for one exact rating key after a repair.",
-    requiredArgs: ["ratingKey"]
-  }
-];
-
-const EXECUTION_ALLOWLIST = new Set(REPAIR_AGENT_TOOLS.map(tool => tool.toolName));
-
-const LANGUAGE_ALIASES = [
-  { code: "ko", label: "Korean", patterns: [/\bkorean\b/i, /\bkor\b/i] },
-  { code: "en", label: "English", patterns: [/\benglish\b/i, /\beng\b/i] },
-  { code: "es", label: "Spanish", patterns: [/\bspanish\b/i, /\bespanol\b/i, /\bspa\b/i] },
-  { code: "fr", label: "French", patterns: [/\bfrench\b/i, /\bfre\b/i, /\bfra\b/i] },
-  { code: "de", label: "German", patterns: [/\bgerman\b/i, /\bger\b/i, /\bdeu\b/i] },
-  { code: "it", label: "Italian", patterns: [/\bitalian\b/i, /\bita\b/i] },
-  { code: "ja", label: "Japanese", patterns: [/\bjapanese\b/i, /\bjpn\b/i] },
-  { code: "zh", label: "Chinese", patterns: [/\bchinese\b/i, /\bmandarin\b/i, /\bcantonese\b/i, /\bchi\b/i, /\bzho\b/i] },
-  { code: "pt", label: "Portuguese", patterns: [/\bportuguese\b/i, /\bpor\b/i] },
-  { code: "ar", label: "Arabic", patterns: [/\barabic\b/i, /\bara\b/i] },
-  { code: "hi", label: "Hindi", patterns: [/\bhindi\b/i, /\bhin\b/i] },
-  { code: "ru", label: "Russian", patterns: [/\brussian\b/i, /\brus\b/i] }
-];
-
-function firstPresent(...values) {
-  return values.find(value => value !== undefined && value !== null && value !== "") ?? undefined;
-}
-
-function compactObject(value) {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null && entry !== ""));
-}
-
-function valueAtPath(value, path) {
-  return path.split(".").reduce((current, key) => current?.[key], value);
-}
-
-function firstPathValue(value, paths) {
-  return firstPresent(...paths.map(path => valueAtPath(value, path)));
-}
-
-function stringifySearchText(...values) {
-  return values.map(value => {
-    if (typeof value === "string") {
-      return value;
-    }
-    if (value === undefined || value === null) {
-      return "";
-    }
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }).join(" ");
-}
-
-function languageFromText(text) {
-  for (const language of LANGUAGE_ALIASES) {
-    if (language.patterns.some(pattern => pattern.test(text))) {
-      return { code: language.code, label: language.label };
-    }
-  }
-  return null;
 }
 
 function textSuggestsClientSide(...values) {
@@ -122,7 +51,10 @@ function textSuggestsClientSide(...values) {
 }
 
 function textSuggestsServerSide(...values) {
-  const text = values.join(" ").toLowerCase();
+  const text = values.join(" ").toLowerCase()
+    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/g, "")
+    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)\b/g, "")
+    .replace(/\bno automated (?:server )?(?:fix|action|repair)\b/g, "");
   const squashed = text.replace(/[^a-z0-9]+/g, "");
   return /\b(?:server-side|server side|server)\b.{0,140}\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b/.test(text)
     || /\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b.{0,140}\b(?:server-side|server side|server)\b/.test(text)
@@ -131,118 +63,27 @@ function textSuggestsServerSide(...values) {
     || /\b(?:bazarr|managed subtitle|subtitle workflow)\b/.test(text);
 }
 
-function textSuggestsNoSupportedServerAction(...values) {
-  const text = values.join(" ").toLowerCase();
-  return /\bno exact allowlisted server-side repair action is available\b/.test(text)
-    || /\bno supported (?:server-side|server side|server) (?:repair )?action\b/.test(text)
-    || /\bunsupported (?:server-side|server side|server) (?:repair )?action\b/.test(text);
-}
-
-function textSuggestsSubtitleRequest(text) {
-  return /\b(subtitle|subtitles|subs|caption|captions|cc)\b/i.test(text);
-}
-
-function mediaTypeIsMovie(value) {
-  const type = String(value || "").toLowerCase();
-  if (!type) {
-    return true;
-  }
-  return /\b(movie|film)\b/.test(type);
-}
-
-function subtitleRepairActionsFor(entry, evidence, summary, operatorMessage = "") {
-  const searchText = stringifySearchText(summary, operatorMessage, entry, evidence?.details?.issue, evidence?.diagnosis?.issue, evidence?.details?.plex, evidence?.diagnosis?.plex);
-  if (!textSuggestsSubtitleRequest(searchText)) {
-    return [];
-  }
-  const language = languageFromText(searchText);
-  if (!language) {
-    return [];
-  }
-  const mediaType = firstPathValue({ entry, evidence }, [
-    "entry.raw.mediaType",
-    "entry.mediaType",
-    "evidence.details.issue.mediaType",
-    "evidence.details.plex.metadata.mediaType",
-    "evidence.diagnosis.issue.mediaType",
-    "evidence.diagnosis.plex.metadata.mediaType"
-  ]);
-  if (!mediaTypeIsMovie(mediaType)) {
-    return [];
-  }
-  const ratingKey = firstPathValue({ entry, evidence }, [
-    "entry.raw.plexRatingKey",
-    "entry.raw.ratingKey",
-    "entry.plexRatingKey",
-    "entry.ratingKey",
-    "evidence.details.issue.plexRatingKey",
-    "evidence.details.issue.ratingKey",
-    "evidence.details.plex.ratingKey",
-    "evidence.details.plex.metadata.ratingKey",
-    "evidence.diagnosis.issue.plexRatingKey",
-    "evidence.diagnosis.issue.ratingKey",
-    "evidence.diagnosis.plex.ratingKey",
-    "evidence.diagnosis.plex.metadata.ratingKey"
-  ]);
-  if (!ratingKey) {
-    return [];
-  }
-  const title = firstPathValue({ entry, evidence }, [
-    "entry.raw.mediaTitle",
-    "entry.mediaTitle",
-    "evidence.details.issue.mediaTitle",
-    "evidence.details.plex.metadata.title",
-    "evidence.diagnosis.issue.mediaTitle",
-    "evidence.diagnosis.plex.metadata.title"
-  ]);
-  const yearValue = firstPathValue({ entry, evidence }, [
-    "entry.raw.year",
-    "entry.year",
-    "evidence.details.plex.metadata.year",
-    "evidence.diagnosis.plex.metadata.year"
-  ]);
-  const year = Number.isInteger(Number(yearValue)) && Number(yearValue) > 0 ? Number(yearValue) : undefined;
-  return [
-    {
-      toolName: "bazarr_download_movie_subtitles_for_plex",
-      riskLevel: "repair",
-      description: `Download ${language.label} subtitles for the exact Plex movie item via Bazarr.`,
-      args: compactObject({
-        plexRatingKey: String(ratingKey),
-        language: language.code,
-        title,
-        year,
-        dryRun: false
-      })
-    },
-    {
-      toolName: "plex_refresh_metadata",
-      riskLevel: "verification",
-      description: "Refresh the exact Plex metadata item so newly downloaded subtitles are visible.",
-      args: {
-        ratingKey: String(ratingKey),
-        dryRun: false
-      }
-    }
-  ];
-}
-
-function buildRepairPrompt(entry, evidence, summary, operatorMessage = "", candidateActions = []) {
+function buildRepairPrompt(entry, evidence, summary, operatorMessage = "") {
   const effectiveEntry = evidence?.entry || entry || {};
-  return [
-    `Repair ${effectiveEntry.source || "media"} issue ${effectiveEntry.issueId || "(unknown issue)"}.`,
-    "Follow the human-approved investigation and use the sanitized evidence only.",
-    operatorMessage ? `Operator steering: ${operatorMessage}` : "",
-    "",
-    "Investigation:",
+  const approvedPlan = {
+    source: effectiveEntry.source,
+    issueId: effectiveEntry.issueId,
     summary,
-    "",
-    candidateActions.length
-      ? `Candidate exact media actions inferred from evidence:\n${JSON.stringify(candidateActions, null, 2)}`
-      : "Infer the exact supported media actions from the investigation and evidence.",
-    "",
-    "Return exact allowlisted media MCP actions for the orchestrator. Do not close or comment on the issue during repair execution."
-  ].filter(Boolean).join("\n");
+    operatorMessage,
+    instructions: [
+      "Use media-mcp directly through the configured Codex MCP server named media.",
+      "Investigate, repair, and verify the approved issue as far as the available media tools allow.",
+      "Choose the media tools that fit the evidence instead of relying on a predefined repair action list.",
+      "Do not delegate media-side work back to the server owner/operator.",
+      "Do not post reporter comments or close the issue; media-issue-agent will request final human approval for that."
+    ]
+  };
+  return repairExecutionPrompt({
+    entry: effectiveEntry,
+    evidence,
+    investigationSummary: summary,
+    operatorMessage
+  }, approvedPlan);
 }
 
 function fallbackDraftComment(source, executionResult = null) {
@@ -259,48 +100,111 @@ function fallbackDraftComment(source, executionResult = null) {
   return `Reviewed this report and completed the approved follow-up for the media item.\n${AUTOMATED_SUFFIX}`;
 }
 
-function normalizeDraftComment(source, draft) {
+function normalizeDraftComment(source, draft, executionResult = null) {
   let message = String(draft || "").trim();
   message = message.replace(/^```(?:text|markdown)?\s*/i, "").replace(/```$/i, "").trim();
   if (!message.endsWith(AUTOMATED_SUFFIX)) {
     message = `${message.replace(/\s+$/g, "")}\n${AUTOMATED_SUFFIX}`;
   }
   if (!validateDraftComment(source, message).valid) {
-    message = fallbackDraftComment(source);
+    message = fallbackDraftComment(source, executionResult);
   }
   return message;
 }
 
 function buildPlan(entry, evidence, summary, operatorMessage = "") {
   const effectiveEntry = evidence?.entry || entry || {};
-  const candidateActions = subtitleRepairActionsFor(effectiveEntry, evidence, summary, operatorMessage);
   const clientSideText = textSuggestsClientSide(summary, operatorMessage);
-  const noSupportedServerAction = candidateActions.length === 0 && textSuggestsNoSupportedServerAction(summary, operatorMessage);
-  const serverSide = candidateActions.length > 0 || (!clientSideText && !noSupportedServerAction && textSuggestsServerSide(summary, operatorMessage));
+  const serverSide = textSuggestsServerSide(summary, operatorMessage) || !clientSideText;
   const clientSide = !serverSide && clientSideText;
-  const repairPrompt = serverSide ? buildRepairPrompt(effectiveEntry, evidence, summary, operatorMessage, candidateActions) : undefined;
+  const repairPrompt = serverSide ? buildRepairPrompt(effectiveEntry, evidence, summary, operatorMessage) : undefined;
   return {
     source: effectiveEntry.source,
     issueId: effectiveEntry.issueId,
     summary,
     plan: {
-      classification: serverSide ? "server_action" : clientSide ? "client_side" : "no_supported_server_action",
+      classification: serverSide ? "server_action" : "client_side",
       executionMode: serverSide ? "approved_repair_agent" : "none",
       actions: [],
-      candidateActions,
       requiresServerAction: serverSide,
       repairPrompt,
       note: serverSide
-        ? "Approval will run the repair agent with this prompt and execute only exact allowlisted media actions."
-        : clientSide
-          ? "Determination is client-side or no server-side action is required."
-          : "No exact allowlisted server-side repair action is available for this issue yet."
+        ? "Approval will run the autonomous Codex repair runner with this exact prompt."
+        : "Determination is client-side or no server-side action is required."
     },
     evidence
   };
 }
 
-function parseRepairAgentOutput(output) {
+const REPAIR_RESULT_STATUSES = new Set([
+  "fixed",
+  "not_reproducible",
+  "client_side",
+  "partially_fixed",
+  "needs_operator_decision",
+  "failed_retryable",
+  "failed_terminal"
+]);
+
+const REPAIR_VERIFICATION_STATUSES = new Set(["passed", "failed", "not_applicable"]);
+
+function requiredString(value, field) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    throw new Error(`final repair result field ${field} must be a non-empty string`);
+  }
+  return text;
+}
+
+function parseActionsTaken(value) {
+  if (!Array.isArray(value)) {
+    throw new Error("final repair result field actionsTaken must be an array");
+  }
+  return value.map(action => String(action).trim()).filter(Boolean);
+}
+
+function parseVerification(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("final repair result field verification must be an object");
+  }
+  const status = String(value.status || "").trim();
+  if (!REPAIR_VERIFICATION_STATUSES.has(status)) {
+    throw new Error(`invalid repair verification status ${status || "(missing)"}`);
+  }
+  const details = String(value.details ?? "").trim();
+  if (!details) {
+    throw new Error("final repair result field verification.details must be a non-empty string");
+  }
+  return { ...value, status, details };
+}
+
+function validateRepairResult(result) {
+  if (typeof result.closeRecommended !== "boolean") {
+    throw new Error("final repair result field closeRecommended must be a boolean");
+  }
+  if (result.status === "fixed") {
+    if (!result.actionsTaken.length) {
+      throw new Error("fixed repair result must include at least one actionTaken entry");
+    }
+    if (result.verification.status !== "passed") {
+      throw new Error("fixed repair result must include passed verification");
+    }
+  }
+  if (result.status === "partially_fixed" && !result.actionsTaken.length) {
+    throw new Error("partially_fixed repair result must include at least one actionTaken entry");
+  }
+  if (result.status === "needs_operator_decision" && !result.proposedChoices.length) {
+    throw new Error("needs_operator_decision repair result must include proposedChoices");
+  }
+  if (result.closeRecommended && result.verification.status === "failed") {
+    throw new Error("repair result cannot recommend closure when verification failed");
+  }
+  if (!["failed_retryable", "failed_terminal", "needs_operator_decision"].includes(result.status) && !result.draftComment) {
+    throw new Error("successful repair result must include a draftComment");
+  }
+}
+
+function parseRepairResult(output) {
   const trimmed = String(output || "").trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/```$/i, "")
@@ -315,67 +219,122 @@ function parseRepairAgentOutput(output) {
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate);
-      if (Array.isArray(parsed)) {
-        return { summary: "Repair agent returned exact actions.", actions: parsed };
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("final repair result must be a JSON object");
       }
-      return {
-        summary: String(parsed.summary || parsed.note || "Repair agent returned exact actions."),
-        actions: Array.isArray(parsed.actions) ? parsed.actions : []
+      const status = String(parsed.status || "").trim();
+      if (!REPAIR_RESULT_STATUSES.has(status)) {
+        throw new Error(`invalid repair status ${status || "(missing)"}`);
+      }
+      const result = {
+        status,
+        summary: requiredString(parsed.summary, "summary"),
+        actionsTaken: parseActionsTaken(parsed.actionsTaken),
+        verification: parseVerification(parsed.verification),
+        draftComment: String(parsed.draftComment || "").trim(),
+        closeRecommended: parsed.closeRecommended,
+        proposedChoices: Array.isArray(parsed.proposedChoices)
+          ? parsed.proposedChoices.map(choice => String(choice).trim()).filter(Boolean)
+          : []
       };
+      validateRepairResult(result);
+      return result;
     } catch (error) {
       lastError = error;
     }
   }
-  throw new Error(`Repair agent did not return valid JSON: ${lastError?.message || "unknown parse error"}`);
+  throw new Error(`Repair runner did not return valid final JSON: ${lastError?.message || "unknown parse error"}`);
 }
 
-function normalizeRepairActions(actions) {
-  return actions.map((action, index) => {
-    const toolName = action?.toolName || action?.tool || action?.name;
-    if (!toolName) {
-      throw new Error(`Repair action ${index + 1} is missing toolName`);
-    }
-    const args = action.args && typeof action.args === "object" && !Array.isArray(action.args)
-      ? action.args
-      : {};
-    return {
-      toolName,
-      riskLevel: action.riskLevel || action.risk || "repair",
-      description: action.description || action.summary,
-      args
-    };
-  });
+function textDelegatesOwnerWork(...values) {
+  const text = values.filter(Boolean).join("\n").toLowerCase();
+  return /\b(?:server owner|owner|operator|admin)\b.{0,120}\b(?:should|must|needs? to|has to|will need to|please)\b.{0,140}\b(?:replace|blacklist|reacquire|download|refresh|analy[sz]e|scan|repair|fix|run|delete|import|queue|upgrade|configure)\b/.test(text)
+    || /\b(?:replace|blacklist|reacquire|download|refresh|analy[sz]e|scan|repair|fix|run|delete|import|queue|upgrade|configure)\b.{0,120}\b(?:manually|yourself|by the server owner|by an operator)\b/.test(text)
+    || /\bno repair action was run yet\b/.test(text)
+    || /\bstill need(?:s)? server-side\b/.test(text);
 }
 
-function verificationTimeoutMs(config) {
-  return Number.isFinite(Number(config.verificationTimeoutMs)) ? Number(config.verificationTimeoutMs) : 120000;
+function executionResultFromRepairResult(repairResult, agentRun) {
+  const actionsTaken = repairResult.actionsTaken || [];
+  return {
+    outcome: repairResult.status,
+    summary: repairResult.summary,
+    actionsRequested: actionsTaken.length,
+    actionsExecuted: actionsTaken.length,
+    actions: actionsTaken.map((summary, index) => ({
+      status: "completed_by_codex",
+      index: index + 1,
+      summary
+    })),
+    verification: repairResult.verification,
+    draftComment: repairResult.draftComment,
+    closeRecommended: repairResult.closeRecommended,
+    proposedChoices: repairResult.proposedChoices || [],
+    agentRunId: agentRun?.id || null,
+    modelConfig: agentRun?.config || null
+  };
 }
 
-function verificationPollIntervalMs(config) {
-  return Number.isFinite(Number(config.verificationPollIntervalMs)) ? Number(config.verificationPollIntervalMs) : 5000;
+function repairWorkspaceFor(config, jobId) {
+  const root = config.repairWorkspaceRoot || path.join(path.dirname(config.dbPath || "/state/media-issue-agent.sqlite"), "repair-workspaces");
+  return path.join(root, `job-${jobId}`);
 }
 
-function subtitleVerificationChecks(actions) {
-  const checks = [];
-  for (const action of actions) {
-    if (action.toolName !== "bazarr_download_movie_subtitles_for_plex") {
-      continue;
-    }
-    const ratingKey = firstPresent(action.args?.plexRatingKey, action.args?.ratingKey);
-    const language = action.args?.language;
-    if (!ratingKey || !language) {
-      continue;
-    }
-    checks.push({
-      checkType: "plex_subtitle_track",
-      toolName: "plex_verify_subtitle_track",
-      args: {
-        ratingKey: String(ratingKey),
-        language: String(language)
-      }
-    });
+function toolBriefingFromTools(tools = []) {
+  return {
+    tools: tools.map(tool => ({
+      name: tool.name,
+      description: tool.description || "",
+      inputSchema: tool.inputSchema || tool.input_schema || null
+    })).filter(tool => tool.name)
+  };
+}
+
+function compactRepairHistory(details) {
+  return {
+    job: {
+      id: details.job.id,
+      state: details.job.state,
+      lastError: details.job.lastError || ""
+    },
+    runs: (details.agentRuns || []).slice(0, 5).map(run => ({
+      id: run.id,
+      status: run.status,
+      error: run.error || "",
+      finalResult: run.finalResult || null,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt
+    })),
+    recentEvents: (details.agentRunEvents || []).slice(0, 25).map(event => ({
+      runId: event.runId,
+      eventType: event.eventType,
+      payload: event.payload,
+      createdAt: event.createdAt
+    }))
+  };
+}
+
+const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+
+function normalizeCodexSettings(values = {}, defaults = {}) {
+  const model = String(values.model ?? defaults.model ?? "gpt-5.5").trim();
+  if (!model || model.length > 120) {
+    throw new Error("Codex model must be a non-empty string.");
   }
-  return checks;
+  const reasoningEffort = String(values.reasoningEffort ?? defaults.reasoningEffort ?? "xhigh").trim();
+  if (!REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new Error(`Unsupported Codex reasoning effort ${reasoningEffort}`);
+  }
+  const fastMode = Boolean(values.fastMode ?? defaults.fastMode ?? true);
+  const serviceTier = String(values.serviceTier ?? defaults.serviceTier ?? (fastMode ? "fast" : "")).trim();
+  if (serviceTier.length > 80) {
+    throw new Error("Codex service tier is too long.");
+  }
+  const repairContext = String(values.repairContext ?? defaults.repairContext ?? "").trim();
+  if (repairContext.length > 4000) {
+    throw new Error("Repair context is too long.");
+  }
+  return { model, reasoningEffort, fastMode, serviceTier, repairContext };
 }
 
 function closeActionsFor(source, issueId, message) {
@@ -390,6 +349,20 @@ function closeActionsFor(source, issueId, message) {
       { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message, dryRun: false, verbose: false } },
       { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message: "Closed.", dryRun: false, verbose: false } },
       { toolName: "seerr_resolve_issue", args: { issueId: Number(issueId), dryRun: false, verbose: false } }
+    ];
+  }
+  throw new Error(`Unsupported issue source ${source}`);
+}
+
+function commentActionsFor(source, issueId, message) {
+  if (source === "plex") {
+    return [
+      { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message, dryRun: false, verbose: false } }
+    ];
+  }
+  if (source === "seerr") {
+    return [
+      { toolName: "seerr_add_issue_comment", args: { issueId: Number(issueId), message, dryRun: false, verbose: false } }
     ];
   }
   throw new Error(`Unsupported issue source ${source}`);
@@ -441,16 +414,35 @@ function commentsFromDetails(details) {
   return Array.isArray(issue.comments) ? issue.comments : [];
 }
 
-function entryIsClosed(entry) {
-  const status = String(entry?.status || "").toLowerCase();
-  if (entry?.jobState) {
-    return entry.jobState === "closed";
+function sourceClosedState(entry) {
+  const raw = entry?.raw || {};
+  const directLifecycle = String(entry?.lifecycle || raw.lifecycle || "").toLowerCase();
+  if (directLifecycle === "closed") {
+    return true;
   }
-  return Boolean(entry?.raw?.isClosed)
-    || status === "closed"
-    || status === "resolved"
-    || status.includes("closed")
-    || status.includes("resolved");
+  if (directLifecycle === "open") {
+    return false;
+  }
+  const comments = Array.isArray(raw.comments) ? raw.comments : Array.isArray(entry?.comments) ? entry.comments : null;
+  if (comments?.length) {
+    return issueLifecycleFromComments(comments, entry?.status || raw.status || raw.rawStatus || "").closed;
+  }
+  if (raw.isClosed === true || entry?.isClosed === true) {
+    return true;
+  }
+  const status = String(entry?.status || raw.status || raw.rawStatus || "").toLowerCase();
+  if (status === "closed" || status === "resolved" || status.includes("closed") || status.includes("resolved")) {
+    return true;
+  }
+  return null;
+}
+
+function entryIsClosed(entry) {
+  const sourceState = sourceClosedState(entry);
+  if (sourceState !== null) {
+    return sourceState;
+  }
+  return entry?.jobState === "closed";
 }
 
 function supersedeAllPendingApprovals(dbPath, jobId) {
@@ -492,6 +484,7 @@ export class MediaIssueAgent {
     const issues = await issueQueue(records, this.client);
     const markdown = issueTableMarkdown(issues);
     const snapshot = insertSnapshot(this.config.dbPath, markdown, issues);
+    pruneSnapshots(this.config.dbPath, this.config.issueSnapshotRetention);
     for (const issue of issues) {
       const job = ensureJob(this.config.dbPath, issue.source, issue.issueId);
       if (issue.isClosed && job.state !== "closed") {
@@ -544,9 +537,31 @@ export class MediaIssueAgent {
   status() {
     return {
       ...statusSummary(this.config.dbPath),
-      dryRun: this.config.dryRun,
       webEnabled: this.config.webEnabled
     };
+  }
+
+  codexSettings() {
+    const defaults = {
+      model: this.config.codexModel || "gpt-5.5",
+      reasoningEffort: this.config.codexReasoningEffort || "xhigh",
+      fastMode: this.config.codexFastMode !== false,
+      serviceTier: this.config.codexServiceTier || (this.config.codexFastMode === false ? "" : "fast"),
+      repairContext: this.config.repairContext || ""
+    };
+    const saved = getSetting(this.config.dbPath, "codex", null);
+    return {
+      defaults,
+      effective: normalizeCodexSettings(saved || {}, defaults),
+      saved: saved || null
+    };
+  }
+
+  updateCodexSettings(values) {
+    const current = this.codexSettings();
+    const saved = normalizeCodexSettings({ ...current.effective, ...(values || {}) }, current.defaults);
+    setSetting(this.config.dbPath, "codex", saved);
+    return this.codexSettings();
   }
 
   async codexAuthStatus() {
@@ -768,7 +783,7 @@ export class MediaIssueAgent {
     if (!current) {
       throw new Error(`Job ${jobId} has no investigation to steer`);
     }
-    const operatorMessage = String(message || "").trim();
+    const operatorMessage = redactText(String(message || "").trim());
     if (!operatorMessage) {
       throw new Error("Steering message is required");
     }
@@ -833,24 +848,51 @@ export class MediaIssueAgent {
     if (!pending) {
       throw new Error(`Job ${jobId} has no pending approval`);
     }
-    const approvals = setPendingApprovals(this.config.dbPath, jobId, "approved", actor, pending.kind);
-    recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: pending.id, kind: pending.kind, actor }), jobId);
     if (pending.kind === "action") {
+      const approvals = setPendingApprovals(this.config.dbPath, jobId, "approved", actor, pending.kind);
+      recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: pending.id, kind: pending.kind, actor }), jobId);
       transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval"], "approved_for_execution");
       return this.continueJob(jobId, actor, { approvals });
     }
     if (pending.kind === "resolution") {
-      return this.closeApprovedIssue(jobId, pending, actor, approvals);
+      recordAudit(this.config.dbPath, "resolution_approval_attempted", sanitizeValue({ approvalId: pending.id, kind: pending.kind, actor }), jobId);
+      return this.closeApprovedIssue(jobId, pending, actor);
     }
     throw new Error(`Unsupported approval kind ${pending.kind}`);
   }
 
   reject(jobId, actor = "operator") {
     const pending = pendingApprovalForJobAnyKind(this.config.dbPath, jobId);
+    if (!pending) {
+      throw new Error(`Job ${jobId} has no pending approval`);
+    }
     const approvals = setPendingApprovals(this.config.dbPath, jobId, "rejected", actor, pending?.kind || null);
     transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"], "blocked_needs_human");
     recordAudit(this.config.dbPath, "approval_rejected", sanitizeValue({ approvals, actor }), jobId);
     return approvals;
+  }
+
+  async retryRepair(jobId, note, actor = "operator") {
+    const job = jobForId(this.config.dbPath, jobId);
+    if (!job) {
+      throw new Error(`Job ${jobId} was not found`);
+    }
+    if (job.state !== "failed_retryable") {
+      throw new Error(`Job ${jobId} cannot retry repair from ${job.state}`);
+    }
+    if (pendingApprovalForJob(this.config.dbPath, jobId, "resolution")) {
+      throw new Error(`Job ${jobId} has a pending resolution approval; approve it to retry closure actions.`);
+    }
+    const actionApproval = this.jobDetails(jobId).approvals.find(approval => approval.kind === "action" && approval.status === "approved");
+    if (!actionApproval || actionApproval.payload?.plan?.executionMode !== "approved_repair_agent") {
+      throw new Error(`Job ${jobId} has no approved autonomous repair prompt to retry`);
+    }
+    const retryNote = redactText(String(note || "").trim());
+    if (!retryNote) {
+      throw new Error("Repair retry note is required");
+    }
+    recordAudit(this.config.dbPath, "repair_retry_requested", sanitizeValue({ actor, note: retryNote }), jobId);
+    return this.executeApprovedPlan(jobId, actor, { repairRetryNote: retryNote });
   }
 
   async continueJob(jobId, actor = "operator", context = {}) {
@@ -864,71 +906,63 @@ export class MediaIssueAgent {
     return this.executeApprovedPlan(jobId, actor, context);
   }
 
-  async waitForVerification(jobId, checks, executionResult, actor) {
-    const timeoutMs = Math.max(0, verificationTimeoutMs(this.config));
-    const intervalMs = Math.max(100, verificationPollIntervalMs(this.config));
-    const startedAt = Date.now();
-    const verification = {
-      status: "passed",
-      timeoutMs,
-      intervalMs,
-      checks: []
-    };
-    for (const check of checks) {
-      const stored = createVerificationCheck(this.config.dbPath, jobId, check.checkType, check.args, "running");
-      const checkResult = {
-        id: stored.id,
-        checkType: check.checkType,
-        toolName: check.toolName,
-        args: check.args,
-        attempts: 0,
-        status: "running",
-        lastResult: null
-      };
-      verification.checks.push(checkResult);
-      recordAudit(this.config.dbPath, "verification_started", sanitizeValue({ actor, check }), jobId);
-      for (;;) {
-        checkResult.attempts += 1;
-        let result;
-        try {
-          result = await this.client.callTool(check.toolName, check.args);
-        } catch (error) {
-          const message = redactText(error.message);
-          checkResult.status = "failed";
-          completeVerificationCheck(this.config.dbPath, stored.id, "failed");
-          verification.status = "failed";
-          executionResult.outcome = "verification_failed";
-          executionResult.summary = `Verification failed before the repair could be confirmed: ${message}`;
-          executionResult.verification = verification;
-          recordAudit(this.config.dbPath, "verification_failed", sanitizeValue({ actor, check, error: error.message }), jobId);
-          transitionJob(this.config.dbPath, jobId, ["waiting_for_plex_verification"], "failed_retryable", message);
-          throw error;
-        }
-        checkResult.lastResult = sanitizeValue(result);
-        if (result?.found === true) {
-          checkResult.status = "passed";
-          completeVerificationCheck(this.config.dbPath, stored.id, "passed");
-          recordAudit(this.config.dbPath, "verification_passed", sanitizeValue({ actor, check, result }), jobId);
-          break;
-        }
-        const elapsed = Date.now() - startedAt;
-        if (elapsed >= timeoutMs) {
-          checkResult.status = "failed";
-          completeVerificationCheck(this.config.dbPath, stored.id, "failed");
-          verification.status = "failed";
-          executionResult.outcome = "verification_failed";
-          executionResult.summary = "Approved actions finished, but required verification did not confirm the repair completed.";
-          executionResult.verification = verification;
-          recordAudit(this.config.dbPath, "verification_failed", sanitizeValue({ actor, check, result, timeoutMs }), jobId);
-          const message = `Verification failed for ${check.checkType}: expected ${JSON.stringify(check.args)}`;
-          transitionJob(this.config.dbPath, jobId, ["waiting_for_plex_verification"], "failed_retryable", message);
-          throw new Error(message);
-        }
-        await sleep(Math.min(intervalMs, Math.max(100, timeoutMs - elapsed)));
-      }
+  async buildExecutionRepairPrompt(jobId, actor, actionApproval, context = {}) {
+    const details = this.jobDetails(jobId);
+    const settings = this.codexSettings().effective;
+    const workspace = repairWorkspaceFor(this.config, jobId);
+    await mkdir(workspace, { recursive: true });
+    const retryNote = redactText(String(context.repairRetryNote || "").trim());
+    if (retryNote) {
+      await appendFile(path.join(workspace, "operator-retry-notes.jsonl"), `${JSON.stringify({
+        createdAt: new Date().toISOString(),
+        actor,
+        note: retryNote,
+        previousJobError: details.job.lastError || ""
+      })}\n`);
     }
-    executionResult.verification = verification;
-    return verification;
+    let toolBriefing;
+    try {
+      const tools = typeof this.client.listTools === "function" ? await this.client.listTools() : [];
+      toolBriefing = toolBriefingFromTools(tools);
+    } catch (error) {
+      const message = redactText(error.message);
+      toolBriefing = { tools: [], error: message };
+      recordAudit(this.config.dbPath, "repair_tool_list_failed", sanitizeValue({ actor, error: error.message }), jobId);
+    }
+    const payload = actionApproval.payload || {};
+    const plan = payload.plan || {};
+    const approvedPlan = {
+      source: payload.source || details.job.source,
+      issueId: payload.issueId || details.job.issueId,
+      classification: plan.classification || "server_action",
+      summary: payload.summary || details.investigation?.summary || "",
+      operatorMessage: payload.evidence?.steering?.message || "",
+      instructions: [
+        "Use media-mcp directly through the configured Codex MCP server named media.",
+        "Investigate, repair, and verify the approved issue as far as the available media tools allow.",
+        "Choose the media tools that fit the evidence and current tool briefing.",
+        "Do not delegate media-side work back to the server owner/operator.",
+        "Do not post reporter comments or close the issue; media-issue-agent will request final human approval for that."
+      ]
+    };
+    const prompt = repairExecutionPrompt({
+      job: details.job,
+      investigation: details.investigation,
+      approvedBy: actor,
+      originalEvidence: payload.evidence,
+      retryRequested: Boolean(retryNote)
+    }, approvedPlan, {
+      runtimeContext: settings.repairContext,
+      scratchWorkspace: workspace,
+      toolBriefing,
+      previousRepairHistory: compactRepairHistory(details),
+      retry: retryNote ? {
+        operatorNote: retryNote,
+        previousJobError: details.job.lastError || "",
+        guidance: "Use this trusted note to retry the already approved repair. Do not require a new investigation unless evidence is missing."
+      } : null
+    });
+    return { prompt, workspace, settings, toolBriefing };
   }
 
   async executeApprovedPlan(jobId, actor, context = {}) {
@@ -937,96 +971,71 @@ export class MediaIssueAgent {
     if (!actionApproval) {
       throw new Error(`Job ${jobId} has no approved action plan`);
     }
-    transitionJob(this.config.dbPath, jobId, ["approved_for_execution"], "executing");
+    transitionJob(this.config.dbPath, jobId, ["approved_for_execution", "failed_retryable"], "executing");
     recordAudit(this.config.dbPath, "execution_started", sanitizeValue({ actor, plan: actionApproval.payload.plan }), jobId);
     const plan = actionApproval.payload?.plan || {};
-    let actions = Array.isArray(plan.actions) ? plan.actions : [];
     const classification = plan.classification;
-    const executionResult = {
-      outcome: classification === "client_side" ? "client_side" : "no_supported_action",
-      summary: classification === "client_side"
-        ? "Determination was client-side or no server-side action was required. No server-side media action was executed."
-        : "No exact allowlisted server-side repair action is available for this issue yet. No media action was executed.",
-      actionsRequested: 0,
-      actionsExecuted: 0,
-      actions: []
-    };
-    if (!actions.length && plan.executionMode === "approved_repair_agent") {
-      try {
-        const repairOutput = await runCodex(this.config, repairExecutionPrompt({
-          job: details.job,
-          investigation: details.investigation,
-          approvedBy: actor,
-          originalEvidence: actionApproval.payload?.evidence
-        }, actionApproval.payload, REPAIR_AGENT_TOOLS));
-        const parsed = parseRepairAgentOutput(repairOutput);
-        actions = normalizeRepairActions(parsed.actions);
-        executionResult.repairAgentSummary = parsed.summary;
-        executionResult.repairAgentActionsRequested = actions.length;
-        recordAudit(this.config.dbPath, "repair_agent_plan_ready", sanitizeValue({ actor, summary: parsed.summary, actions }), jobId);
-      } catch (error) {
-        const message = redactText(error.message);
-        executionResult.outcome = "failed_retryable";
-        executionResult.summary = `Repair agent could not produce an executable plan: ${message}`;
-        recordAudit(this.config.dbPath, "repair_agent_plan_failed", sanitizeValue({ actor, error: error.message }), jobId);
-        transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
-        throw error;
-      }
+    if (classification === "client_side" || plan.executionMode === "none") {
+      const executionResult = {
+        outcome: "client_side",
+        summary: "Determination was client-side or no server-side action was required. No server-side media action was executed.",
+        actionsRequested: 0,
+        actionsExecuted: 0,
+        actions: [],
+        verification: { status: "not_applicable", details: "No server-side repair was required." }
+      };
+      recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
+      transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
+      return this.draftResolutionApproval(jobId, actor, executionResult, context);
     }
-    actions = normalizeRepairActions(actions);
-    executionResult.actionsRequested = actions.length;
-    const verificationChecks = subtitleVerificationChecks(actions);
-    const unsupported = actions.filter(action => !EXECUTION_ALLOWLIST.has(action?.toolName));
-    if (unsupported.length) {
-      executionResult.outcome = "unsupported_actions";
-      executionResult.summary = "The approved plan contained actions outside the media issue agent execution allowlist. No media action was executed.";
-      executionResult.actions = actions.map(action => ({
-        requested: action,
-        status: EXECUTION_ALLOWLIST.has(action?.toolName) ? "skipped" : "not_executed",
-        reason: EXECUTION_ALLOWLIST.has(action?.toolName) ? "skipped because the plan included unsupported actions" : "unsupported action for media issue agent"
+    const { prompt: repairPrompt, workspace, settings, toolBriefing } = await this.buildExecutionRepairPrompt(jobId, actor, actionApproval, context);
+    const agentRun = createAgentRun(this.config.dbPath, jobId, "repair", repairPrompt, settings);
+    recordAudit(this.config.dbPath, "repair_agent_started", sanitizeValue({ actor, runId: agentRun.id, settings, workspace, toolCount: toolBriefing?.tools?.length || 0, retry: Boolean(context.repairRetryNote) }), jobId);
+    let completedRun = null;
+    try {
+      const output = await runCodexRepair(this.config, repairPrompt, settings, {
+        codexWorkspace: workspace,
+        onEvent: event => recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, event?.type || "event", sanitizeValue(event))
+      });
+      recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, "codex_exit", sanitizeValue({
+        args: output.args,
+        settings: output.settings,
+        stderr: output.stderr
       }));
-      const message = "Approved plan contains unsupported actions";
-      recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, executionResult }), jobId);
-      transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
-      throw new Error(message);
-    }
-    if (actions.length) {
-      executionResult.outcome = "server_action_completed";
-      executionResult.summary = verificationChecks.length
-        ? "Executed the approved server-side media repair actions and completed required verification."
-        : "Executed the approved server-side media repair actions.";
-      try {
-        for (const action of actions) {
-          const args = { ...(action.args || {}), dryRun: false };
-          const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, args, action.riskLevel || "repair");
-          recordAudit(this.config.dbPath, "execution_action_started", sanitizeValue({ actor, action: planned }), jobId);
-          const result = await this.client.callTool(action.toolName, args);
-          const sanitized = sanitizeValue(result);
-          markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
-          executionResult.actionsExecuted += 1;
-          executionResult.actions.push({
-            requested: action,
-            executed: { id: planned.id, toolName: planned.toolName, args },
-            status: "executed",
-            result: sanitized
-          });
-        }
-      } catch (error) {
-        const message = redactText(error.message);
-        executionResult.outcome = "failed_retryable";
-        executionResult.summary = `Execution failed before all approved actions completed: ${message}`;
-        recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, error: error.message, executionResult }), jobId);
-        transitionJob(this.config.dbPath, jobId, ["executing"], "failed_retryable", message);
-        throw error;
+      const repairResult = parseRepairResult(output.finalMessage);
+      if (textDelegatesOwnerWork(repairResult.summary, repairResult.draftComment, repairResult.actionsTaken.join("\n"))) {
+        throw new Error("Repair runner delegated media-side work back to the server owner/operator instead of attempting it.");
       }
+      completedRun = completeAgentRun(this.config.dbPath, agentRun.id, repairResult.status, repairResult, null);
+      if (repairResult.status === "needs_operator_decision") {
+        const message = repairResult.summary || "Repair runner needs an operator decision before continuing.";
+        recordAudit(this.config.dbPath, "repair_agent_needs_operator_decision", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
+        setJobState(this.config.dbPath, jobId, "failed_retryable", redactText(message));
+        throw new Error(message);
+      }
+      if (repairResult.status === "failed_retryable" || repairResult.status === "failed_terminal") {
+        const message = repairResult.summary || `Repair runner returned ${repairResult.status}`;
+        recordAudit(this.config.dbPath, "repair_agent_failed", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
+        setJobState(this.config.dbPath, jobId, repairResult.status, redactText(message));
+        throw new Error(message);
+      }
+      const executionResult = executionResultFromRepairResult(repairResult, completedRun || agentRun);
+      recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
+      transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
+      return this.draftResolutionApproval(jobId, actor, executionResult, context);
+    } catch (error) {
+      const message = redactText(error.message);
+      if (!completedRun) {
+        completeAgentRun(this.config.dbPath, agentRun.id, "failed_retryable", null, message);
+      }
+      recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, "repair_failed", sanitizeValue({ error: error.message }));
+      recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, runId: agentRun.id, error: error.message }), jobId);
+      const current = jobForId(this.config.dbPath, jobId);
+      if (current?.state !== "failed_retryable" && current?.state !== "failed_terminal") {
+        setJobState(this.config.dbPath, jobId, "failed_retryable", message);
+      }
+      throw error;
     }
-    if (verificationChecks.length) {
-      transitionJob(this.config.dbPath, jobId, ["executing"], "waiting_for_plex_verification");
-      await this.waitForVerification(jobId, verificationChecks, executionResult, actor);
-    }
-    recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
-    transitionJob(this.config.dbPath, jobId, ["executing", "waiting_for_plex_verification"], "drafting_comment");
-    return this.draftResolutionApproval(jobId, actor, executionResult, context);
   }
 
   async draftResolutionApproval(jobId, actor, executionResult, context = {}) {
@@ -1041,14 +1050,28 @@ export class MediaIssueAgent {
       executionResult,
       approvedBy: actor
     });
-    let draft;
-    try {
-      draft = await runCodex(this.config, commentDraftPrompt(evidence));
-    } catch (error) {
-      recordAudit(this.config.dbPath, "codex_comment_draft_failed", sanitizeValue({ error: error.message }), jobId);
-      draft = fallbackDraftComment(details.job.source, executionResult);
+    let draft = executionResult?.draftComment;
+    if (!draft) {
+      try {
+        draft = await runCodex(this.config, commentDraftPrompt(evidence));
+      } catch (error) {
+        recordAudit(this.config.dbPath, "codex_comment_draft_failed", sanitizeValue({ error: error.message }), jobId);
+        draft = fallbackDraftComment(details.job.source, executionResult);
+      }
     }
-    const message = normalizeDraftComment(details.job.source, draft);
+    if (textDelegatesOwnerWork(draft)) {
+      const note = "Draft resolution delegated media-side work back to the server owner/operator.";
+      transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
+      recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message: draft }), jobId);
+      throw new Error(note);
+    }
+    const message = normalizeDraftComment(details.job.source, draft, executionResult);
+    if (textDelegatesOwnerWork(message)) {
+      const note = "Draft resolution delegated media-side work back to the server owner/operator.";
+      transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
+      recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message }), jobId);
+      throw new Error(note);
+    }
     const validation = validateDraftComment(details.job.source, message);
     if (!validation.valid) {
       transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", validation.errors.join("; "));
@@ -1058,6 +1081,7 @@ export class MediaIssueAgent {
       source: details.job.source,
       issueId: details.job.issueId,
       message,
+      closeIssue: executionResult?.closeRecommended !== false,
       characterCount: validation.characterCount,
       executionResult
     });
@@ -1074,13 +1098,19 @@ export class MediaIssueAgent {
     };
   }
 
-  async closeApprovedIssue(jobId, approval, actor, approvals) {
-    transitionJob(this.config.dbPath, jobId, ["awaiting_resolution_approval"], "closing_issue");
-    const { source, issueId, message } = approval.payload;
-    const actions = closeActionsFor(source, issueId, message);
+  async closeApprovedIssue(jobId, approval, actor) {
+    transitionJob(this.config.dbPath, jobId, ["awaiting_resolution_approval", "failed_retryable"], "closing_issue");
+    const { source, issueId, message, closeIssue = true } = approval.payload;
+    const actions = closeIssue ? closeActionsFor(source, issueId, message) : commentActionsFor(source, issueId, message);
     const results = [];
     try {
+      const executedActions = this.jobDetails(jobId).plannedActions.filter(action => action.riskLevel === "resolution" && action.executedAt);
       for (const action of actions) {
+        const alreadyExecuted = executedActions.find(executed => executed.toolName === action.toolName && JSON.stringify(executed.args) === JSON.stringify(action.args));
+        if (alreadyExecuted) {
+          results.push({ action: alreadyExecuted, result: alreadyExecuted.result, skipped: true });
+          continue;
+        }
         const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, "resolution");
         recordAudit(this.config.dbPath, "closing_action_started", sanitizeValue({ action: planned }), jobId);
         const result = await this.client.callTool(action.toolName, action.args);
@@ -1088,11 +1118,19 @@ export class MediaIssueAgent {
         markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
         results.push({ action: planned, result: sanitized });
       }
-      transitionJob(this.config.dbPath, jobId, ["closing_issue"], "closed");
-      recordAudit(this.config.dbPath, "issue_closed", sanitizeValue({ actor, results }), jobId);
+      if (closeIssue) {
+        transitionJob(this.config.dbPath, jobId, ["closing_issue"], "closed");
+        recordAudit(this.config.dbPath, "issue_closed", sanitizeValue({ actor, results }), jobId);
+      } else {
+        const note = "Repair result did not recommend closing the issue; posted the approved update and left the job for human follow-up.";
+        transitionJob(this.config.dbPath, jobId, ["closing_issue"], "blocked_needs_human", note);
+        recordAudit(this.config.dbPath, "resolution_comment_posted_without_closure", sanitizeValue({ actor, results }), jobId);
+      }
+      const approvals = setPendingApprovals(this.config.dbPath, jobId, "approved", actor, "resolution");
+      recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: approval.id, kind: "resolution", actor }), jobId);
       return {
         jobId,
-        status: "closed",
+        status: closeIssue ? "closed" : "blocked_needs_human",
         approvals,
         results
       };
