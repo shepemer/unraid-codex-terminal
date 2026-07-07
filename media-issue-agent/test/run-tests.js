@@ -466,6 +466,93 @@ async function testSubtitleServerActionPlanExecutesRepair() {
   }
 }
 
+async function testSuccessfulRepairRecoversStaleRetryableState() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-stale-retry-success.mjs");
+  await writeFile(codexBin, [
+    "#!/usr/bin/env node",
+    "import { spawnSync } from 'node:child_process';",
+    "import { readFileSync } from 'node:fs';",
+    "readFileSync(0, 'utf8');",
+    `const dbPath = ${JSON.stringify(dbPath)};`,
+    "if (process.argv.includes('--json')) {",
+    "  const update = spawnSync('sqlite3', [dbPath, \"UPDATE jobs SET state = 'failed_retryable', last_error = 'stale retry marker' WHERE state = 'executing';\"], { encoding: 'utf8' });",
+    "  if (update.status !== 0) {",
+    "    process.stderr.write(update.stderr || update.stdout || 'sqlite update failed');",
+    "    process.exit(update.status || 1);",
+    "  }",
+    "  const final = {",
+    "    status: 'fixed',",
+    "    summary: 'Completed the repair after the stale retry marker was written.',",
+    "    actionsTaken: ['Ran the autonomous repair to completion.', 'Verified the repaired media state.'],",
+    "    verification: { status: 'passed', details: 'Fixture verification passed after repair.' },",
+    "    draftComment: 'Completed the repair and verified the result. Automated response from Codex.',",
+    "    closeRecommended: true",
+    "  };",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(final) } })}\\n`);",
+    "}"
+  ].join("\n"));
+  await chmod(codexBin, 0o700);
+  const client = {
+    async listTools() {
+      return [];
+    },
+    async callTool(name) {
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  };
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 10000,
+      dryRun: false
+    }, client);
+    await agent.init();
+    const job = ensureJob(dbPath, "plex", "plex-stale-retry-success");
+    transitionJob(dbPath, job.id, "detected", "awaiting_action_approval");
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Investigation summary: server-side repair is required and should be executed by Codex.",
+      evidence: { entry: { source: "plex", issueId: "plex-stale-retry-success" } }
+    });
+    createApproval(dbPath, job.id, "action", {
+      source: "plex",
+      issueId: "plex-stale-retry-success",
+      summary: "Investigation summary: server-side repair is required and should be executed by Codex.",
+      evidence: { entry: { source: "plex", issueId: "plex-stale-retry-success" } },
+      plan: {
+        classification: "server_action",
+        executionMode: "approved_repair_agent",
+        actions: [],
+        requiresServerAction: true,
+        repairPrompt: "Run the synthetic repair and verify it."
+      }
+    });
+
+    const result = await agent.approve(job.id, "fixture");
+    assert.equal(result.status, "awaiting_resolution_approval");
+    assert.equal(result.executionResult.outcome, "fixed");
+    const details = jobDetails(dbPath, job.id);
+    assert.equal(details.job.state, "awaiting_resolution_approval");
+    assert.equal(details.job.lastError, null);
+    assert.equal(details.agentRuns.length, 1);
+    assert.equal(details.agentRuns[0].status, "fixed");
+    assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 1);
+    assert.equal(details.auditEvents.some(event => event.eventType === "repair_success_recovered_from_retryable_state"), true);
+    assert.equal(details.agentRunEvents.some(event => event.eventType === "repair_failed"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
 async function testRepairRunnerRejectsOwnerDelegation() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -1361,12 +1448,17 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
     assert.match(pageText, /id="codex-settings-panel"/);
+    assert.match(pageText, /id="runner-settings-button"/);
+    assert.match(pageText, /id="runner-settings-close-button"/);
     assert.match(pageText, /id="codex-model"/);
     assert.match(pageText, /id="codex-reasoning"/);
     assert.match(pageText, /id="codex-fast-mode"/);
     assert.match(pageText, /id="codex-settings-save"/);
     assert.match(pageText, /id="app-shell"/);
+    assert.match(pageText, /id="activity-drawer-button"/);
+    assert.match(pageText, /id="activity-close-button"/);
     assert.match(pageText, /id="work-area"/);
+    assert.match(pageText, /id="issue-cards"/);
     assert.match(pageText, /id="detail-band"/);
     assert.match(pageText, /id="detail-close-button"/);
     assert.match(pageText, /id="detail-processing"/);
@@ -1374,6 +1466,8 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="reopen-button"/);
     assert.match(pageText, /id="steer-panel"/);
     assert.match(pageText, /id="close-dialog"/);
+    assert.match(pageText, /id="runner-settings-backdrop"/);
+    assert.match(pageText, /id="activity-drawer-backdrop"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
@@ -1389,11 +1483,22 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /white-space: nowrap;/);
     assert.match(cssText, /tbody tr\.issue-closed/);
     assert.match(cssText, /tbody tr\.issue-active/);
+    assert.match(cssText, /tbody tr\.issue-processing/);
+    assert.match(cssText, /button\.job-row\.processing/);
     assert.match(cssText, /\.modal-backdrop/);
     assert.match(cssText, /\.work-area\.detail-open/);
     assert.match(cssText, /\.detail-band\.processing::before/);
     assert.match(cssText, /\.runner-strip/);
     assert.match(cssText, /\.compact-field/);
+    assert.match(cssText, /\.mobile-only/);
+    assert.match(cssText, /\.issue-cards/);
+    assert.match(cssText, /\.issue-card/);
+    assert.match(cssText, /\.issue-card\.issue-processing/);
+    assert.match(cssText, /\.drawer-backdrop/);
+    assert.match(cssText, /@media \(max-width: 700px\)/);
+    assert.match(cssText, /\.app-shell\.runner-settings-open \.runner-strip/);
+    assert.match(cssText, /\.app-shell\.activity-open \.side-panel/);
+    assert.match(cssText, /\.detail-band \{/);
     assert.match(cssText, /@keyframes processingSweep/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
     assert.equal(js.status, 200);
@@ -1405,6 +1510,11 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /repair-context-dialog/);
     assert.match(jsText, /openRepairContextDialog/);
     assert.match(jsText, /Re-investigate/);
+    assert.match(jsText, /Queued repair/);
+    assert.match(jsText, /Executing repair/);
+    assert.match(jsText, /Drafting fix/);
+    assert.match(jsText, /View repair/);
+    assert.match(jsText, /Retry repair/);
     assert.match(jsText, /function showEntry/);
     assert.match(jsText, /function showJob/);
     assert.match(jsText, /function continueJob/);
@@ -1416,6 +1526,12 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function setDetailProcessing/);
     assert.match(jsText, /function renderCodexSettings/);
     assert.match(jsText, /function saveCodexSettings/);
+    assert.match(jsText, /function setActivityDrawerOpen/);
+    assert.match(jsText, /function setRunnerSettingsOpen/);
+    assert.match(jsText, /function issueCardHtml/);
+    assert.match(jsText, /function mergeJobDetailState/);
+    assert.match(jsText, /PROCESSING_JOB_STATES/);
+    assert.match(jsText, /function handleIssueListClick/);
     assert.match(jsText, /\/api\/settings\/codex/);
     assert.match(jsText, /function updateIssueRowHighlights/);
     assert.match(jsText, /Verification checks:/);
@@ -1494,6 +1610,7 @@ async function run() {
   await testInvestigationCacheAndStaleApprovalSuperseding();
   await testApprovedJobContinuesToDryRunCommentPosting();
   await testSubtitleServerActionPlanExecutesRepair();
+  await testSuccessfulRepairRecoversStaleRetryableState();
   await testRepairRunnerRejectsOwnerDelegation();
   await testRepairRunnerInvalidJsonFailsWithoutResolution();
   await testRepairRunnerNeedsOperatorDecisionCanRetryWithNote();

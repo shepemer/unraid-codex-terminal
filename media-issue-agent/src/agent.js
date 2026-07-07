@@ -409,6 +409,35 @@ function executionResultFromRepairResult(repairResult, agentRun) {
   };
 }
 
+function transitionSuccessfulRepairToDrafting(dbPath, jobId, agentRun, repairResult) {
+  const current = jobForId(dbPath, jobId);
+  if (!current) {
+    throw new Error(`Job ${jobId} was not found after repair completed`);
+  }
+  if (current.state === "executing") {
+    transitionJob(dbPath, jobId, ["executing"], "drafting_comment");
+    return { recovered: false, previousState: current.state };
+  }
+  if (current.state === "failed_retryable") {
+    setJobState(dbPath, jobId, "drafting_comment", null);
+    recordAudit(dbPath, "repair_success_recovered_from_retryable_state", sanitizeValue({
+      runId: agentRun?.id || null,
+      repairStatus: repairResult?.status || null,
+      previousState: current.state,
+      previousError: current.lastError || null
+    }), jobId);
+    return { recovered: true, previousState: current.state };
+  }
+  const message = `Repair runner completed successfully for job ${jobId}, but job state is ${current.state}; expected executing before drafting the resolution comment.`;
+  recordAudit(dbPath, "repair_success_state_conflict", sanitizeValue({
+    runId: agentRun?.id || null,
+    repairStatus: repairResult?.status || null,
+    currentState: current.state,
+    currentError: current.lastError || null
+  }), jobId);
+  throw new Error(message);
+}
+
 function repairWorkspaceFor(config, jobId) {
   const root = config.repairWorkspaceRoot || path.join(path.dirname(config.dbPath || "/state/media-issue-agent.sqlite"), "repair-workspaces");
   return path.join(root, `job-${jobId}`);
@@ -1136,6 +1165,7 @@ export class MediaIssueAgent {
     const agentRun = createAgentRun(this.config.dbPath, jobId, "repair", repairPrompt, settings);
     recordAudit(this.config.dbPath, "repair_agent_started", sanitizeValue({ actor, runId: agentRun.id, settings, workspace, toolCount: toolBriefing?.tools?.length || 0, retry: Boolean(context.repairRetryNote) }), jobId);
     let completedRun = null;
+    let repairResult = null;
     try {
       const output = await runCodexRepair(this.config, repairPrompt, settings, {
         codexWorkspace: workspace,
@@ -1146,7 +1176,7 @@ export class MediaIssueAgent {
         settings: output.settings,
         stderr: output.stderr
       }));
-      const repairResult = parseRepairResult(output.finalMessage);
+      repairResult = parseRepairResult(output.finalMessage);
       if (textDelegatesOwnerWork(repairResult.summary, repairResult.draftComment, repairResult.actionsTaken.join("\n"))) {
         throw new Error("Repair runner delegated media-side work back to the server owner/operator instead of attempting it.");
       }
@@ -1163,10 +1193,6 @@ export class MediaIssueAgent {
         setJobState(this.config.dbPath, jobId, repairResult.status, redactText(message));
         throw new Error(message);
       }
-      const executionResult = executionResultFromRepairResult(repairResult, completedRun || agentRun);
-      recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
-      transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
-      return this.draftResolutionApproval(jobId, actor, executionResult, context);
     } catch (error) {
       const message = redactText(error.message);
       if (!completedRun) {
@@ -1180,6 +1206,10 @@ export class MediaIssueAgent {
       }
       throw error;
     }
+    const executionResult = executionResultFromRepairResult(repairResult, completedRun || agentRun);
+    recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
+    transitionSuccessfulRepairToDrafting(this.config.dbPath, jobId, completedRun || agentRun, repairResult);
+    return this.draftResolutionApproval(jobId, actor, executionResult, context);
   }
 
   async draftResolutionApproval(jobId, actor, executionResult, context = {}) {
