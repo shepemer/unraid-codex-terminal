@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +17,7 @@ import {
 } from "../src/db.js";
 import { issueTableMarkdown } from "../src/issues.js";
 import { startWebServer } from "../src/web.js";
+import { closeServer, createCodexHome, jsonRpcError, jsonRpcResult, readBody } from "./helpers.js";
 
 const WEB_USERNAME = "operator";
 const WEB_PASSWORD = "web-e2e-password";
@@ -24,62 +25,6 @@ const MCP_TOKEN = "web-e2e-token";
 
 async function tempDir() {
   return mkdtemp(path.join(os.tmpdir(), "media-issue-agent-web-e2e-"));
-}
-
-async function closeServer(server) {
-  if (!server) {
-    return;
-  }
-  await new Promise(resolve => server.close(resolve));
-}
-
-async function readBody(req) {
-  let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-  }
-  return body;
-}
-
-function jsonRpcResult(id, result) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    result: {
-      content: [{
-        type: "text",
-        text: JSON.stringify(result)
-      }]
-    }
-  };
-}
-
-function jsonRpcError(id, message) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code: -32000,
-      message
-    }
-  };
-}
-
-async function createCodexHome(root) {
-  const codexHome = path.join(root, "codex-home");
-  await mkdir(codexHome, { recursive: true });
-  await writeFile(path.join(codexHome, "auth.json"), JSON.stringify({
-    auth_mode: "chatgpt",
-    OPENAI_API_KEY: null,
-    tokens: {
-      id_token: "web-e2e-id-token",
-      access_token: "web-e2e-access-token",
-      refresh_token: "web-e2e-refresh-token",
-      account_id: "web-e2e-account"
-    },
-    last_refresh: "2026-01-01T00:00:00.000000000Z"
-  }, null, 2));
-  return codexHome;
 }
 
 async function createFakeCodexBin(root, logPath) {
@@ -98,7 +43,7 @@ async function createFakeCodexBin(root, logPath) {
     "} else if (kind === 'steered-investigation') {",
     "  process.stdout.write('Revised investigation: client-side app playback issue. No server-side action is required.\\n');",
     "} else {",
-    "  process.stdout.write('Investigation summary: fixture diagnostics found no exact allowlisted server repair.\\n');",
+    "  process.stdout.write('Investigation summary: fixture diagnostics require operator steering before repair.\\n');",
     "}"
   ].join("\n"));
   await chmod(bin, 0o700);
@@ -213,6 +158,7 @@ async function startHarness(root, fakeMcp) {
     ISSUE_AGENT_CODEX_BIN: codexBin,
     ISSUE_AGENT_CODEX_WORKSPACE: path.join(root, "workspace"),
     ISSUE_AGENT_CODEX_TIMEOUT_MS: "10000",
+    ISSUE_AGENT_CODEX_ENV_ALLOWLIST: "WEB_E2E_CODEX_LOG",
     ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS: "10000",
     ISSUE_AGENT_WEB_HOST: "127.0.0.1",
     ISSUE_AGENT_WEB_PORT: "6983",
@@ -447,6 +393,20 @@ async function testFullBrowserWorkflow(browser) {
     const pageHandle = await newPage(browser, harness.baseUrl);
     context = pageHandle.context;
     const page = pageHandle.page;
+
+    await expect(page.locator("#codex-settings-panel")).toBeVisible();
+    await page.locator("#codex-model").fill("gpt-5");
+    await page.locator("#codex-reasoning").selectOption("high");
+    await page.locator("#codex-fast-mode").setChecked(false);
+    await page.locator("#codex-service-tier").fill("");
+    await page.locator("#codex-repair-context").fill("Prefer exact IDs in browser tests.");
+    await page.locator("#codex-settings-save").click();
+    await expect(page.locator("#toast")).toContainText("Codex settings saved");
+    await page.getByRole("button", { name: "Reload" }).click();
+    await expect(page.locator("#codex-model")).toHaveValue("gpt-5");
+    await expect(page.locator("#codex-reasoning")).toHaveValue("high");
+    await expect(page.locator("#codex-fast-mode")).not.toBeChecked();
+    await expect(page.locator("#codex-repair-context")).toHaveValue("Prefer exact IDs in browser tests.");
 
     await page.getByRole("button", { name: "Poll Now" }).click();
     await expect(row(page, 1)).toContainText("Browser Flow Fixture");

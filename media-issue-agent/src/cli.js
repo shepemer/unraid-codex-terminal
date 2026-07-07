@@ -49,7 +49,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     throw new Error(`Unknown command: ${command}\n${usage()}`);
   }
   const config = await loadConfig(env, {
-    requireCodexAuth: command === "investigate",
+    requireCodexAuth: ["investigate", "approve", "continue", "steer"].includes(command),
     requireWebPassword: ["serve", "web"].includes(command)
   });
   const agent = new MediaIssueAgent(config);

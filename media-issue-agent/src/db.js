@@ -115,11 +115,71 @@ CREATE TABLE IF NOT EXISTS investigations (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  final_result_json TEXT,
+  error TEXT,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_run_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 `);
 }
 
 export function stableHash(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function parseJson(value, fallback = null) {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+export function getSetting(dbPath, key, fallback = null) {
+  const rows = sqliteExec(dbPath, sql`
+SELECT value_json AS valueJson
+FROM settings
+WHERE key = ${key}
+LIMIT 1;
+`, { json: true });
+  return rows[0] ? parseJson(rows[0].valueJson, fallback) : fallback;
+}
+
+export function setSetting(dbPath, key, value) {
+  sqliteExec(dbPath, sql`
+INSERT INTO settings (key, value_json)
+VALUES (${key}, ${JSON.stringify(value)})
+ON CONFLICT(key) DO UPDATE SET
+  value_json = excluded.value_json,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`);
+  return getSetting(dbPath, key);
 }
 
 export function insertSnapshot(dbPath, markdown, entries) {
@@ -154,6 +214,20 @@ INSERT INTO issue_snapshot_entries (
 `).join("\n");
   sqliteExec(dbPath, `BEGIN;\n${rows}\nCOMMIT;`);
   return { id, sourceHash };
+}
+
+export function pruneSnapshots(dbPath, keep = 200) {
+  const capped = Math.max(1, Number(keep || 200));
+  sqliteExec(dbPath, sql`
+DELETE FROM issue_snapshot_entries
+WHERE snapshot_id NOT IN (
+  SELECT id FROM issue_snapshots ORDER BY id DESC LIMIT ${capped}
+);
+DELETE FROM issue_snapshots
+WHERE id NOT IN (
+  SELECT id FROM issue_snapshots ORDER BY id DESC LIMIT ${capped}
+);
+  `);
 }
 
 export function latestSnapshot(dbPath) {
@@ -378,6 +452,52 @@ LIMIT 1;
   return { ...row, evidence: JSON.parse(row.evidenceJson) };
 }
 
+export function createAgentRun(dbPath, jobId, kind, prompt, config) {
+  const [{ id }] = sqliteExec(dbPath, sql`
+INSERT INTO agent_runs (job_id, kind, status, prompt, config_json)
+VALUES (${jobId}, ${kind}, 'running', ${prompt}, ${JSON.stringify(config || {})})
+RETURNING id;
+`, { json: true });
+  return { id, jobId, kind, status: "running", prompt, config: config || {} };
+}
+
+export function completeAgentRun(dbPath, runId, status, finalResult = null, error = null) {
+  sqliteExec(dbPath, sql`
+UPDATE agent_runs
+SET status = ${status},
+    final_result_json = ${finalResult === null || finalResult === undefined ? null : JSON.stringify(finalResult)},
+    error = ${error},
+    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${runId};
+`);
+  return sqliteExec(dbPath, sql`
+SELECT
+	  id,
+	  job_id AS jobId,
+	  kind,
+	  status,
+	  config_json AS configJson,
+	  final_result_json AS finalResultJson,
+	  error,
+  started_at AS startedAt,
+  completed_at AS completedAt
+FROM agent_runs
+WHERE id = ${runId}
+LIMIT 1;
+`, { json: true }).map(row => ({
+    ...row,
+    config: parseJson(row.configJson, {}),
+    finalResult: parseJson(row.finalResultJson, null)
+  }))[0] || null;
+}
+
+export function recordAgentRunEvent(dbPath, runId, jobId, eventType, payload) {
+  sqliteExec(dbPath, sql`
+INSERT INTO agent_run_events (run_id, job_id, event_type, payload_json)
+VALUES (${runId}, ${jobId}, ${eventType}, ${JSON.stringify(payload || {})});
+`);
+}
+
 export function setPendingApprovals(dbPath, jobId, status, actor = "operator", kind = null) {
   if (!["approved", "rejected"].includes(status)) {
     throw new Error(`Unsupported approval status ${status}`);
@@ -486,7 +606,41 @@ WHERE job_id = ${jobId}
 ORDER BY id DESC
 LIMIT 25;
 `, { json: true }).map(row => ({ ...row, redactedPayload: JSON.parse(row.redactedPayloadJson) }));
-  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents };
+  const agentRuns = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  job_id AS jobId,
+  kind,
+  status,
+  prompt,
+  config_json AS configJson,
+  final_result_json AS finalResultJson,
+  error,
+  started_at AS startedAt,
+  completed_at AS completedAt
+FROM agent_runs
+WHERE job_id = ${jobId}
+ORDER BY id DESC
+LIMIT 10;
+`, { json: true }).map(row => ({
+    ...row,
+    config: parseJson(row.configJson, {}),
+    finalResult: parseJson(row.finalResultJson, null)
+  }));
+  const agentRunEvents = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  run_id AS runId,
+  job_id AS jobId,
+  event_type AS eventType,
+  payload_json AS payloadJson,
+  created_at AS createdAt
+FROM agent_run_events
+WHERE job_id = ${jobId}
+ORDER BY id DESC
+LIMIT 50;
+`, { json: true }).map(row => ({ ...row, payload: parseJson(row.payloadJson, {}) }));
+  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents, agentRuns, agentRunEvents };
 }
 
 export function createPlannedAction(dbPath, jobId, toolName, args, riskLevel = "comment") {

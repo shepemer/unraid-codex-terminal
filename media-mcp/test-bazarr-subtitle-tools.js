@@ -51,13 +51,13 @@ async function run() {
       headers: req.headers
     });
 
-    if (req.method === "GET" && url.pathname === "/plex/library/metadata/109444") {
+    if (req.method === "GET" && url.pathname === "/plex/library/metadata/900001") {
       assert.equal(req.headers["x-plex-token"], "plex-token");
       return sendJson(res, 200, {
         MediaContainer: {
           Metadata: [{
-            ratingKey: "109444",
-            key: "/library/metadata/109444",
+            ratingKey: "900001",
+            key: "/library/metadata/900001",
             guid: "plex://movie/fixture",
             Guid: [{ id: "tmdb://98765" }],
             type: "movie",
@@ -79,11 +79,11 @@ async function run() {
         }
       });
     }
-    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/109444/refresh") {
+    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/900001/refresh") {
       assert.equal(req.headers["x-plex-token"], "plex-token");
       return sendJson(res, 200, { refreshed: true });
     }
-    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/109444/analyze") {
+    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/900001/analyze") {
       assert.equal(req.headers["x-plex-token"], "plex-token");
       return sendJson(res, 200, { analyzed: true });
     }
@@ -199,7 +199,7 @@ async function run() {
     assert.ok(toolNames.has("plex_verify_subtitle_track"));
 
     const dryRun = await tool("bazarr_download_movie_subtitles_for_plex", {
-      plexRatingKey: "109444",
+      plexRatingKey: "900001",
       language: "ko",
       dryRun: true
     });
@@ -210,7 +210,7 @@ async function run() {
     assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/movies/subtitles").length, 0);
 
     const downloaded = await tool("bazarr_download_movie_subtitles_for_plex", {
-      plexRatingKey: "109444",
+      plexRatingKey: "900001",
       language: "ko",
       dryRun: false
     });
@@ -218,14 +218,14 @@ async function run() {
     assert.equal(downloaded.radarrMovie.id, 44);
     assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/movies/subtitles").length, 1);
 
-    const refreshed = await tool("plex_refresh_metadata", { ratingKey: "109444", dryRun: false });
+    const refreshed = await tool("plex_refresh_metadata", { ratingKey: "900001", dryRun: false });
     assert.equal(refreshed.dryRun, false);
     assert.deepEqual(refreshed.result, { refreshed: true });
-    const analyzeDryRun = await tool("plex_analyze_metadata", { ratingKey: "109444", dryRun: true });
+    const analyzeDryRun = await tool("plex_analyze_metadata", { ratingKey: "900001", dryRun: true });
     assert.equal(analyzeDryRun.dryRun, true);
     assert.equal(calls.filter(call => call.method === "PUT" && call.path.endsWith("/analyze")).length, 0);
 
-    const verified = await tool("plex_verify_subtitle_track", { ratingKey: "109444", language: "ko" });
+    const verified = await tool("plex_verify_subtitle_track", { ratingKey: "900001", language: "ko" });
     assert.equal(verified.found, true);
     assert.equal(verified.subtitleCount, 1);
     assert.equal(verified.matches[0].languageCode, "kor");

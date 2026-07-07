@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import { startWebServer } from "../src/web.js";
+import { closeServer, createCodexHome, jsonRpcError, jsonRpcResult, readBody } from "./helpers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,45 +21,6 @@ const WEB_PASSWORD = "sil-fixture-password";
 
 async function tempDir() {
   return mkdtemp(path.join(os.tmpdir(), "media-issue-agent-sil-"));
-}
-
-async function closeServer(server) {
-  if (!server) {
-    return;
-  }
-  await new Promise(resolve => server.close(resolve));
-}
-
-async function readBody(req) {
-  let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-  }
-  return body;
-}
-
-function jsonRpcResult(id, result) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    result: {
-      content: [{
-        type: "text",
-        text: JSON.stringify(result)
-      }]
-    }
-  };
-}
-
-function jsonRpcError(id, message) {
-  return {
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code: -32000,
-      message
-    }
-  };
 }
 
 function fixtureIssues() {
@@ -97,7 +59,7 @@ function fixtureIssues() {
       reporter: { username: "fixture-reporter-c" },
       mediaTitle: "SIL Subtitle Fixture",
       mediaType: "movie",
-      plexRatingKey: "109444",
+      plexRatingKey: "900001",
       year: 2026,
       message: "subtitle-repair-fixture: Please add Korean subtitles."
     }],
@@ -156,6 +118,23 @@ async function startFakeMediaMcp() {
       }
       const body = JSON.parse(await readBody(req));
       requestId = body.id;
+      if (body.method === "tools/list") {
+        calls.push({ name: "tools/list", args: {} });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            tools: [
+              { name: "bazarr_download_movie_subtitles_for_plex", description: "Download movie subtitles for one Plex rating key." },
+              { name: "plex_refresh_metadata", description: "Refresh one Plex rating key." },
+              { name: "plex_verify_subtitle_track", description: "Verify a subtitle track by language." },
+              { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." }
+            ]
+          }
+        }));
+        return;
+      }
       const toolName = body?.params?.name;
       const args = body?.params?.arguments || {};
       calls.push({ name: toolName, args });
@@ -241,28 +220,28 @@ async function startFakeMediaMcp() {
           dryRun: args.dryRun
         };
       } else if (toolName === "bazarr_download_movie_subtitles_for_plex") {
-        assert.equal(args.plexRatingKey, "109444");
+        assert.equal(args.plexRatingKey, "900001");
         assert.equal(args.language, "ko");
         assert.equal(args.dryRun, false);
         result = {
           dryRun: false,
           language: "ko",
-          plexRatingKey: "109444",
+          plexRatingKey: "900001",
           radarrMovie: { id: 44, title: "SIL Subtitle Fixture" }
         };
       } else if (toolName === "plex_refresh_metadata") {
-        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.ratingKey, "900001");
         assert.equal(args.dryRun, false);
         result = {
           dryRun: false,
-          ratingKey: "109444",
+          ratingKey: "900001",
           refreshed: true
         };
       } else if (toolName === "plex_verify_subtitle_track") {
-        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.ratingKey, "900001");
         assert.equal(args.language, "ko");
         result = {
-          ratingKey: "109444",
+          ratingKey: "900001",
           language: "ko",
           found: true,
           subtitleCount: 1,
@@ -291,33 +270,43 @@ async function startFakeMediaMcp() {
   };
 }
 
-async function createCodexHome(root) {
-  const codexHome = path.join(root, "codex-home");
-  await mkdir(codexHome, { recursive: true });
-  await writeFile(path.join(codexHome, "auth.json"), JSON.stringify({
-    auth_mode: "chatgpt",
-    OPENAI_API_KEY: null,
-    tokens: {
-      id_token: "sil-id-token",
-      access_token: "sil-access-token",
-      refresh_token: "sil-refresh-token",
-      account_id: "sil-account"
-    },
-    last_refresh: "2026-01-01T00:00:00.000000000Z"
-  }, null, 2));
-  return codexHome;
-}
-
 async function createFakeCodexBin(root, logPath) {
   const bin = path.join(root, "codex-fixture.mjs");
   await writeFile(bin, [
     "#!/usr/bin/env node",
     "import { appendFileSync, readFileSync } from 'node:fs';",
     "const prompt = readFileSync(0, 'utf8');",
+    "function configValue(name) {",
+    "  for (let index = 0; index < process.argv.length - 1; index += 1) {",
+    "    if (process.argv[index] === '-c' && process.argv[index + 1].startsWith(`${name}=`)) {",
+    "      const raw = process.argv[index + 1].slice(name.length + 1);",
+    "      try { return JSON.parse(raw); } catch { return raw.replace(/^\"|\"$/g, ''); }",
+    "    }",
+    "  }",
+    "  return '';",
+    "}",
+    "async function callMedia(name, args) {",
+    "  const url = configValue('mcp_servers.media.url');",
+    "  const response = await fetch(url, {",
+    "    method: 'POST',",
+    "    headers: {",
+    "      authorization: `Bearer ${process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN || ''}`,",
+    "      'content-type': 'application/json',",
+    "      accept: 'application/json, text/event-stream'",
+    "    },",
+    "    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args } })",
+    "  });",
+    "  const text = await response.text();",
+    "  const parsed = JSON.parse(text);",
+    "  if (parsed.error) throw new Error(parsed.error.message);",
+    "  if (parsed.result?.isError) throw new Error(parsed.result.content?.[0]?.text || 'tool returned error');",
+    "  const toolText = parsed.result?.content?.[0]?.text;",
+    "  return toolText ? JSON.parse(toolText) : parsed.result;",
+    "}",
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
-    "if (prompt.includes('Approved media repair execution')) kind = 'repair-execution';",
+    "if (process.argv.includes('--json') || prompt.includes('Autonomous approved media repair execution')) kind = 'repair-execution';",
     "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
@@ -330,13 +319,27 @@ async function createFakeCodexBin(root, logPath) {
     "    process.stdout.write('Reviewed as a client-side playback problem. No server-side media action was applied.\\nAutomated response from Codex.\\n');",
     "  }",
     "} else if (kind === 'repair-execution') {",
-    "  process.stdout.write(JSON.stringify({ summary: 'Download Korean subtitles and refresh Plex.', actions: [{ toolName: 'bazarr_download_movie_subtitles_for_plex', riskLevel: 'repair', args: { plexRatingKey: '109444', language: 'ko' } }, { toolName: 'plex_refresh_metadata', riskLevel: 'verification', args: { ratingKey: '109444' } }] }));",
+    "  try {",
+    "    await callMedia('seerr_add_issue_comment', { issueId: 1001, message: 'This premature repair comment should be blocked.', dryRun: false });",
+    "  } catch (error) {",
+    "    process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.seerr_add_issue_comment', status: 'blocked', error: error.message } })}\\n`);",
+    "  }",
+    "  await callMedia('bazarr_download_movie_subtitles_for_plex', { plexRatingKey: '900001', language: 'ko', dryRun: false });",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.bazarr_download_movie_subtitles_for_plex', status: 'completed' } })}\\n`);",
+    "  await callMedia('plex_refresh_metadata', { ratingKey: '900001', dryRun: false });",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_refresh_metadata', status: 'completed' } })}\\n`);",
+    "  const verification = await callMedia('plex_verify_subtitle_track', { ratingKey: '900001', language: 'ko' });",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_verify_subtitle_track', status: 'completed' } })}\\n`);",
+    "  const final = verification.found",
+    "    ? { status: 'fixed', summary: 'Downloaded Korean subtitles, refreshed Plex, and verified the Korean subtitle track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.', 'Verified Korean subtitles are visible.'], verification: { status: 'passed', details: 'Korean subtitle track found on Plex item 900001.' }, draftComment: 'Downloaded and verified the requested Korean subtitles. Automated response from Codex.', closeRecommended: true }",
+    "    : { status: 'failed_retryable', summary: 'Subtitle download ran, but verification did not find the track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.'], verification: { status: 'failed', details: 'Korean subtitle track was not visible after refresh.' }, draftComment: '', closeRecommended: false };",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(final) } })}\\n`);",
     "} else if (kind === 'steered-investigation') {",
     "  process.stdout.write('Revised investigation: this appears to be a client-side playback problem. No server-side action is required.\\nNext action: explain that no media repair was applied.\\n');",
     "} else if (prompt.includes('subtitle-repair-fixture')) {",
-    "  process.stdout.write('Investigation summary: this is a Korean subtitle request for a movie. Server-side action is required.\\nExact safe next actions: download Korean subtitles with Bazarr for Plex item 109444, then refresh Plex metadata.\\nUser-side: restart playback after the server action completes.\\n');",
+    "  process.stdout.write('Investigation summary: this is a Korean subtitle request for a movie. Server-side action is required.\\nExact safe next actions: download Korean subtitles with Bazarr for Plex item 900001, then refresh Plex metadata.\\nUser-side: restart playback after the server action completes.\\n');",
     "} else {",
-    "  process.stdout.write('Investigation summary: fixture diagnostics show no exact allowlisted server repair yet.\\nLikely cause: playback metadata mismatch in fixture evidence.\\nNext action: request approval for the proposed no-op follow-up.\\n');",
+    "  process.stdout.write('Investigation summary: this appears to be a client-side playback problem. No server-side action is required.\\nLikely cause: playback metadata mismatch in fixture evidence.\\nNext action: explain that no media repair was applied.\\n');",
     "}"
   ].join("\n"));
   await chmod(bin, 0o700);
@@ -521,6 +524,15 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
 }
 
 async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId) {
+  await api(baseUrl, "/api/settings/codex", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "gpt-5",
+      reasoningEffort: "high",
+      fastMode: false,
+      serviceTier: ""
+    })
+  });
   const before = await codexInvocations(logPath);
   const investigated = await api(baseUrl, "/api/investigate", {
     method: "POST",
@@ -534,43 +546,52 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   assert.equal(actionApproval.payload.plan.classification, "server_action");
   assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
   assert.equal(actionApproval.payload.plan.actions.length, 0);
-  assert.deepEqual(actionApproval.payload.plan.candidateActions.map(action => action.toolName), [
-    "bazarr_download_movie_subtitles_for_plex",
-    "plex_refresh_metadata"
-  ]);
+  assert.equal(actionApproval.payload.plan.repairHints, undefined);
+  assert.match(actionApproval.payload.plan.repairPrompt, /Autonomous approved media repair execution/);
+  assert.match(actionApproval.payload.plan.repairPrompt, /Choose the media tools that fit the evidence/);
 
   const resolution = await api(baseUrl, `/api/jobs/${investigated.result.jobId}/approve`, {
     method: "POST",
     body: "{}"
   });
   assert.equal(resolution.result.status, "awaiting_resolution_approval");
-  assert.equal(resolution.result.executionResult.outcome, "server_action_completed");
-  assert.equal(resolution.result.executionResult.actionsRequested, 2);
-  assert.equal(resolution.result.executionResult.actionsExecuted, 2);
-  assert.match(resolution.result.executionResult.repairAgentSummary, /Download Korean subtitles/);
+  assert.equal(resolution.result.executionResult.outcome, "fixed");
+  assert.equal(resolution.result.executionResult.actionsRequested, 3);
+  assert.equal(resolution.result.executionResult.actionsExecuted, 3);
+  assert.match(resolution.result.executionResult.summary, /Downloaded Korean subtitles/);
   assert.equal(resolution.result.executionResult.verification.status, "passed");
-  assert.equal(resolution.result.executionResult.verification.checks[0].status, "passed");
   assert.match(resolution.result.message, /Automated response from Codex\.$/);
-  assert.equal((await codexInvocations(logPath)).length, before.length + 3);
+  const after = await codexInvocations(logPath);
+  assert.equal(after.length, before.length + 2);
+  const repairInvocation = after.find(invocation => invocation.kind === "repair-execution");
+  assert.ok(repairInvocation);
+  assert.ok(repairInvocation.args.includes("--dangerously-bypass-approvals-and-sandbox"));
+  assert.ok(repairInvocation.args.includes("--json"));
+  assert.ok(repairInvocation.args.includes("--model"));
+  assert.ok(repairInvocation.args.includes("gpt-5"));
+  assert.ok(repairInvocation.args.includes('model_reasoning_effort="high"'));
+  assert.equal(repairInvocation.args.includes("features.fast_mode=true"), false);
+  assert.ok(repairInvocation.args.some(arg => arg.includes("mcp_servers.media.url=")));
+  assert.ok(repairInvocation.args.includes('mcp_servers.media.default_tools_approval_mode="approve"'));
 
   details = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
   assert.equal(details.job.state, "awaiting_resolution_approval");
-  assert.equal(pendingApproval(details, "resolution").payload.executionResult.outcome, "server_action_completed");
-  assert.deepEqual(details.plannedActions.map(action => action.toolName).sort(), [
-    "bazarr_download_movie_subtitles_for_plex",
-    "plex_refresh_metadata"
-  ].sort());
-
-  const downloadCall = fakeMcp.calls.find(call => call.name === "bazarr_download_movie_subtitles_for_plex");
-  assert.equal(downloadCall.args.plexRatingKey, "109444");
-  assert.equal(downloadCall.args.language, "ko");
-  assert.equal(downloadCall.args.dryRun, false);
-  const refreshCall = fakeMcp.calls.find(call => call.name === "plex_refresh_metadata");
-  assert.equal(refreshCall.args.ratingKey, "109444");
-  assert.equal(refreshCall.args.dryRun, false);
-  const verifyCall = fakeMcp.calls.find(call => call.name === "plex_verify_subtitle_track");
-  assert.equal(verifyCall.args.ratingKey, "109444");
-  assert.equal(verifyCall.args.language, "ko");
+  assert.equal(pendingApproval(details, "resolution").payload.executionResult.outcome, "fixed");
+  assert.equal(details.plannedActions.length, 0);
+  assert.equal(details.agentRuns.length, 1);
+  assert.equal(details.agentRuns[0].status, "fixed");
+  assert.match(details.agentRuns[0].prompt, /Current media MCP tool briefing/);
+  assert.match(details.agentRuns[0].prompt, /bazarr_download_movie_subtitles_for_plex/);
+  assert.match(details.agentRuns[0].prompt, /Persistent scratch workspace/);
+  assert.ok(details.agentRunEvents.some(event => event.payload?.item?.name === "media.bazarr_download_movie_subtitles_for_plex"));
+  assert.ok(details.agentRunEvents.some(event => event.eventType === "repair_mcp_tool_call" && event.payload?.toolName === "bazarr_download_movie_subtitles_for_plex"));
+  assert.ok(details.agentRunEvents.some(event => event.eventType === "repair_mcp_tool_result" && event.payload?.calls?.[0]?.toolName === "plex_verify_subtitle_track"));
+  assert.ok(details.agentRunEvents.some(event => event.eventType === "repair_mcp_proxy_blocked"));
+  assert.equal(fakeMcp.calls.some(call => call.name === "tools/list"), true);
+  assert.equal(fakeMcp.calls.some(call => call.name === "seerr_add_issue_comment" && call.args.message === "This premature repair comment should be blocked."), false);
+  assert.equal(fakeMcp.calls.some(call => call.name === "bazarr_download_movie_subtitles_for_plex"), true);
+  assert.equal(fakeMcp.calls.some(call => call.name === "plex_refresh_metadata"), true);
+  assert.equal(fakeMcp.calls.some(call => call.name === "plex_verify_subtitle_track"), true);
 }
 
 async function assertRejectPath(baseUrl, snapshotId) {
@@ -608,9 +629,19 @@ async function assertClosureFailurePath(baseUrl, fakeMcp, snapshotId) {
   assert.doesNotMatch(failed.error, /\/mnt\/user/);
   const details = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
   assert.equal(details.job.state, "failed_retryable");
+  assert.ok(pendingApproval(details, "resolution"));
   assert.doesNotMatch(details.job.lastError, /service\.example\.invalid/);
   assert.doesNotMatch(details.job.lastError, /sil-secret-token/);
   assert.doesNotMatch(details.job.lastError, /\/mnt\/user/);
+  fakeMcp.failCloseIssueIds.delete(1002);
+  const retried = await api(baseUrl, `/api/jobs/${investigated.result.jobId}/approve`, {
+    method: "POST",
+    body: "{}"
+  });
+  assert.equal(retried.result.status, "closed");
+  const retriedDetails = (await api(baseUrl, `/api/jobs/${investigated.result.jobId}`)).detail;
+  assert.equal(retriedDetails.job.state, "closed");
+  assert.equal(pendingApproval(retriedDetails, "resolution"), undefined);
 }
 
 async function assertCodexFailurePath(baseUrl, snapshotId) {
@@ -664,8 +695,8 @@ async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
   assert.ok(fakeMcp.calls.some(call => call.name === "seerr_reopen_issue" && call.args.issueId === 1004));
 
   const repolled = await api(baseUrl, "/api/poll", { method: "POST", body: "{}" });
-  assert.equal(repolled.result.openIssueCount, 4);
-  assert.equal(repolled.result.closedIssueCount, 2);
+  assert.equal(repolled.result.openIssueCount, 3);
+  assert.equal(repolled.result.closedIssueCount, 3);
   const latest = await api(baseUrl, "/api/snapshot/latest");
   const reopenedEntry = latest.snapshot.entries.find(entry => entry.issueId === "1004");
   assert.equal(reopenedEntry.status, "open");
@@ -691,6 +722,7 @@ async function run() {
       ISSUE_AGENT_CODEX_BIN: codexBin,
       ISSUE_AGENT_CODEX_WORKSPACE: path.join(root, "codex-workspace"),
       ISSUE_AGENT_CODEX_TIMEOUT_MS: "10000",
+      ISSUE_AGENT_CODEX_ENV_ALLOWLIST: "SIL_CODEX_LOG",
       ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS: "10000",
       ISSUE_AGENT_POLL_INTERVAL_SECONDS: "30",
       ISSUE_AGENT_WEB_HOST: "127.0.0.1",
