@@ -258,7 +258,15 @@ SELECT
   investigations.status AS investigationStatus,
   investigations.summary AS investigationSummary,
   investigations.error AS investigationError,
-  investigations.updated_at AS investigationUpdatedAt
+  investigations.updated_at AS investigationUpdatedAt,
+  EXISTS (
+    SELECT 1
+    FROM approvals
+    WHERE approvals.job_id = jobs.id
+      AND approvals.kind = 'action'
+      AND approvals.status = 'approved'
+      AND approvals.payload_json LIKE '%"executionMode":"approved_repair_agent"%'
+  ) AS hasApprovedRepair
 FROM issue_snapshot_entries
 LEFT JOIN jobs
   ON jobs.source = issue_snapshot_entries.source
@@ -272,7 +280,7 @@ LIMIT 1;
   if (!row) {
     return null;
   }
-  return { ...row, raw: JSON.parse(row.rawJson) };
+  return { ...row, hasApprovedRepair: Boolean(row.hasApprovedRepair), raw: JSON.parse(row.rawJson) };
 }
 
 export function snapshotEntries(dbPath, snapshotId) {
@@ -293,7 +301,15 @@ SELECT
   investigations.status AS investigationStatus,
   investigations.summary AS investigationSummary,
   investigations.error AS investigationError,
-  investigations.updated_at AS investigationUpdatedAt
+  investigations.updated_at AS investigationUpdatedAt,
+  EXISTS (
+    SELECT 1
+    FROM approvals
+    WHERE approvals.job_id = jobs.id
+      AND approvals.kind = 'action'
+      AND approvals.status = 'approved'
+      AND approvals.payload_json LIKE '%"executionMode":"approved_repair_agent"%'
+  ) AS hasApprovedRepair
 FROM issue_snapshot_entries
 LEFT JOIN jobs
   ON jobs.source = issue_snapshot_entries.source
@@ -302,7 +318,7 @@ LEFT JOIN investigations
   ON investigations.job_id = jobs.id
 WHERE issue_snapshot_entries.snapshot_id = ${snapshotId}
 ORDER BY issue_snapshot_entries.idx;
-`, { json: true }).map(row => ({ ...row, raw: JSON.parse(row.rawJson) }));
+`, { json: true }).map(row => ({ ...row, hasApprovedRepair: Boolean(row.hasApprovedRepair), raw: JSON.parse(row.rawJson) }));
 }
 
 export function ensureJob(dbPath, source, issueId, state = "detected") {

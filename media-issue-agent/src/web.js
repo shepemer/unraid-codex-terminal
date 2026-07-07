@@ -55,7 +55,10 @@ const HTML = `<!doctype html>
           </label>
           <button id="repair-context-button" type="button" class="secondary">Context</button>
           <button id="codex-settings-save" type="button" class="secondary">Save</button>
+          <button id="runner-settings-close-button" type="button" class="secondary mobile-only">Close</button>
         </div>
+        <button id="runner-settings-button" class="secondary mobile-only" type="button" aria-expanded="false">Runner</button>
+        <button id="activity-drawer-button" class="secondary mobile-only" type="button" aria-expanded="false">Activity</button>
         <div class="theme-toggle" aria-label="Theme">
           <button type="button" data-theme-choice="light">Light</button>
           <button type="button" data-theme-choice="dark">Dark</button>
@@ -105,6 +108,7 @@ const HTML = `<!doctype html>
               </tbody>
             </table>
           </div>
+          <div id="issue-cards" class="issue-cards" aria-label="Mobile issue list"></div>
         </section>
 
         <aside class="side-panel panel" aria-labelledby="activity-heading">
@@ -114,6 +118,7 @@ const HTML = `<!doctype html>
               <h2 id="activity-heading">Activity</h2>
             </div>
             <span id="approval-mode" class="badge warning">approval-gated</span>
+            <button id="activity-close-button" class="secondary mobile-only" type="button">Close</button>
           </div>
           <div class="stats-grid" id="stats-grid"></div>
           <div class="job-list" id="job-list"></div>
@@ -185,6 +190,8 @@ const HTML = `<!doctype html>
       </div>
     </div>
   </div>
+  <div id="runner-settings-backdrop" class="drawer-backdrop hidden"></div>
+  <div id="activity-drawer-backdrop" class="drawer-backdrop hidden"></div>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
 </body>
@@ -449,6 +456,10 @@ p { color: var(--muted); margin-top: 2px; }
   font-size: 12px;
 }
 
+.mobile-only {
+  display: none;
+}
+
 .theme-toggle {
   display: inline-flex;
   align-items: center;
@@ -615,6 +626,10 @@ p { color: var(--muted); margin-top: 2px; }
   max-height: none;
 }
 
+.issue-cards {
+  display: none;
+}
+
 table {
   width: 100%;
   min-width: 1040px;
@@ -664,6 +679,18 @@ tbody tr.issue-active {
 
 tbody tr.issue-active:hover {
   background: color-mix(in srgb, var(--accent-soft) 72%, var(--panel));
+}
+
+tbody tr.issue-processing,
+tbody tr.issue-processing:hover {
+  background:
+    linear-gradient(100deg,
+      color-mix(in srgb, var(--accent-soft) 48%, transparent),
+      color-mix(in srgb, var(--warning-soft) 58%, transparent),
+      color-mix(in srgb, var(--accent-soft) 48%, transparent)),
+    var(--panel);
+  background-size: 260% 100%;
+  animation: processingSweep 1.7s linear infinite;
 }
 
 td {
@@ -768,6 +795,20 @@ button.job-row.active {
   background: color-mix(in srgb, var(--accent-soft) 28%, var(--panel));
   border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
   transform: none;
+}
+
+button.job-row.processing,
+button.job-row.processing:hover,
+button.job-row.processing.active {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--line));
+  background:
+    linear-gradient(100deg,
+      color-mix(in srgb, var(--accent-soft) 36%, transparent),
+      color-mix(in srgb, var(--warning-soft) 52%, transparent),
+      color-mix(in srgb, var(--accent-soft) 36%, transparent)),
+    var(--panel);
+  background-size: 260% 100%;
+  animation: processingSweep 1.7s linear infinite;
 }
 
 .job-main {
@@ -946,6 +987,17 @@ pre {
   display: none;
 }
 
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 24;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.drawer-backdrop.hidden {
+  display: none;
+}
+
 #toast {
   position: fixed;
   right: 18px;
@@ -1022,9 +1074,336 @@ pre {
   }
 }
 
+@media (max-width: 700px) {
+  html,
+  body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  body {
+    min-height: 100dvh;
+  }
+
+  button {
+    min-height: 44px;
+  }
+
+  .mobile-only {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .app-shell {
+    min-height: 100dvh;
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .brand-block {
+    width: 100%;
+  }
+
+  #snapshot-meta {
+    max-width: calc(100vw - 24px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar .toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    gap: 8px;
+  }
+
+  .theme-toggle,
+  #reload-button {
+    display: none;
+  }
+
+  #poll-button {
+    grid-column: auto;
+  }
+
+  .app-shell.runner-settings-open .topbar {
+    z-index: 45;
+  }
+
+  .runner-strip {
+    display: none;
+  }
+
+  .app-shell.runner-settings-open .runner-strip {
+    position: fixed;
+    inset: auto 12px 12px;
+    z-index: 46;
+    display: grid;
+    grid-template-columns: 1fr;
+    width: auto;
+    max-height: calc(100dvh - 24px);
+    overflow: auto;
+    gap: 10px;
+    padding: 12px;
+    background: var(--panel);
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+    box-shadow: var(--shadow);
+  }
+
+  .runner-label {
+    padding: 0;
+  }
+
+  .compact-field {
+    grid-template-columns: 1fr;
+    gap: 4px;
+    width: 100%;
+  }
+
+  .compact-model,
+  .compact-reasoning,
+  .compact-tier,
+  .compact-toggle,
+  .runner-strip button {
+    width: 100%;
+  }
+
+  .runner-strip input[type="text"],
+  .runner-strip select {
+    min-height: 44px;
+  }
+
+  .compact-toggle {
+    justify-content: flex-start;
+    min-height: 44px;
+  }
+
+  .workspace {
+    display: block;
+    padding: 10px;
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .issue-section {
+    min-width: 0;
+    border-radius: 9px;
+  }
+
+  .issue-section .section-header,
+  .side-panel .section-header,
+  .detail-band .section-header {
+    min-height: 54px;
+    align-items: center;
+  }
+
+  .table-wrap {
+    display: none;
+  }
+
+  .issue-cards {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .issue-card {
+    display: grid;
+    gap: 9px;
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 11px;
+    background: var(--panel);
+    box-shadow: var(--shadow-soft);
+  }
+
+  .issue-card.issue-closed {
+    background: color-mix(in srgb, var(--success-soft) 46%, var(--panel));
+  }
+
+  .issue-card.issue-active {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+    box-shadow: inset 3px 0 0 var(--accent-strong), var(--shadow-soft);
+  }
+
+  .issue-card.issue-processing {
+    border-color: color-mix(in srgb, var(--warning) 38%, var(--line));
+    background:
+      linear-gradient(100deg,
+        color-mix(in srgb, var(--accent-soft) 36%, transparent),
+        color-mix(in srgb, var(--warning-soft) 52%, transparent),
+        color-mix(in srgb, var(--accent-soft) 36%, transparent)),
+      var(--panel);
+    background-size: 260% 100%;
+    animation: processingSweep 1.7s linear infinite;
+  }
+
+  .issue-card-header,
+  .issue-card-meta {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .issue-card-header {
+    justify-content: space-between;
+  }
+
+  .issue-card-title {
+    margin: 0;
+    color: var(--text);
+    font-size: 16px;
+    line-height: 1.25;
+    font-weight: 780;
+    overflow-wrap: anywhere;
+  }
+
+  .issue-card-date,
+  .issue-card-description {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.35;
+  }
+
+  .issue-card-description {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .issue-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .issue-actions button {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .side-panel {
+    position: fixed;
+    inset: 0 0 0 auto;
+    z-index: 25;
+    width: min(360px, calc(100vw - 34px));
+    max-width: calc(100vw - 34px);
+    margin: 0;
+    border-radius: 0;
+    transform: translateX(105%);
+    transition: transform 180ms ease;
+    box-shadow: var(--shadow);
+  }
+
+  .app-shell.activity-open .side-panel {
+    transform: translateX(0);
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr 1fr;
+    padding: 10px;
+  }
+
+  .stat {
+    min-height: 62px;
+  }
+
+  .job-list {
+    padding: 10px;
+    max-height: none;
+  }
+
+  .detail-band {
+    position: fixed;
+    inset: 0;
+    z-index: 28;
+    width: 100vw;
+    height: 100dvh;
+    max-width: 100vw;
+    margin: 0;
+    border-radius: 0;
+    border: 0;
+  }
+
+  .detail-band.hidden {
+    display: none;
+  }
+
+  .detail-band .section-header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .detail-band .section-header > .toolbar {
+    display: flex;
+    width: auto;
+    max-width: 58%;
+    justify-content: flex-end;
+  }
+
+  #approval-actions {
+    width: 100%;
+  }
+
+  #approval-actions button,
+  #detail-close-button,
+  #reopen-button,
+  #continue-button {
+    min-height: 40px;
+  }
+
+  pre {
+    flex: 1;
+    min-height: 0;
+    padding: 12px;
+    font-size: 12px;
+  }
+
+  .steer-panel {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .steer-panel button {
+    width: 100%;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+
+  .modal-panel {
+    max-height: calc(100dvh - 20px);
+    overflow: auto;
+  }
+
+  #toast {
+    right: 10px;
+    bottom: 10px;
+    max-width: calc(100vw - 20px);
+  }
+}
+
 @media (max-width: 560px) {
   .topbar {
-    padding: 12px;
+    padding: 10px;
   }
 
   .brand-block {
@@ -1038,42 +1417,6 @@ pre {
   }
 
   h1 { font-size: 18px; }
-
-  .theme-toggle,
-  .toolbar > button,
-  .runner-strip {
-    width: 100%;
-  }
-
-  .theme-toggle button {
-    flex: 1;
-  }
-
-  .runner-strip {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .runner-label,
-  .compact-field,
-  .compact-toggle,
-  .runner-strip button {
-    width: 100%;
-  }
-
-  .runner-label {
-    grid-column: 1 / -1;
-  }
-
-  .compact-field {
-    grid-template-columns: 1fr;
-  }
-
-  .compact-model,
-  .compact-reasoning,
-  .compact-tier {
-    width: 100%;
-  }
 
   .auth-panel {
     grid-template-columns: 1fr;
@@ -1091,6 +1434,7 @@ pre {
 
 const JS = `const state = {
   snapshotId: null,
+  snapshotGeneratedAt: null,
   entries: [],
   jobs: [],
   activeJobId: null,
@@ -1100,6 +1444,8 @@ const JS = `const state = {
   authOk: false,
   loginRunning: false,
   codexSettings: null,
+  activityOpen: false,
+  runnerSettingsOpen: false,
   authTimer: null,
   jobPollTimer: null
 };
@@ -1122,9 +1468,16 @@ const el = {
   repairContextDialog: document.getElementById("repair-context-dialog"),
   repairContextCancelButton: document.getElementById("repair-context-cancel-button"),
   repairContextSaveButton: document.getElementById("repair-context-save-button"),
+  runnerSettingsButton: document.getElementById("runner-settings-button"),
+  runnerSettingsCloseButton: document.getElementById("runner-settings-close-button"),
+  runnerSettingsBackdrop: document.getElementById("runner-settings-backdrop"),
+  activityDrawerButton: document.getElementById("activity-drawer-button"),
+  activityCloseButton: document.getElementById("activity-close-button"),
+  activityDrawerBackdrop: document.getElementById("activity-drawer-backdrop"),
   snapshotMeta: document.getElementById("snapshot-meta"),
   issueCount: document.getElementById("issue-count"),
   issueRows: document.getElementById("issue-rows"),
+  issueCards: document.getElementById("issue-cards"),
   pollButton: document.getElementById("poll-button"),
   reloadButton: document.getElementById("reload-button"),
   statsGrid: document.getElementById("stats-grid"),
@@ -1154,6 +1507,14 @@ const el = {
   themeButtons: [...document.querySelectorAll("[data-theme-choice]")]
 };
 
+const PROCESSING_JOB_STATES = new Set([
+  "approved_for_execution",
+  "executing",
+  "waiting_for_plex_verification",
+  "drafting_comment",
+  "closing_issue"
+]);
+
 function toast(message) {
   el.toast.textContent = message;
   el.toast.classList.add("show");
@@ -1162,6 +1523,10 @@ function toast(message) {
 }
 
 function setDetailOpen(open) {
+  if (open) {
+    setActivityDrawerOpen(false);
+    setRunnerSettingsOpen(false);
+  }
   el.detailBand.classList.toggle("hidden", !open);
   el.workArea.classList.toggle("detail-open", open);
 }
@@ -1176,9 +1541,26 @@ function entryIndexForJob(jobId) {
   return state.entries.find(entry => Number(entry.jobId) === Number(jobId))?.idx || null;
 }
 
+function setActivityDrawerOpen(open) {
+  state.activityOpen = Boolean(open);
+  el.appShell.classList.toggle("activity-open", state.activityOpen);
+  el.activityDrawerBackdrop.classList.toggle("hidden", !state.activityOpen);
+  el.activityDrawerButton.setAttribute("aria-expanded", String(state.activityOpen));
+}
+
+function setRunnerSettingsOpen(open) {
+  state.runnerSettingsOpen = Boolean(open);
+  el.appShell.classList.toggle("runner-settings-open", state.runnerSettingsOpen);
+  el.runnerSettingsBackdrop.classList.toggle("hidden", !state.runnerSettingsOpen);
+  el.runnerSettingsButton.setAttribute("aria-expanded", String(state.runnerSettingsOpen));
+}
+
 function updateIssueRowHighlights() {
   for (const row of el.issueRows.querySelectorAll("[data-entry-index]")) {
     row.classList.toggle("issue-active", Number(row.dataset.entryIndex) === Number(state.activeEntryIndex));
+  }
+  for (const card of el.issueCards.querySelectorAll("[data-entry-index]")) {
+    card.classList.toggle("issue-active", Number(card.dataset.entryIndex) === Number(state.activeEntryIndex));
   }
 }
 
@@ -1194,6 +1576,8 @@ function closeDetail() {
   el.continueButton.classList.add("hidden");
   el.approvalActions.classList.add("hidden");
   setSteerVisible(false);
+  setActivityDrawerOpen(false);
+  setRunnerSettingsOpen(false);
   renderJobs(state.jobs);
   updateIssueRowHighlights();
 }
@@ -1263,10 +1647,10 @@ function stateLabel(stateName) {
     queued_for_investigation: "Queued",
     investigating: "Investigating",
     awaiting_action_approval: "Needs approval",
-    approved_for_execution: "Approved",
-    executing: "Executing",
-    waiting_for_plex_verification: "Verifying",
-    drafting_comment: "Drafting",
+    approved_for_execution: "Queued repair",
+    executing: "Executing repair",
+    waiting_for_plex_verification: "Verifying fix",
+    drafting_comment: "Drafting fix",
     awaiting_comment_approval: "Comment review",
     awaiting_resolution_approval: "Approve fix",
     posting_comment: "Posting",
@@ -1278,6 +1662,10 @@ function stateLabel(stateName) {
     failed_terminal: "Failed"
   };
   return labels[stateName] || String(stateName || "").replaceAll("_", " ");
+}
+
+function isProcessingState(stateName) {
+  return PROCESSING_JOB_STATES.has(String(stateName || ""));
 }
 
 function statusBadgeClass(status) {
@@ -1331,7 +1719,7 @@ function renderJobs(jobs) {
     return;
   }
   el.jobList.innerHTML = jobs.map(job => \`
-    <button class="job-row \${Number(state.activeJobId) === Number(job.id) ? "active" : ""}" type="button" data-job-id="\${job.id}">
+    <button class="\${["job-row", Number(state.activeJobId) === Number(job.id) ? "active" : "", isProcessingState(job.state) ? "processing" : ""].filter(Boolean).join(" ")}" type="button" data-job-id="\${job.id}">
       <div class="job-main">
         <strong>Job \${escapeHtml(job.id)}</strong>
         <span>\${escapeHtml(job.source)} \${escapeHtml(job.issueId)}</span>
@@ -1339,6 +1727,38 @@ function renderJobs(jobs) {
       <span class="\${badgeClass(job.state)}">\${escapeHtml(stateLabel(job.state))}</span>
     </button>
   \`).join("");
+}
+
+function entryHasApprovedRepair(entry) {
+  return entry?.hasApprovedRepair === true || entry?.hasApprovedRepair === 1 || entry?.hasApprovedRepair === "1";
+}
+
+function issueOpensJob(entry) {
+  if (!entry.jobId) {
+    return false;
+  }
+  const stateName = String(entry.jobState || "");
+  if (stateName === "awaiting_resolution_approval") {
+    return true;
+  }
+  if (isProcessingState(stateName)) {
+    return true;
+  }
+  return stateName === "failed_retryable" && entryHasApprovedRepair(entry);
+}
+
+function issueOpenJobLabel(entry) {
+  const stateName = String(entry.jobState || "");
+  if (stateName === "awaiting_resolution_approval") {
+    return "Approve fix";
+  }
+  if (stateName === "failed_retryable" && entryHasApprovedRepair(entry)) {
+    return "Retry repair";
+  }
+  if (isProcessingState(stateName)) {
+    return "View repair";
+  }
+  return "Open job";
 }
 
 function canReinvestigate(entry) {
@@ -1378,6 +1798,9 @@ function issueAction(entry) {
   if (isClosedEntry(entry)) {
     return { kind: "summary", label: "View summary" };
   }
+  if (issueOpensJob(entry)) {
+    return { kind: "open", label: issueOpenJobLabel(entry) };
+  }
   if (canReinvestigate(entry)) {
     return { kind: "investigate", label: "Re-investigate", force: true };
   }
@@ -1406,6 +1829,44 @@ function issueActionButton(entry) {
     primary = \`<button class="secondary" type="button" disabled>\${action.label}</button>\`;
   }
   return \`<div class="issue-actions">\${primary}\${closeButton}</div>\`;
+}
+
+function issueCardHtml(entry) {
+  const cardClasses = [
+    "issue-card",
+    isClosedEntry(entry) ? "issue-closed" : "",
+    Number(state.activeEntryIndex) === Number(entry.idx) ? "issue-active" : "",
+    isProcessingState(entry.jobState) ? "issue-processing" : ""
+  ].filter(Boolean).join(" ");
+  return \`
+    <article class="\${cardClasses}" data-entry-index="\${entry.idx}">
+      <div class="issue-card-header">
+        <div class="issue-card-meta">
+          <span class="source-pill">\${escapeHtml(entry.source)}</span>
+          <span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span>
+        </div>
+        <span class="badge muted">#\${escapeHtml(entry.idx)}</span>
+      </div>
+      <h3 class="issue-card-title">\${escapeHtml(entry.mediaTitle || "Untitled media")}</h3>
+      <div class="issue-card-date">\${escapeHtml(entry.date || "Unknown date")}</div>
+      <div class="issue-card-description">\${escapeHtml(entry.description || "No description provided.")}</div>
+      \${issueActionButton(entry)}
+    </article>
+  \`;
+}
+
+function formatEntryMetadata(entry) {
+  if (!entry) {
+    return "";
+  }
+  return [
+    \`Source: \${entry.source}\`,
+    \`Issue ID: \${entry.issueId}\`,
+    \`Reporter: \${entry.reporter || "Unknown"}\`,
+    \`Media/title: \${entry.mediaTitle || "Untitled media"}\`,
+    \`Date: \${entry.date || "Unknown date"}\`,
+    \`Status: \${entry.status || "Unknown"}\`
+  ].join("\\n");
 }
 
 function setSteerVisible(visible) {
@@ -1467,23 +1928,31 @@ function closeRepairContextDialog({ revert = true } = {}) {
 function renderSnapshot(snapshot) {
   if (!snapshot) {
     state.snapshotId = null;
+    state.snapshotGeneratedAt = null;
     state.entries = [];
     setSteerVisible(false);
     el.snapshotMeta.textContent = "No snapshot loaded";
     el.issueCount.textContent = "0";
     el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No snapshot loaded.</td></tr>';
+    el.issueCards.innerHTML = '<div class="empty">No snapshot loaded.</div>';
     return;
   }
   state.snapshotId = snapshot.id;
+  state.snapshotGeneratedAt = snapshot.generatedAt;
   state.entries = snapshot.entries || [];
   el.snapshotMeta.textContent = \`Snapshot \${snapshot.id} · \${snapshot.generatedAt}\`;
   el.issueCount.textContent = String(snapshot.entries.length);
-  if (!snapshot.entries.length) {
+  renderIssueLists();
+}
+
+function renderIssueLists() {
+  if (!state.entries.length) {
     el.issueRows.innerHTML = '<tr><td colspan="9" class="empty">No issues.</td></tr>';
+    el.issueCards.innerHTML = '<div class="empty">No issues.</div>';
     return;
   }
-  el.issueRows.innerHTML = snapshot.entries.map(entry => \`
-    <tr data-entry-index="\${entry.idx}" class="\${[isClosedEntry(entry) ? "issue-closed" : "", Number(state.activeEntryIndex) === Number(entry.idx) ? "issue-active" : ""].filter(Boolean).join(" ")}">
+  el.issueRows.innerHTML = state.entries.map(entry => \`
+    <tr data-entry-index="\${entry.idx}" class="\${[isClosedEntry(entry) ? "issue-closed" : "", Number(state.activeEntryIndex) === Number(entry.idx) ? "issue-active" : "", isProcessingState(entry.jobState) ? "issue-processing" : ""].filter(Boolean).join(" ")}">
       <td>\${entry.idx}</td>
       <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
       <td>\${escapeHtml(entry.issueId)}</td>
@@ -1495,6 +1964,49 @@ function renderSnapshot(snapshot) {
       <td>\${issueActionButton(entry)}</td>
     </tr>
   \`).join("");
+  el.issueCards.innerHTML = state.entries.map(issueCardHtml).join("");
+}
+
+function detailHasApprovedRepair(detail) {
+  return (detail.approvals || []).some(approval => approval.kind === "action"
+    && approval.status === "approved"
+    && approval.payload?.plan?.executionMode === "approved_repair_agent");
+}
+
+function mergeJobDetailState(detail) {
+  const job = detail?.job;
+  if (!job) {
+    return;
+  }
+  let matchedJob = false;
+  state.jobs = state.jobs.map(existing => {
+    if (Number(existing.id) !== Number(job.id)) {
+      return existing;
+    }
+    matchedJob = true;
+    return { ...existing, ...job };
+  });
+  if (!matchedJob) {
+    state.jobs = [job, ...state.jobs];
+  }
+  const approvedRepair = detailHasApprovedRepair(detail);
+  state.entries = state.entries.map(entry => {
+    const matches = Number(entry.jobId) === Number(job.id)
+      || (entry.source === job.source && String(entry.issueId) === String(job.issueId));
+    if (!matches) {
+      return entry;
+    }
+    return {
+      ...entry,
+      jobId: job.id,
+      jobState: job.state,
+      investigationStatus: detail.investigation?.status || entry.investigationStatus,
+      investigationSummary: detail.investigation?.summary || entry.investigationSummary,
+      investigationError: detail.investigation?.error || entry.investigationError,
+      investigationUpdatedAt: detail.investigation?.updatedAt || entry.investigationUpdatedAt,
+      hasApprovedRepair: entryHasApprovedRepair(entry) || approvedRepair
+    };
+  });
 }
 
 function showEntry(index) {
@@ -1522,10 +2034,10 @@ function showEntry(index) {
   if (entry.investigationSummary) {
     const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
     const updated = entry.investigationUpdatedAt ? \`Updated: \${entry.investigationUpdatedAt}\` : "";
-    el.output.textContent = [status, updated, "", entry.investigationSummary].filter(Boolean).join("\\n");
+    el.output.textContent = [formatEntryMetadata(entry), "", status, updated, "", entry.investigationSummary].filter(Boolean).join("\\n");
     el.approvalActions.classList.toggle("hidden", entry.jobState !== "awaiting_action_approval");
   } else {
-    el.output.textContent = \`No cached investigation for \${entry.source} issue \${entry.issueId}. Select Investigate to run Codex.\`;
+    el.output.textContent = [formatEntryMetadata(entry), "", "No cached investigation. Select Investigate to run Codex."].filter(Boolean).join("\\n");
     el.approvalActions.classList.add("hidden");
     setSteerVisible(false);
   }
@@ -1707,11 +2219,13 @@ async function showJob(jobId, options = {}) {
   updateIssueRowHighlights();
   try {
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
+    mergeJobDetailState(result.detail);
     el.output.textContent = formatJobDetail(result.detail);
     updateJobControls(result.detail);
     const processing = shouldPollJob(result.detail);
     setDetailProcessing(processing, processing ? stateLabel(result.detail.job.state) : "Processing");
     renderJobs(state.jobs);
+    renderIssueLists();
     updateIssueRowHighlights();
     if (processing) {
       if (!state.jobPollTimer) startJobPolling();
@@ -1783,7 +2297,7 @@ async function showIssueSummary(index) {
   updateIssueRowHighlights();
   try {
     const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/summary\`);
-    el.output.textContent = result.summary;
+    el.output.textContent = [formatEntryMetadata(entry), "", result.summary].filter(Boolean).join("\\n");
     el.reopenButton.classList.toggle("hidden", !result.closed);
   } catch (error) {
     el.output.textContent = error.message;
@@ -2036,6 +2550,12 @@ el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
 el.loginButton.addEventListener("click", startLogin);
 el.codexSettingsSave.addEventListener("click", saveCodexSettings);
+el.runnerSettingsButton.addEventListener("click", () => setRunnerSettingsOpen(true));
+el.runnerSettingsCloseButton.addEventListener("click", () => setRunnerSettingsOpen(false));
+el.runnerSettingsBackdrop.addEventListener("click", () => setRunnerSettingsOpen(false));
+el.activityDrawerButton.addEventListener("click", () => setActivityDrawerOpen(true));
+el.activityCloseButton.addEventListener("click", () => setActivityDrawerOpen(false));
+el.activityDrawerBackdrop.addEventListener("click", () => setActivityDrawerOpen(false));
 el.repairContextButton.addEventListener("click", openRepairContextDialog);
 el.repairContextCancelButton.addEventListener("click", () => closeRepairContextDialog());
 el.repairContextSaveButton.addEventListener("click", () => saveCodexSettings({ closeRepairContextDialog: true }));
@@ -2047,7 +2567,7 @@ el.repairContextDialog.addEventListener("click", event => {
 for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
-el.issueRows.addEventListener("click", event => {
+function handleIssueListClick(event) {
   const summaryButton = event.target.closest("[data-issue-summary]");
   if (summaryButton) {
     showIssueSummary(Number(summaryButton.dataset.issueSummary));
@@ -2072,7 +2592,9 @@ el.issueRows.addEventListener("click", event => {
   if (row) {
     showEntry(Number(row.dataset.entryIndex));
   }
-});
+}
+el.issueRows.addEventListener("click", handleIssueListClick);
+el.issueCards.addEventListener("click", handleIssueListClick);
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
 el.detailCloseButton.addEventListener("click", closeDetail);
@@ -2100,6 +2622,7 @@ el.closeDialog.addEventListener("click", event => {
 el.jobList.addEventListener("click", event => {
   const row = event.target.closest("[data-job-id]");
   if (row) {
+    setActivityDrawerOpen(false);
     showJob(Number(row.dataset.jobId));
   }
 });
