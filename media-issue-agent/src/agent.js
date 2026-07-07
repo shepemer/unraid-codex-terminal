@@ -1,8 +1,10 @@
 import { MediaMcpClient } from "./mcp-client.js";
 import { issueQueue, issueTableMarkdown } from "./issues.js";
 import {
+  completeVerificationCheck,
   createApproval,
   createPlannedAction,
+  createVerificationCheck,
   ensureJob,
   initDb,
   insertSnapshot,
@@ -343,6 +345,37 @@ function normalizeRepairActions(actions) {
       args
     };
   });
+}
+
+function verificationTimeoutMs(config) {
+  return Number.isFinite(Number(config.verificationTimeoutMs)) ? Number(config.verificationTimeoutMs) : 120000;
+}
+
+function verificationPollIntervalMs(config) {
+  return Number.isFinite(Number(config.verificationPollIntervalMs)) ? Number(config.verificationPollIntervalMs) : 5000;
+}
+
+function subtitleVerificationChecks(actions) {
+  const checks = [];
+  for (const action of actions) {
+    if (action.toolName !== "bazarr_download_movie_subtitles_for_plex") {
+      continue;
+    }
+    const ratingKey = firstPresent(action.args?.plexRatingKey, action.args?.ratingKey);
+    const language = action.args?.language;
+    if (!ratingKey || !language) {
+      continue;
+    }
+    checks.push({
+      checkType: "plex_subtitle_track",
+      toolName: "plex_verify_subtitle_track",
+      args: {
+        ratingKey: String(ratingKey),
+        language: String(language)
+      }
+    });
+  }
+  return checks;
 }
 
 function closeActionsFor(source, issueId, message) {
@@ -831,6 +864,73 @@ export class MediaIssueAgent {
     return this.executeApprovedPlan(jobId, actor, context);
   }
 
+  async waitForVerification(jobId, checks, executionResult, actor) {
+    const timeoutMs = Math.max(0, verificationTimeoutMs(this.config));
+    const intervalMs = Math.max(100, verificationPollIntervalMs(this.config));
+    const startedAt = Date.now();
+    const verification = {
+      status: "passed",
+      timeoutMs,
+      intervalMs,
+      checks: []
+    };
+    for (const check of checks) {
+      const stored = createVerificationCheck(this.config.dbPath, jobId, check.checkType, check.args, "running");
+      const checkResult = {
+        id: stored.id,
+        checkType: check.checkType,
+        toolName: check.toolName,
+        args: check.args,
+        attempts: 0,
+        status: "running",
+        lastResult: null
+      };
+      verification.checks.push(checkResult);
+      recordAudit(this.config.dbPath, "verification_started", sanitizeValue({ actor, check }), jobId);
+      for (;;) {
+        checkResult.attempts += 1;
+        let result;
+        try {
+          result = await this.client.callTool(check.toolName, check.args);
+        } catch (error) {
+          const message = redactText(error.message);
+          checkResult.status = "failed";
+          completeVerificationCheck(this.config.dbPath, stored.id, "failed");
+          verification.status = "failed";
+          executionResult.outcome = "verification_failed";
+          executionResult.summary = `Verification failed before the repair could be confirmed: ${message}`;
+          executionResult.verification = verification;
+          recordAudit(this.config.dbPath, "verification_failed", sanitizeValue({ actor, check, error: error.message }), jobId);
+          transitionJob(this.config.dbPath, jobId, ["waiting_for_plex_verification"], "failed_retryable", message);
+          throw error;
+        }
+        checkResult.lastResult = sanitizeValue(result);
+        if (result?.found === true) {
+          checkResult.status = "passed";
+          completeVerificationCheck(this.config.dbPath, stored.id, "passed");
+          recordAudit(this.config.dbPath, "verification_passed", sanitizeValue({ actor, check, result }), jobId);
+          break;
+        }
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= timeoutMs) {
+          checkResult.status = "failed";
+          completeVerificationCheck(this.config.dbPath, stored.id, "failed");
+          verification.status = "failed";
+          executionResult.outcome = "verification_failed";
+          executionResult.summary = "Approved actions finished, but required verification did not confirm the repair completed.";
+          executionResult.verification = verification;
+          recordAudit(this.config.dbPath, "verification_failed", sanitizeValue({ actor, check, result, timeoutMs }), jobId);
+          const message = `Verification failed for ${check.checkType}: expected ${JSON.stringify(check.args)}`;
+          transitionJob(this.config.dbPath, jobId, ["waiting_for_plex_verification"], "failed_retryable", message);
+          throw new Error(message);
+        }
+        await sleep(Math.min(intervalMs, Math.max(100, timeoutMs - elapsed)));
+      }
+    }
+    executionResult.verification = verification;
+    return verification;
+  }
+
   async executeApprovedPlan(jobId, actor, context = {}) {
     const details = this.jobDetails(jobId);
     const actionApproval = details.approvals.find(approval => approval.kind === "action" && approval.status === "approved");
@@ -875,6 +975,7 @@ export class MediaIssueAgent {
     }
     actions = normalizeRepairActions(actions);
     executionResult.actionsRequested = actions.length;
+    const verificationChecks = subtitleVerificationChecks(actions);
     const unsupported = actions.filter(action => !EXECUTION_ALLOWLIST.has(action?.toolName));
     if (unsupported.length) {
       executionResult.outcome = "unsupported_actions";
@@ -891,7 +992,9 @@ export class MediaIssueAgent {
     }
     if (actions.length) {
       executionResult.outcome = "server_action_completed";
-      executionResult.summary = "Executed the approved server-side media repair actions.";
+      executionResult.summary = verificationChecks.length
+        ? "Executed the approved server-side media repair actions and completed required verification."
+        : "Executed the approved server-side media repair actions.";
       try {
         for (const action of actions) {
           const args = { ...(action.args || {}), dryRun: false };
@@ -917,8 +1020,12 @@ export class MediaIssueAgent {
         throw error;
       }
     }
+    if (verificationChecks.length) {
+      transitionJob(this.config.dbPath, jobId, ["executing"], "waiting_for_plex_verification");
+      await this.waitForVerification(jobId, verificationChecks, executionResult, actor);
+    }
     recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
-    transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
+    transitionJob(this.config.dbPath, jobId, ["executing", "waiting_for_plex_verification"], "drafting_comment");
     return this.draftResolutionApproval(jobId, actor, executionResult, context);
   }
 

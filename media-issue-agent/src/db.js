@@ -515,6 +515,24 @@ WHERE id = ${actionId};
   }
 }
 
+export function createVerificationCheck(dbPath, jobId, checkType, criteria, status = "running") {
+  const [{ id }] = sqliteExec(dbPath, sql`
+INSERT INTO verification_checks (job_id, check_type, criteria_json, status, started_at)
+VALUES (${jobId}, ${checkType}, ${JSON.stringify(criteria || {})}, ${status}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+RETURNING id;
+`, { json: true });
+  return { id, jobId, checkType, criteria, status };
+}
+
+export function completeVerificationCheck(dbPath, checkId, status) {
+  sqliteExec(dbPath, sql`
+UPDATE verification_checks
+SET status = ${status},
+    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${checkId};
+`);
+}
+
 export function recordAudit(dbPath, eventType, payload, jobId = null) {
   sqliteExec(dbPath, sql`
 INSERT INTO audit_events (job_id, event_type, redacted_payload_json)

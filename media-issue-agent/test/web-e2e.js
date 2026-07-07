@@ -364,6 +364,75 @@ async function testIssueStateActionMatrix(browser) {
   }
 }
 
+async function testJobListRowsDoNotOverlap(browser) {
+  const root = await tempDir();
+  const fakeMcp = await startFakeMediaMcp([]);
+  let harness;
+  let context;
+  try {
+    harness = await startHarness(root, fakeMcp);
+    const dbPath = harness.config.dbPath;
+    await initDb(dbPath);
+    for (let index = 0; index < 16; index += 1) {
+      const issueId = index % 3 === 0
+        ? `e293935c-859c-49e5-a782-a5bfce703950-${index}`
+        : String(7000 + index);
+      const job = ensureJob(dbPath, index % 3 === 0 ? "plex" : "seerr", issueId);
+      transitionJob(dbPath, job.id, "detected", "closed");
+    }
+
+    const pageHandle = await newPage(browser, harness.baseUrl);
+    context = pageHandle.context;
+    const page = pageHandle.page;
+    await page.setViewportSize({ width: 720, height: 1100 });
+    await expect(page.locator(".job-row")).toHaveCount(16);
+
+    const layout = await page.evaluate(() => {
+      return [...document.querySelectorAll(".job-row")].slice(0, 12).map((row, index) => {
+        const rowRect = row.getBoundingClientRect();
+        const mainRect = row.querySelector(".job-main").getBoundingClientRect();
+        const titleRect = row.querySelector(".job-main strong").getBoundingClientRect();
+        const sourceRect = row.querySelector(".job-main span").getBoundingClientRect();
+        const badgeRect = row.querySelector(".badge").getBoundingClientRect();
+        const sourceStyle = getComputedStyle(row.querySelector(".job-main span"));
+        return {
+          index,
+          row: { top: rowRect.top, bottom: rowRect.bottom, height: rowRect.height, left: rowRect.left, right: rowRect.right },
+          main: { top: mainRect.top, bottom: mainRect.bottom, left: mainRect.left, right: mainRect.right },
+          title: { top: titleRect.top, bottom: titleRect.bottom, height: titleRect.height },
+          source: { top: sourceRect.top, bottom: sourceRect.bottom, height: sourceRect.height },
+          badge: { top: badgeRect.top, bottom: badgeRect.bottom, left: badgeRect.left, right: badgeRect.right },
+          sourceWhiteSpace: sourceStyle.whiteSpace,
+          sourceOverflow: sourceStyle.overflow,
+          sourceTextOverflow: sourceStyle.textOverflow
+        };
+      });
+    });
+
+    for (const rowLayout of layout) {
+      assert.ok(rowLayout.row.height >= 68, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.main.top >= rowLayout.row.top - 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.main.bottom <= rowLayout.row.bottom + 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.title.bottom <= rowLayout.row.bottom + 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.source.bottom <= rowLayout.row.bottom + 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.badge.top >= rowLayout.row.top - 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.badge.bottom <= rowLayout.row.bottom + 1, JSON.stringify(rowLayout));
+      assert.ok(rowLayout.badge.left >= rowLayout.main.right, JSON.stringify(rowLayout));
+      assert.equal(rowLayout.sourceWhiteSpace, "nowrap");
+      assert.equal(rowLayout.sourceOverflow, "hidden");
+      assert.equal(rowLayout.sourceTextOverflow, "ellipsis");
+    }
+    for (let index = 1; index < layout.length; index += 1) {
+      assert.ok(layout[index].row.top >= layout[index - 1].row.bottom + 8, JSON.stringify({ previous: layout[index - 1], current: layout[index] }));
+    }
+  } finally {
+    await context?.close();
+    await harness?.close();
+    await fakeMcp.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testFullBrowserWorkflow(browser) {
   const root = await tempDir();
   const fakeMcp = await startFakeMediaMcp([mediaIssue(301, {
@@ -516,6 +585,7 @@ async function run() {
   const browser = await chromium.launch();
   try {
     await testIssueStateActionMatrix(browser);
+    await testJobListRowsDoNotOverlap(browser);
     await testFullBrowserWorkflow(browser);
     await testManualCloseReopenBrowser(browser);
   } finally {

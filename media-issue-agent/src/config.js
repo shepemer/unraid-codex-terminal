@@ -116,6 +116,8 @@ export async function loadConfig(env = process.env, options = {}) {
     codexWorkspace: env.ISSUE_AGENT_CODEX_WORKSPACE || "/tmp/media-issue-agent-workspace",
     codexTimeoutMs: integer(env.ISSUE_AGENT_CODEX_TIMEOUT_MS, 120000, 10000),
     mcpRequestTimeoutMs: integer(env.ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS, 30000, 1000),
+    verificationTimeoutMs: integer(env.ISSUE_AGENT_VERIFICATION_TIMEOUT_MS, 120000, 0),
+    verificationPollIntervalMs: integer(env.ISSUE_AGENT_VERIFICATION_POLL_INTERVAL_MS, 5000, 100),
     webEnabled: truthy(env.ISSUE_AGENT_WEB_ENABLED, true),
     webHost: env.ISSUE_AGENT_WEB_HOST || "0.0.0.0",
     webPort: integer(env.ISSUE_AGENT_WEB_PORT, 6983, 1),
