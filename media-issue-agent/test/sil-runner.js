@@ -258,6 +258,16 @@ async function startFakeMediaMcp() {
           ratingKey: "109444",
           refreshed: true
         };
+      } else if (toolName === "plex_verify_subtitle_track") {
+        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.language, "ko");
+        result = {
+          ratingKey: "109444",
+          language: "ko",
+          found: true,
+          subtitleCount: 1,
+          matches: [{ languageCode: "ko", language: "Korean" }]
+        };
       } else {
         throw new Error(`Unexpected SIL media-mcp tool ${toolName}`);
       }
@@ -538,6 +548,8 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   assert.equal(resolution.result.executionResult.actionsRequested, 2);
   assert.equal(resolution.result.executionResult.actionsExecuted, 2);
   assert.match(resolution.result.executionResult.repairAgentSummary, /Download Korean subtitles/);
+  assert.equal(resolution.result.executionResult.verification.status, "passed");
+  assert.equal(resolution.result.executionResult.verification.checks[0].status, "passed");
   assert.match(resolution.result.message, /Automated response from Codex\.$/);
   assert.equal((await codexInvocations(logPath)).length, before.length + 3);
 
@@ -556,6 +568,9 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   const refreshCall = fakeMcp.calls.find(call => call.name === "plex_refresh_metadata");
   assert.equal(refreshCall.args.ratingKey, "109444");
   assert.equal(refreshCall.args.dryRun, false);
+  const verifyCall = fakeMcp.calls.find(call => call.name === "plex_verify_subtitle_track");
+  assert.equal(verifyCall.args.ratingKey, "109444");
+  assert.equal(verifyCall.args.language, "ko");
 }
 
 async function assertRejectPath(baseUrl, snapshotId) {

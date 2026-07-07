@@ -63,7 +63,18 @@ async function run() {
             type: "movie",
             title: "Fixture Movie",
             year: 2026,
-            librarySectionTitle: "Movies"
+            librarySectionTitle: "Movies",
+            Media: [{
+              id: 1,
+              Part: [{
+                id: 2,
+                Stream: [
+                  { id: 10, streamType: 1, codec: "h264" },
+                  { id: 11, streamType: 2, codec: "aac", languageCode: "eng", language: "English" },
+                  { id: 12, streamType: 3, codec: "srt", languageCode: "kor", language: "Korean", title: "Korean" }
+                ]
+              }]
+            }]
           }]
         }
       });
@@ -185,6 +196,7 @@ async function run() {
     assert.ok(toolNames.has("bazarr_download_movie_subtitles_for_plex"));
     assert.ok(toolNames.has("plex_refresh_metadata"));
     assert.ok(toolNames.has("plex_analyze_metadata"));
+    assert.ok(toolNames.has("plex_verify_subtitle_track"));
 
     const dryRun = await tool("bazarr_download_movie_subtitles_for_plex", {
       plexRatingKey: "109444",
@@ -212,6 +224,11 @@ async function run() {
     const analyzeDryRun = await tool("plex_analyze_metadata", { ratingKey: "109444", dryRun: true });
     assert.equal(analyzeDryRun.dryRun, true);
     assert.equal(calls.filter(call => call.method === "PUT" && call.path.endsWith("/analyze")).length, 0);
+
+    const verified = await tool("plex_verify_subtitle_track", { ratingKey: "109444", language: "ko" });
+    assert.equal(verified.found, true);
+    assert.equal(verified.subtitleCount, 1);
+    assert.equal(verified.matches[0].languageCode, "kor");
   } finally {
     child.kill("SIGTERM");
     mock.close();

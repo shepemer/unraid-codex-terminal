@@ -600,6 +600,7 @@ th:last-child {
 
 .job-list {
   display: grid;
+  grid-auto-rows: minmax(68px, auto);
   align-content: start;
   gap: 9px;
   padding: 12px;
@@ -611,19 +612,20 @@ th:last-child {
 
 button.job-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) max-content;
   align-items: center;
   column-gap: 12px;
   width: 100%;
-  min-height: 0;
+  min-height: 68px;
   border: 1px solid var(--line);
   border-radius: 9px;
-  padding: 11px;
+  padding: 10px 12px;
   background: var(--panel);
   color: var(--text);
-  font: inherit;
+  font: 14px/1.25 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   text-align: left;
   box-shadow: none;
+  overflow: hidden;
 }
 
 button.job-row:hover,
@@ -635,6 +637,8 @@ button.job-row.active {
 
 .job-main {
   min-width: 0;
+  display: grid;
+  gap: 5px;
 }
 
 .job-main strong,
@@ -644,19 +648,30 @@ button.job-row.active {
 
 .job-main strong {
   font-size: 15px;
+  line-height: 1.2;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-main span {
   color: var(--muted);
   font-size: 12px;
-  margin-top: 3px;
-  overflow-wrap: anywhere;
+  line-height: 1.25;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-row .badge {
   justify-self: end;
-  max-width: none;
+  max-width: 148px;
+  overflow: hidden;
   white-space: nowrap;
+  text-overflow: ellipsis;
   text-align: right;
 }
 
@@ -1308,6 +1323,18 @@ function formatJobDetail(detail) {
       }));
     }
   }
+  if (detail.verificationChecks?.length) {
+    lines.push("", "Verification checks:");
+    for (const check of detail.verificationChecks) {
+      lines.push(formatJson({
+        type: check.checkType,
+        status: check.status,
+        criteria: check.criteria,
+        startedAt: check.startedAt,
+        completedAt: check.completedAt
+      }));
+    }
+  }
   if (detail.auditEvents?.length) {
     lines.push("", "Recent activity:");
     for (const event of detail.auditEvents.slice(0, 8)) {
@@ -1327,7 +1354,7 @@ function updateJobControls(detail) {
 }
 
 function shouldPollJob(detail) {
-  return ["investigating", "approved_for_execution", "executing", "drafting_comment", "closing_issue"].includes(detail.job.state);
+  return ["investigating", "approved_for_execution", "executing", "waiting_for_plex_verification", "drafting_comment", "closing_issue"].includes(detail.job.state);
 }
 
 function clearJobPolling() {

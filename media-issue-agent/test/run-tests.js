@@ -340,6 +340,17 @@ async function testSubtitleServerActionPlanExecutesRepair() {
         assert.equal(args.dryRun, false);
         return { dryRun: false, ratingKey: "109444" };
       }
+      if (name === "plex_verify_subtitle_track") {
+        assert.equal(args.ratingKey, "109444");
+        assert.equal(args.language, "ko");
+        return {
+          ratingKey: "109444",
+          language: "ko",
+          found: true,
+          subtitleCount: 1,
+          matches: [{ languageCode: "ko", language: "Korean" }]
+        };
+      }
       throw new Error(`Unexpected tool ${name}`);
     }
   };
@@ -350,6 +361,8 @@ async function testSubtitleServerActionPlanExecutesRepair() {
       codexBin,
       codexWorkspace: path.join(dir, "codex-workspace"),
       codexTimeoutMs: 10000,
+      verificationTimeoutMs: 100,
+      verificationPollIntervalMs: 10,
       dryRun: false
     }, client);
     await agent.init();
@@ -384,13 +397,118 @@ async function testSubtitleServerActionPlanExecutesRepair() {
     assert.equal(resolutionReview.executionResult.actionsRequested, 2);
     assert.equal(resolutionReview.executionResult.actionsExecuted, 2);
     assert.match(resolutionReview.executionResult.repairAgentSummary, /Download Korean subtitles/);
+    assert.equal(resolutionReview.executionResult.verification.status, "passed");
+    assert.equal(resolutionReview.executionResult.verification.checks[0].status, "passed");
     assert.equal(calls.filter(call => call.name === "bazarr_download_movie_subtitles_for_plex").length, 1);
     assert.equal(calls.filter(call => call.name === "plex_refresh_metadata").length, 1);
+    assert.equal(calls.filter(call => call.name === "plex_verify_subtitle_track").length, 1);
     const details = jobDetails(dbPath, investigated.jobId);
     assert.deepEqual(details.plannedActions.map(action => action.toolName).sort(), [
       "bazarr_download_movie_subtitles_for_plex",
       "plex_refresh_metadata"
     ].sort());
+    assert.equal(details.verificationChecks[0].status, "passed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function testSubtitleRepairRequiresVerificationBeforeResolution() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-subtitle-verification-fixture");
+  await writeFile(codexBin, [
+    "#!/bin/sh",
+    "prompt=\"$(cat)\"",
+    "case \"$prompt\" in",
+    "  *\"Approved media repair execution\"*)",
+    "    printf '%s\\n' '{\"summary\":\"Download Korean subtitles and refresh Plex.\",\"actions\":[{\"toolName\":\"bazarr_download_movie_subtitles_for_plex\",\"riskLevel\":\"repair\",\"args\":{\"plexRatingKey\":\"109444\",\"language\":\"ko\"}},{\"toolName\":\"plex_refresh_metadata\",\"riskLevel\":\"verification\",\"args\":{\"ratingKey\":\"109444\"}}]}'",
+    "    ;;",
+    "  *)",
+    "    printf '%s\\n' 'Investigation summary: Korean subtitle request. Server-side action is required for Plex item 109444.'",
+    "    ;;",
+    "esac"
+  ].join("\n"));
+  await chmod(codexBin, 0o700);
+  const calls = [];
+  const client = {
+    async callTool(name, args) {
+      calls.push({ name, args });
+      if (name === "plex_issue_details" || name === "media_diagnose_issue") {
+        return {
+          issue: {
+            source: "plex",
+            id: args.issueId,
+            status: "open",
+            message: "Please add Korean subtitles.",
+            mediaTitle: "Fixture Movie",
+            mediaType: "movie",
+            plexRatingKey: "109444",
+            comments: []
+          },
+          plex: {
+            ratingKey: "109444",
+            metadata: {
+              ratingKey: "109444",
+              mediaType: "movie",
+              title: "Fixture Movie",
+              year: 2026
+            }
+          }
+        };
+      }
+      if (name === "bazarr_download_movie_subtitles_for_plex") {
+        return { dryRun: false, language: "ko", radarrMovie: { id: 44, title: "Fixture Movie" } };
+      }
+      if (name === "plex_refresh_metadata") {
+        return { dryRun: false, ratingKey: "109444" };
+      }
+      if (name === "plex_verify_subtitle_track") {
+        return {
+          ratingKey: "109444",
+          language: "ko",
+          found: false,
+          subtitleCount: 0,
+          matches: []
+        };
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  };
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      codexTimeoutMs: 10000,
+      verificationTimeoutMs: 5,
+      verificationPollIntervalMs: 100,
+      dryRun: false
+    }, client);
+    await agent.init();
+    const entries = [{
+      source: "plex",
+      issueId: "plex-subtitle-1002",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Movie",
+      mediaType: "movie",
+      plexRatingKey: "109444",
+      status: "open",
+      description: "Please add Korean subs."
+    }];
+    const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+    const investigated = await agent.investigate(snapshot.id, 1, { force: true });
+    await assert.rejects(() => agent.approve(investigated.jobId, "fixture"), /Verification failed/);
+    const details = jobDetails(dbPath, investigated.jobId);
+    assert.equal(details.job.state, "failed_retryable");
+    assert.match(details.job.lastError, /Verification failed/);
+    assert.equal(details.verificationChecks[0].status, "failed");
+    assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
+    assert.ok(calls.some(call => call.name === "plex_verify_subtitle_track"));
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -608,7 +726,13 @@ async function testWebAuthAndApi() {
     const cssText = await css.text();
     assert.match(cssText, /:root\[data-theme="dark"\]/);
     assert.match(cssText, /button\.job-row \{\s+display: grid;/);
+    assert.match(cssText, /grid-auto-rows: minmax\(68px, auto\);/);
+    assert.match(cssText, /grid-template-columns: minmax\(0, 1fr\) max-content;/);
+    assert.match(cssText, /min-height: 68px;/);
+    assert.match(cssText, /\.job-main \{\s+min-width: 0;\s+display: grid;/);
+    assert.match(cssText, /\.job-main span \{[\s\S]*text-overflow: ellipsis;[\s\S]*white-space: nowrap;/);
     assert.match(cssText, /justify-self: end;/);
+    assert.match(cssText, /max-width: 148px;/);
     assert.match(cssText, /white-space: nowrap;/);
     assert.match(cssText, /tbody tr\.issue-closed/);
     assert.match(cssText, /tbody tr\.issue-active/);
@@ -634,6 +758,8 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function closeDetail/);
     assert.match(jsText, /function setDetailProcessing/);
     assert.match(jsText, /function updateIssueRowHighlights/);
+    assert.match(jsText, /Verification checks:/);
+    assert.match(jsText, /waiting_for_plex_verification/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
     assert.match(jsText, /data-job-id/);
     assert.match(jsText, /data-close-issue/);
@@ -700,6 +826,7 @@ async function run() {
   await testInvestigationCacheAndStaleApprovalSuperseding();
   await testApprovedJobContinuesToDryRunCommentPosting();
   await testSubtitleServerActionPlanExecutesRepair();
+  await testSubtitleRepairRequiresVerificationBeforeResolution();
   await testAuthConfig();
   await testStateTransitions();
   await testDbDirectoryWritablePreflight();

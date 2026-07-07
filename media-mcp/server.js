@@ -1060,6 +1060,106 @@ function plexMetadataTmdbId(metadataResult) {
   return undefined;
 }
 
+function plexMetadataStreams(body) {
+  const item = plexMetadataItem(body);
+  if (!item) {
+    return [];
+  }
+  return (Array.isArray(item.Media) ? item.Media : []).flatMap(media => {
+    return (Array.isArray(media.Part) ? media.Part : []).flatMap(part => {
+      return (Array.isArray(part.Stream) ? part.Stream : []).map(stream => ({
+        media,
+        part,
+        stream
+      }));
+    });
+  });
+}
+
+function normalizeSubtitleLanguage(value) {
+  const text = String(value || "").trim().toLowerCase();
+  const aliases = {
+    ko: "ko",
+    kor: "ko",
+    korean: "ko",
+    en: "en",
+    eng: "en",
+    english: "en",
+    es: "es",
+    spa: "es",
+    spanish: "es",
+    fr: "fr",
+    fre: "fr",
+    fra: "fr",
+    french: "fr",
+    de: "de",
+    ger: "de",
+    deu: "de",
+    german: "de",
+    ja: "ja",
+    jpn: "ja",
+    japanese: "ja",
+    zh: "zh",
+    chi: "zh",
+    zho: "zh",
+    chinese: "zh"
+  };
+  return aliases[text] || text;
+}
+
+function summarizePlexSubtitleStream(stream) {
+  return compactObject({
+    id: stream.id,
+    streamType: stream.streamType,
+    language: stream.language,
+    languageCode: stream.languageCode,
+    title: stream.title,
+    codec: stream.codec,
+    format: stream.format,
+    key: stream.key,
+    forced: stream.forced,
+    hearingImpaired: stream.hearingImpaired,
+    selected: stream.selected
+  });
+}
+
+function plexSubtitleStreamMatchesLanguage(stream, language) {
+  const expected = normalizeSubtitleLanguage(language);
+  const candidates = [
+    stream.languageCode,
+    stream.language,
+    stream.title
+  ].map(normalizeSubtitleLanguage).filter(Boolean);
+  return candidates.includes(expected);
+}
+
+async function verifyPlexSubtitleTrack(input) {
+  const ratingKey = String(input.ratingKey || input.plexRatingKey || "").trim();
+  if (!ratingKey) {
+    throw new Error("ratingKey is required");
+  }
+  const language = String(input.language || "").trim();
+  if (!language) {
+    throw new Error("language is required");
+  }
+  const body = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}`);
+  const summary = summarizePlexMetadata(body);
+  const subtitleStreams = plexMetadataStreams(body)
+    .map(({ stream }) => stream)
+    .filter(stream => Number(stream.streamType) === 3 || String(stream.streamType).toLowerCase() === "subtitle")
+    .map(summarizePlexSubtitleStream);
+  const matches = subtitleStreams.filter(stream => plexSubtitleStreamMatchesLanguage(stream, language));
+  return {
+    ratingKey,
+    language: normalizeSubtitleLanguage(language),
+    found: matches.length > 0,
+    metadata: summary,
+    subtitleCount: subtitleStreams.length,
+    matches,
+    subtitles: subtitleStreams
+  };
+}
+
 function normalizeMediaMatchTitle(value) {
   return String(value || "")
     .toLowerCase()
@@ -7364,6 +7464,16 @@ function createServer() {
       dryRun: z.boolean().default(true)
     }
   }, async ({ ratingKey, dryRun }) => jsonText(await plexMetadataMaintenance(ratingKey, "analyze", dryRun)));
+
+  server.registerTool("plex_verify_subtitle_track", {
+    title: "Plex Verify Subtitle Track",
+    description: "Verify that Plex metadata for one exact rating key exposes a subtitle track for the requested language.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]),
+      language: z.string().min(1)
+    }
+  }, async (input) => jsonText(await verifyPlexSubtitleTrack(input)));
 
   server.registerTool("plex_active_sessions", {
     title: "Plex Active Sessions",
