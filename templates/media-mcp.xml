@@ -8,7 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
   <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
-  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
+  <Overview>Optional internal MCP sidecar for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, Threadfin, and Seerr-family media automation. This container should not publish its MCP port to the LAN.</Overview>
   <Category>Tools:</Category>
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/media-mcp.xml</TemplateURL>
@@ -33,6 +33,10 @@
   <Config Name="Tautulli API Key" Target="TAUTULLI_API_KEY" Default="" Mode="" Description="Tautulli API key. Required when Tautulli URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Tracearr URL" Target="TRACEARR_URL" Default="" Mode="" Description="Tracearr base URL. Leave blank to disable Tracearr read-only diagnostics." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Tracearr API Key" Target="TRACEARR_API_KEY" Default="" Mode="" Description="Tracearr public API key. Required when Tracearr URL is set." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Threadfin URL" Target="THREADFIN_URL" Default="" Mode="" Description="Threadfin base URL. Leave blank to disable Threadfin tools." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Threadfin Username" Target="THREADFIN_USERNAME" Default="" Mode="" Description="Threadfin web/API username. Required with Threadfin Password when Threadfin authentication is enabled and no reusable token is supplied." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Threadfin Password" Target="THREADFIN_PASSWORD" Default="" Mode="" Description="Threadfin web/API password. Required with Threadfin Username when Threadfin authentication is enabled and no reusable token is supplied." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Threadfin Token" Target="THREADFIN_TOKEN" Default="" Mode="" Description="Optional existing Threadfin auth token for web/API commands. Username/password can refresh tokens when this is omitted or expires." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Bazarr URL" Target="BAZARR_URL" Default="" Mode="" Description="Bazarr base URL. Leave blank to disable Bazarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Bazarr API Key" Target="BAZARR_API_KEY" Default="" Mode="" Description="Bazarr API key. Required when Bazarr URL is set." Type="Variable" Display="always" Required="false" Mask="true"/>
   <Config Name="Prowlarr URL" Target="PROWLARR_URL" Default="" Mode="" Description="Prowlarr base URL. Leave blank to disable Prowlarr tools." Type="Variable" Display="always" Required="false" Mask="false"/>

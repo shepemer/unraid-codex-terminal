@@ -30,7 +30,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 - `codex-terminal`: OpenSSH server on container port `2222`, `ttyd` WebUI on container port `7681`, Codex CLI, common diagnostic tools, persistent `/config`, and `/workspace` backed by `/config/workspace`.
 - `unraid-mcp`: pinned `unraid-mcp==1.2.4` HTTP MCP server on the internal `codex-mgmt` network.
-- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family media automation.
+- `media-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, Threadfin, and Seerr-family media automation.
 - `media-issue-agent`: optional human-in-the-loop worker on the internal `codex-mgmt` network for Plex-native reports and Seerr-family issue triage. It uses `media-mcp` for media API access and local Codex ChatGPT auth for investigation summaries and comment drafts.
 - `utilities-mcp`: optional HTTP MCP server on the internal `codex-mgmt` network for Scrutiny storage health monitoring.
 - `codex-mgmt`: user-defined Docker bridge network. SSH and the WebUI are published to the host; MCP is internal only.
@@ -79,6 +79,7 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
    - Seerr, Overseerr, or Jellyseerr: `SEERR_URL` and `SEERR_API_KEY`
    - Tautulli: `TAUTULLI_URL` and `TAUTULLI_API_KEY`
    - Tracearr: `TRACEARR_URL` and `TRACEARR_API_KEY`
+   - Threadfin: `THREADFIN_URL`, plus optional `THREADFIN_USERNAME` and `THREADFIN_PASSWORD`, or optional `THREADFIN_TOKEN`
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add this optional sidecar to `/config/.codex/config.toml`.
 
@@ -238,15 +239,16 @@ ssh -t unraid-codex codex login
 - Plex: server status, libraries, library items, search, metadata, active sessions, and normalized Seerr/Plex-native user-reported issue views with Plex-native comment replies.
 - Tautulli: current activity and playback history diagnostics.
 - Tracearr: health, OpenAPI, stats, today stats, activity trends, active streams, users, violations, and playback history diagnostics.
+- Threadfin: status, configuration snapshots with summaries, M3U/HDHomeRun/XMLTV source management, M3U group/channel discovery from configured playlist sources, group-title filter creation, M3U updates from existing playlist fields, selector-based XEPG mapping updates, XMLTV source lookup, output verification against `/lineup.json`, `/m3u/`, and `/discover.json`, settings patches, user management, logs, backup/restore, PPV enable/disable, exported output inspection, refresh/update commands, and guarded raw API/websocket commands.
 - Bazarr: status, wanted movie subtitles, wanted episode subtitles, providers, subtitle history, and subtitle overview.
 - Prowlarr: list indexers, search, and indexer health/history summary.
 - qBittorrent: list torrents, pause or resume selected hashes, recheck/reannounce exact hashes, and delete selected hashes with explicit optional file deletion.
 - NZBGet: status, queue, history/detail, exposed download files, archive diagnosis, dry-run-first post-processing retry, guarded history removal, optional local archive extraction with filesystem fallback, pause or resume downloads, and set rate limits.
 - Seerr, Overseerr, or Jellyseerr: search media, list/request details, guarded request status updates, and list/comment/resolve/reopen/delete reported issues. Plex-native reports can be listed, diagnosed, and commented on through Plex's community GraphQL API; the current Plex Web API does not expose resolve/reopen/archive/delete state transitions for those native reports.
 
-Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, library media shares, or appdata directories; the optional downloads mount is only for guarded archive extraction. Tracearr support is read-only and does not expose stream termination.
+Container lifecycle management stays with `unraid-mcp` and the scoped Unraid API. The media sidecar does not mount the Docker socket, library media shares, or appdata directories; the optional downloads mount is only for guarded archive extraction. Threadfin management goes through Threadfin's own API and web UI websocket control surfaces. Tracearr support is read-only and does not expose stream termination.
 
-Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
+Mutating media tools use exact IDs, exact hashes, or exact manual-import paths, and file-changing admin actions default to `dryRun=true`. Threadfin write tools also require `confirm=true` when `dryRun=false`. Use `media_queue_repair_plan` before `media_apply_queue_repair_plan`; real execution accepts only exact plan actions or exact Seerr follow-up actions.
 
 Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr command immediately and return the queued command record. Global missing and cutoff searches can fan out into many indexer searches and may grab releases depending on each app's own settings. Prefer `sonarr_wanted_missing_ids` plus `sonarr_search_missing_exact`, or `radarr_wanted_missing_ids` plus `radarr_search_missing_exact`, when you need controlled missing-media searches: the exact tools page through wanted records, apply monitored/aired/available safeguards, default to `dryRun=true`, and queue only `EpisodeSearch` or `MoviesSearch` batches when explicitly executed. File-changing actions such as rename, downloaded scan, manual import, release grab, queue removal, download-client cleanup, and Servarr profile/custom format/quality definition updates are guarded with exact IDs/names/paths and dry-run-first behavior. Servarr config dry-runs return the current object, proposed object, compact diff, validation errors, and exact API method/path before any PUT or POST is attempted.
 
@@ -540,6 +542,7 @@ bash -n archive-tools-check
 sh -n codex-terminal-profile.sh
 npm --prefix media-mcp run check
 npm --prefix media-mcp run test:arr-commands
+npm --prefix media-mcp run test:threadfin
 npm --prefix media-issue-agent run check
 npm --prefix media-issue-agent test
 npm --prefix utilities-mcp run check
@@ -585,7 +588,7 @@ Unraid acceptance:
 - Never mount `/`, `/boot`, broad `/mnt`, or all of `/mnt/user/appdata`.
 - Use only narrow read-only diagnostic mounts.
 - Keep the Unraid API key only in the MCP sidecar.
-- Keep Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, and Seerr-family credentials only in the optional media MCP sidecar.
+- Keep Sonarr, Radarr, Plex, Tautulli, Tracearr, Bazarr, Prowlarr, qBittorrent, NZBGet, Threadfin, and Seerr-family credentials only in the optional media MCP sidecar.
 - Keep Scrutiny endpoints only in the optional utilities MCP sidecar.
 - MCP sidecars require bearer-token auth; do not add host port mappings for MCP.
 - The terminal container root filesystem is writable so it can apply an SSH password at startup. It still runs without privileged mode, host networking, host devices, host PID/IPC, broad mounts, or Docker socket access.
