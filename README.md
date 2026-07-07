@@ -64,7 +64,7 @@ For full configuration, validation, local development, and security notes, see [
 
    Set the same `MEDIA_MCP_BEARER_TOKEN` in `codex-terminal` to add the optional `media` MCP server to Codex config.
 
-   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, archive extraction with filesystem fallback, command trigger, interactive search, release-grab tools, and Threadfin read/write configuration tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first. Threadfin uses its own API/websocket control surfaces, not appdata mounts. For archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports another path.
+   The media MCP includes guarded Sonarr/Radarr queue, manual import, queue-item import, NZBGet post-processing diagnostics, archive extraction with filesystem fallback, command trigger, interactive search, release-grab tools, and Threadfin read/write configuration tools. Search/rescan/refresh commands queue immediately; file-changing actions stay exact-ID/path and dry-run-first. Threadfin tools can parse configured M3U/XMLTV sources, create group filters, update mappings, and verify public output endpoints through Threadfin's own API/websocket control surfaces, not appdata mounts. Threadfin writes require `confirm=true` when `dryRun=false`. For archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports another path.
 
 6. Optional: install `utilities-mcp` on the same network.
 

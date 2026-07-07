@@ -122,7 +122,10 @@ async function run() {
             "file.source": "http://provider.example/playlist.m3u?token=secret",
             buffer: "ffmpeg",
             tuner: 2,
-            "id.provider": "M1"
+            "id.provider": "M1",
+            "http_headers.user-agent": "ThreadfinTest/1.0",
+            "http_headers.origin": "http://provider.example",
+            "http_headers.referer": "http://provider.example/watch"
           }
         },
         hdhr: {},
@@ -179,6 +182,51 @@ async function run() {
           "x-xmltv-file": "-",
           "x-mapping": "-",
           url: "http://stream.example/sports"
+        },
+        C3: {
+          "x-active": false,
+          "x-channelID": "500",
+          "x-name": "FIFAWC 01: Opening Match",
+          "x-group-title": "FIFA World Cup 2026",
+          "x-category": "-",
+          "x-xmltv-file": "-",
+          "x-mapping": "-",
+          "x-hide-channel": false,
+          "tvg-id": "fifawc.01",
+          "tvg-name": "FIFAWC 01",
+          url: "http://stream.example/fifa/01?token=secret",
+          "_file.m3u.id": "M1",
+          "_file.m3u.name": "Provider"
+        },
+        C4: {
+          "x-active": false,
+          "x-channelID": "501",
+          "x-name": "FIFAWC 02: Group Stage",
+          "x-group-title": "FIFA World Cup 2026",
+          "x-category": "-",
+          "x-xmltv-file": "-",
+          "x-mapping": "-",
+          "x-hide-channel": false,
+          "tvg-id": "fifawc.02",
+          "tvg-name": "FIFAWC 02",
+          url: "http://stream.example/fifa/02?token=secret",
+          "_file.m3u.id": "M1",
+          "_file.m3u.name": "Provider"
+        },
+        C5: {
+          "x-active": false,
+          "x-channelID": "502",
+          "x-name": "FIFAWC 03 | Knockout",
+          "x-group-title": "FIFA World Cup 2026",
+          "x-category": "-",
+          "x-xmltv-file": "-",
+          "x-mapping": "-",
+          "x-hide-channel": false,
+          "tvg-id": "fifawc.03",
+          "tvg-name": "FIFAWC 03",
+          url: "http://stream.example/fifa/03?token=secret",
+          "_file.m3u.id": "M1",
+          "_file.m3u.name": "Provider"
         }
       },
       xmltvMap: {
@@ -186,6 +234,15 @@ async function run() {
           "news.one": {
             "display-name": ["News One"],
             icon: "http://logo.example/news.png"
+          },
+          "fifawc.01": {
+            "display-name": ["FIFAWC 01"]
+          },
+          "fifawc.02": {
+            "display-name": ["FIFAWC 02"]
+          },
+          "fifawc.03": {
+            "display-name": ["FIFAWC 03"]
           }
         }
       }
@@ -258,6 +315,30 @@ async function run() {
     }
   }
 
+  const providerM3u = [
+    "#EXTM3U",
+    "#EXTINF:-1 tvg-id=\"fifawc.01\" tvg-name=\"FIFAWC 01\" group-title=\"FIFA World Cup 2026\",FIFAWC 01: Opening Match",
+    "http://stream.example/fifa/01?token=secret",
+    "#EXTINF:-1 tvg-id=\"fifawc.02\" tvg-name=\"FIFAWC 02\" group-title=\"FIFA World Cup 2026\",FIFAWC 02: Group Stage",
+    "http://stream.example/fifa/02?token=secret",
+    "#EXTINF:-1 tvg-id=\"fifawc.03\" tvg-name=\"FIFAWC 03\" group-title=\"FIFA World Cup 2026\",FIFAWC 03 | Knockout",
+    "http://stream.example/fifa/03?token=secret",
+    "#EXTINF:-1 tvg-id=\"news.one\" tvg-name=\"News One\" group-title=\"News\",News One",
+    "http://stream.example/news?token=secret",
+    ""
+  ].join("\n");
+
+  const providerXmltv = [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<tv>",
+    "  <channel id=\"fifawc.01\"><display-name>FIFAWC 01</display-name><display-name>FIFAWC 01: Opening Match</display-name></channel>",
+    "  <channel id=\"fifawc.02\"><display-name>FIFAWC 02</display-name><display-name>FIFAWC 02: Group Stage</display-name></channel>",
+    "  <channel id=\"fifawc.03\"><display-name>FIFAWC 03</display-name><display-name>FIFAWC 03 | Knockout</display-name></channel>",
+    "  <channel id=\"news.one\"><display-name>News One</display-name></channel>",
+    "</tv>",
+    ""
+  ].join("\n");
+
   const threadfin = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "POST" && url.pathname === "/api/") {
@@ -329,13 +410,41 @@ async function run() {
       sendJson(res, 200, { ok: true });
       return;
     }
-    if (req.method === "GET" && url.pathname === "/m3u/threadfin.m3u") {
+    if (req.method === "GET" && url.pathname === "/provider/playlist.m3u") {
+      calls.push({ transport: "http", path: "provider/playlist.m3u", userAgent: req.headers["user-agent"] });
       res.writeHead(200, { "content-type": "audio/x-mpegurl" });
-      res.end("#EXTM3U\n#EXTINF:-1,News One\nhttp://stream.example/news?token=secret\n");
+      res.end(providerM3u);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/provider/xmltv.xml") {
+      calls.push({ transport: "http", path: "provider/xmltv.xml", userAgent: req.headers["user-agent"] });
+      res.writeHead(200, { "content-type": "application/xml" });
+      res.end(providerXmltv);
+      return;
+    }
+    if (req.method === "GET" && (url.pathname === "/m3u/threadfin.m3u" || url.pathname === "/m3u/")) {
+      res.writeHead(200, { "content-type": "audio/x-mpegurl" });
+      res.end(providerM3u);
       return;
     }
     if (req.method === "GET" && url.pathname === "/lineup.json") {
-      sendJson(res, 200, [{ GuideNumber: "100", GuideName: "News One" }]);
+      sendJson(res, 200, [
+        { GuideNumber: "100", GuideName: "News One" },
+        { GuideNumber: "500", GuideName: "FIFAWC 01: Opening Match" },
+        { GuideNumber: "501", GuideName: "FIFAWC 02: Group Stage" },
+        { GuideNumber: "502", GuideName: "FIFAWC 03 | Knockout" }
+      ]);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/discover.json") {
+      sendJson(res, 200, {
+        FriendlyName: "Threadfin",
+        ModelNumber: "HDTC-2US",
+        FirmwareName: "Threadfin",
+        TunerCount: 8,
+        DeviceID: "threadfin-test",
+        LineupURL: `http://127.0.0.1:${threadfinPort}/lineup.json?token=secret`
+      });
       return;
     }
     sendJson(res, 404, { error: "not found" });
@@ -366,6 +475,8 @@ async function run() {
   });
 
   const threadfinPort = await freePort();
+  config.settings.files.m3u.M1["file.source"] = `http://127.0.0.1:${threadfinPort}/provider/playlist.m3u?token=secret`;
+  config.settings.files.xmltv.X1["file.source"] = `http://127.0.0.1:${threadfinPort}/provider/xmltv.xml?password=secret`;
   threadfin.listen(threadfinPort, "127.0.0.1");
   await once(threadfin, "listening");
 
@@ -449,6 +560,9 @@ async function run() {
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("threadfin_status"));
     assert.ok(toolNames.has("threadfin_save_source"));
+    assert.ok(toolNames.has("threadfin_list_source_groups"));
+    assert.ok(toolNames.has("threadfin_set_mapping_fields"));
+    assert.ok(toolNames.has("threadfin_verify_output"));
     assert.ok(toolNames.has("threadfin_raw_websocket_command"));
 
     const status = await tool("threadfin_status");
@@ -463,10 +577,31 @@ async function run() {
     const configSnapshot = await tool("threadfin_get_config");
     assert.equal(configSnapshot.settings.files.m3u.M1["file.source"], "[redacted]");
     assert.equal(configSnapshot.users.U1.password, "[redacted]");
+    assert.equal(configSnapshot.summary.mappings.total, 5);
+    assert.equal(configSnapshot.summary.playlists[0].fileSource, "[redacted]");
 
     const sources = await tool("threadfin_list_sources", { type: "m3u" });
     assert.equal(sources.records.length, 1);
     assert.equal(sources.records[0].fileSource, "[redacted]");
+
+    const sourceGroups = await tool("threadfin_list_source_groups", {
+      playlistId: "M1",
+      includeChannels: true
+    });
+    const fifaGroup = sourceGroups.groups.find(group => group.groupTitle === "FIFA World Cup 2026");
+    assert.equal(fifaGroup.count, 3);
+    assert.equal(fifaGroup.channels[0].url, undefined);
+    assert.equal(calls.some(call => call.path === "provider/playlist.m3u" && call.userAgent === "ThreadfinTest/1.0"), true);
+
+    const sourceChannels = await tool("threadfin_find_source_channels", {
+      playlistId: "M1",
+      group: "FIFA World Cup 2026",
+      includeTokens: ["FIFAWC 01", "FIFAWC 02", "FIFAWC 03"]
+    });
+    assert.equal(sourceChannels.total, 3);
+    assert.equal(sourceChannels.records[0].name, "FIFAWC 01: Opening Match");
+    assert.equal(sourceChannels.records[0].url, undefined);
+    assert.equal(sourceChannels.records[0].urlTail, "fifa/01");
 
     const channels = await tool("threadfin_list_channels", { includeInactive: false });
     assert.equal(channels.records.length, 1);
@@ -483,7 +618,7 @@ async function run() {
     assert.equal(settingsDryRun.dryRun, true);
     assert.equal(settingsDryRun.proposedObject.tuner, 10);
     assert.equal(config.settings.tuner, 8);
-    await tool("threadfin_update_settings", { patch: { tuner: 10 }, dryRun: false });
+    await tool("threadfin_update_settings", { patch: { tuner: 10 }, dryRun: false, confirm: true });
     assert.equal(config.settings.tuner, 10);
 
     const sourceDryRun = await tool("threadfin_save_source", {
@@ -498,19 +633,48 @@ async function run() {
       type: "m3u",
       id: "M1",
       name: "Provider Updated",
-      dryRun: false
+      dryRun: false,
+      confirm: true
     });
     assert.equal(config.settings.files.m3u.M1.name, "Provider Updated");
 
     const refreshDryRun = await tool("threadfin_refresh_source", { type: "m3u", id: "M1" });
     assert.equal(refreshDryRun.command, "updateFileM3U");
-    await tool("threadfin_refresh_source", { type: "m3u", dryRun: false });
+    await tool("threadfin_refresh_source", { type: "m3u", dryRun: false, confirm: true });
     assert.equal(calls.some(call => call.transport === "api" && call.cmd === "update.m3u"), true);
+
+    const updateM3uDryRun = await tool("threadfin_update_m3u", { playlistId: "M1" });
+    assert.equal(updateM3uDryRun.command, "updateFileM3U");
+    assert.equal(updateM3uDryRun.payload.files.m3u.M1["file.source"], "[redacted]");
+    assert.equal(updateM3uDryRun.sourceGroups.totalGroups, 2);
+    await tool("threadfin_update_m3u", { playlistId: "M1", dryRun: false, confirm: true });
+    const updateCall = calls.findLast(call => call.transport === "websocket" && call.cmd === "updateFileM3U");
+    assert.match(updateCall.body.files.m3u.M1["file.source"], /provider\/playlist\.m3u/);
 
     const filterDryRun = await tool("threadfin_save_filter", { id: 1, name: "News Updated" });
     assert.equal(filterDryRun.dryRun, true);
-    await tool("threadfin_save_filter", { id: 1, name: "News Updated", dryRun: false });
+    await tool("threadfin_save_filter", { id: 1, name: "News Updated", dryRun: false, confirm: true });
     assert.equal(config.settings.filter[1].name, "News Updated");
+
+    const groupFilterDryRun = await tool("threadfin_save_group_filter", {
+      name: "World Cup",
+      groupTitle: "FIFA World Cup 2026",
+      include: "FIFAWC 01,FIFAWC 02,FIFAWC 03",
+      startingNumber: 500,
+      "x-category": "sports"
+    });
+    assert.equal(groupFilterDryRun.command, "saveFilter");
+    assert.equal(groupFilterDryRun.after.filter, "FIFA World Cup 2026");
+    await tool("threadfin_save_group_filter", {
+      name: "World Cup",
+      groupTitle: "FIFA World Cup 2026",
+      include: "FIFAWC 01,FIFAWC 02,FIFAWC 03",
+      startingNumber: 500,
+      "x-category": "sports",
+      dryRun: false,
+      confirm: true
+    });
+    assert.equal(config.settings.filter[-1].include, "FIFAWC 01,FIFAWC 02,FIFAWC 03");
 
     const channelDryRun = await tool("threadfin_update_channels", {
       channels: [{ id: "C1", patch: { "x-name": "News Prime" } }]
@@ -519,9 +683,41 @@ async function run() {
     assert.equal(config.xepg.epgMapping.C1["x-name"], "News One");
     await tool("threadfin_update_channels", {
       channels: [{ id: "C1", patch: { "x-name": "News Prime" } }],
-      dryRun: false
+      dryRun: false,
+      confirm: true
     });
     assert.equal(config.xepg.epgMapping.C1["x-name"], "News Prime");
+
+    const mappingDryRun = await tool("threadfin_set_mapping_fields", {
+      groupTitle: "FIFA World Cup 2026",
+      searchTokens: ["FIFAWC 01", "FIFAWC 02", "FIFAWC 03"],
+      "x-active": true,
+      "x-category": "sports",
+      "x-xmltv-file": "guide.xml",
+      channelNumberStart: 500
+    });
+    assert.deepEqual(mappingDryRun.selectedMappingKeys, ["C3", "C4", "C5"]);
+    assert.equal(config.xepg.epgMapping.C3["x-active"], false);
+    await tool("threadfin_set_mapping_fields", {
+      groupTitle: "FIFA World Cup 2026",
+      searchTokens: ["FIFAWC 01", "FIFAWC 02", "FIFAWC 03"],
+      "x-active": true,
+      "x-category": "sports",
+      "x-xmltv-file": "guide.xml",
+      channelNumberStart: 500,
+      dryRun: false,
+      confirm: true
+    });
+    assert.equal(config.xepg.epgMapping.C3["x-active"], true);
+    assert.equal(config.xepg.epgMapping.C4["x-channelID"], "501");
+    assert.equal(config.xepg.epgMapping.C5["x-category"], "sports");
+
+    const xmltvMatches = await tool("threadfin_find_xmltv_channels", {
+      xmltvId: "X1",
+      searchTokens: ["FIFAWC 01", "FIFAWC 02", "FIFAWC 03"]
+    });
+    assert.equal(xmltvMatches.total, 3);
+    assert.equal(xmltvMatches.records.every(record => record.matchType === "exact"), true);
 
     const userDryRun = await tool("threadfin_save_user", {
       id: "U1",
@@ -532,7 +728,8 @@ async function run() {
     await tool("threadfin_save_user", {
       id: "U1",
       username: "admin2",
-      dryRun: false
+      dryRun: false,
+      confirm: true
     });
     assert.equal(config.users.U1.username, "admin2");
 
@@ -540,7 +737,7 @@ async function run() {
     assert.equal(logs.records[1], "Loaded token=[redacted]");
     const resetLogsDryRun = await tool("threadfin_reset_logs");
     assert.equal(resetLogsDryRun.dryRun, true);
-    await tool("threadfin_reset_logs", { dryRun: false });
+    await tool("threadfin_reset_logs", { dryRun: false, confirm: true });
     assert.equal(config.log.log.length, 0);
 
     const backupDryRun = await tool("threadfin_backup_config");
@@ -550,17 +747,26 @@ async function run() {
 
     const restoreDryRun = await tool("threadfin_restore_config", { base64: "ZmFrZQ==" });
     assert.equal(restoreDryRun.base64Bytes, 8);
-    const restore = await tool("threadfin_restore_config", { base64: "ZmFrZQ==", dryRun: false });
+    const restore = await tool("threadfin_restore_config", { base64: "ZmFrZQ==", dryRun: false, confirm: true });
     assert.match(restore.response.alert, /restored/i);
 
     const ppvDryRun = await tool("threadfin_set_ppv", { enabled: true });
     assert.equal(ppvDryRun.dryRun, true);
-    await tool("threadfin_set_ppv", { enabled: true, dryRun: false });
+    await tool("threadfin_set_ppv", { enabled: true, dryRun: false, confirm: true });
     assert.equal(calls.some(call => call.path === "ppv/enable"), true);
 
     const exported = await tool("threadfin_export_output", { kind: "m3u", includeContent: true });
     assert.equal(exported.content.includes("token=secret"), false);
+    assert.equal(exported.content.includes("http://stream.example"), false);
     assert.equal(exported.content.includes("[redacted]"), true);
+
+    const verification = await tool("threadfin_verify_output", {
+      expectedTokens: ["FIFAWC 01", "FIFAWC 02", "FIFAWC 03"]
+    });
+    assert.equal(verification.tunerCount, 8);
+    assert.equal(verification.lineupCount, 4);
+    assert.equal(verification.m3uCount, 4);
+    assert.equal(verification.matches.every(match => match.matched), true);
 
     const rawDryRun = await tool("threadfin_raw_websocket_command", {
       cmd: "rawWebsocketFixture",

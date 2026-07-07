@@ -3373,7 +3373,7 @@ function redactThreadfinObject(value) {
     if (sensitiveField && /^value$/i.test(key)) {
       return [key, "[redacted]"];
     }
-    if (/token|password|passkey|cookie|authorization|secret|downloadurl|magneturl|filesource|file\.source|m3u-url|xepg-url|^(?:url|uri)(?:[._-]|$)/i.test(key)) {
+    if (/token|password|passkey|cookie|authorization|secret|downloadurl|magneturl|filesource|file\.source|m3u-url|xepg-url|(?:url|uri)$/i.test(key) || /^(?:url|uri)(?:[._-]|$)/i.test(key)) {
       return [key, "[redacted]"];
     }
     return [key, redactThreadfinObject(entry)];
@@ -3434,9 +3434,775 @@ function threadfinRecordMatches(record, term) {
   return JSON.stringify(record).toLowerCase().includes(term.toLowerCase());
 }
 
+function requireThreadfinConfirm(input, action) {
+  if (!input.confirm) {
+    throw new Error(`confirm=true is required when dryRun=false for ${action}`);
+  }
+}
+
+function summarizeThreadfinFilter(id, filter, includeSensitive = false) {
+  return threadfinOutput(compactObject({
+    id,
+    name: filter?.name,
+    description: filter?.description,
+    type: filter?.type,
+    filter: filter?.filter,
+    include: filter?.include,
+    exclude: filter?.exclude,
+    startingNumber: filter?.startingNumber,
+    category: filter?.["x-category"],
+    active: filter?.active,
+    caseSensitive: filter?.caseSensitive,
+    liveEvent: filter?.liveEvent,
+    raw: filter
+  }), includeSensitive);
+}
+
+function threadfinMappingStats(mapping) {
+  const groups = new Map();
+  let active = 0;
+  let hidden = 0;
+  let mapped = 0;
+  for (const channel of Object.values(mapping || {})) {
+    if (channel?.["x-active"] === true) {
+      active += 1;
+    }
+    if (channel?.["x-hide-channel"] === true) {
+      hidden += 1;
+    }
+    if (channel?.["x-mapping"] && channel["x-mapping"] !== "-") {
+      mapped += 1;
+    }
+    const group = channel?.["x-group-title"] || channel?.["group-title"] || "";
+    groups.set(group, (groups.get(group) || 0) + 1);
+  }
+  const total = Object.keys(mapping || {}).length;
+  return {
+    total,
+    active,
+    inactive: Math.max(0, total - active),
+    hidden,
+    mapped,
+    unmapped: Math.max(0, total - mapped),
+    groups: [...groups.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([groupTitle, count]) => ({ groupTitle, count }))
+  };
+}
+
+function threadfinConfigSummary(body) {
+  const settings = body.settings || {};
+  const m3uFiles = threadfinFiles(settings, "m3u");
+  const xmltvFiles = threadfinFiles(settings, "xmltv");
+  const filters = settings.filter || {};
+  const mapping = body.xepg?.epgMapping || {};
+  return {
+    settings: compactObject({
+      api: settings.api,
+      authenticationWeb: settings["authentication.web"],
+      authenticationApi: settings["authentication.api"],
+      authenticationM3U: settings["authentication.m3u"],
+      authenticationXML: settings["authentication.xml"],
+      epgSource: settings.epgSource,
+      tuner: settings.tuner,
+      buffer: settings.buffer
+    }),
+    tunerCount: settings.tuner,
+    playlists: Object.entries(m3uFiles).map(([id, source]) => summarizeThreadfinSource(id, "m3u", source, true)),
+    xmltvFiles: Object.entries(xmltvFiles).map(([id, source]) => summarizeThreadfinSource(id, "xmltv", source, true)),
+    filters: Object.entries(filters).map(([id, filter]) => summarizeThreadfinFilter(id, filter, true)),
+    mappings: threadfinMappingStats(mapping)
+  };
+}
+
+function threadfinConfigSource(settings, type, id) {
+  const files = threadfinFiles(settings, type);
+  if (id) {
+    const source = files[id];
+    if (!source) {
+      throw new Error(`Threadfin ${type} source ${id} was not found`);
+    }
+    return { id, source };
+  }
+  const entries = Object.entries(files);
+  if (entries.length !== 1) {
+    throw new Error(`Threadfin ${type} source id is required when ${entries.length} ${type} sources are configured`);
+  }
+  const [onlyId, source] = entries[0];
+  return { id: onlyId, source };
+}
+
+function firstThreadfinValue(objects, keys) {
+  for (const object of objects) {
+    for (const key of keys) {
+      const value = object?.[key];
+      if (value !== undefined && value !== null && value !== "") {
+        return String(value);
+      }
+    }
+  }
+  return undefined;
+}
+
+function threadfinSourceHeaders(source, settings) {
+  return compactObject({
+    "User-Agent": firstThreadfinValue([source, settings], [
+      "http_headers.user-agent",
+      "http_headers.user_agent",
+      "http_headers.userAgent",
+      "user-agent",
+      "user_agent",
+      "userAgent"
+    ]),
+    Origin: firstThreadfinValue([source, settings], ["http_headers.origin", "origin"]),
+    Referer: firstThreadfinValue([source, settings], ["http_headers.referer", "referer", "referrer"])
+  });
+}
+
+function threadfinSourceUrl(source) {
+  const raw = source?.["file.source"];
+  if (!raw) {
+    throw new Error("Threadfin source does not have a file.source value");
+  }
+  try {
+    return new URL(raw);
+  } catch {
+    throw new Error("Threadfin source file.source is not a valid URL");
+  }
+}
+
+async function threadfinFetchSourceText(source, settings, type) {
+  const response = await fetch(threadfinSourceUrl(source), {
+    method: "GET",
+    headers: threadfinSourceHeaders(source, settings),
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Threadfin ${type} source fetch failed: ${response.status} ${response.statusText}: ${redactText(text).slice(0, 500)}`);
+  }
+  return text;
+}
+
+function decodeXmlText(value) {
+  return String(value || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (match, entity) => {
+      const lower = entity.toLowerCase();
+      if (lower === "amp") return "&";
+      if (lower === "lt") return "<";
+      if (lower === "gt") return ">";
+      if (lower === "quot") return "\"";
+      if (lower === "apos") return "'";
+      if (lower.startsWith("#x")) {
+        return String.fromCodePoint(Number.parseInt(lower.slice(2), 16));
+      }
+      if (lower.startsWith("#")) {
+        return String.fromCodePoint(Number.parseInt(lower.slice(1), 10));
+      }
+      return match;
+    })
+    .trim();
+}
+
+function splitExtinf(line) {
+  const body = line.replace(/^#EXTINF:\s*/i, "");
+  let quoted = false;
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index];
+    if (character === "\"") {
+      quoted = !quoted;
+    } else if (character === "," && !quoted) {
+      return [body.slice(0, index), body.slice(index + 1).trim()];
+    }
+  }
+  return [body, ""];
+}
+
+function parseM3uAttributes(value) {
+  const attributes = {};
+  const pattern = /([A-Za-z0-9_.:-]+)=("([^"]*)"|'([^']*)'|([^\s,]+))/g;
+  let match;
+  while ((match = pattern.exec(value)) !== null) {
+    attributes[match[1]] = match[3] ?? match[4] ?? match[5] ?? "";
+  }
+  return attributes;
+}
+
+function threadfinUrlTail(value) {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    return parts.slice(-2).join("/") || url.hostname;
+  } catch {
+    const withoutQuery = String(value).split(/[?#]/)[0];
+    const parts = withoutQuery.split("/").filter(Boolean);
+    return parts.slice(-2).join("/") || withoutQuery.slice(-80);
+  }
+}
+
+function parseThreadfinM3u(text) {
+  const records = [];
+  let pending;
+  for (const [index, rawLine] of String(text || "").split(/\r?\n/).entries()) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    if (/^#EXTINF:/i.test(line)) {
+      const [metadata, name] = splitExtinf(line);
+      pending = {
+        index: records.length,
+        lineNumber: index + 1,
+        attributes: parseM3uAttributes(metadata),
+        name
+      };
+      continue;
+    }
+    if (pending && !line.startsWith("#")) {
+      records.push({
+        ...pending,
+        url: line,
+        urlTail: threadfinUrlTail(line)
+      });
+      pending = undefined;
+    }
+  }
+  return records;
+}
+
+function sanitizeM3uRecord(record) {
+  const attributes = record.attributes || {};
+  return compactObject({
+    index: record.index,
+    name: record.name,
+    groupTitle: attributes["group-title"],
+    tvgId: attributes["tvg-id"],
+    tvgName: attributes["tvg-name"],
+    tvgChno: attributes["tvg-chno"],
+    channelId: attributes["channel-id"] || attributes["channel-number"] || attributes["tvg-chno"],
+    urlTail: record.urlTail
+  });
+}
+
+function threadfinTerms(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap(threadfinTerms);
+  }
+  if (value === undefined || value === null) {
+    return [];
+  }
+  return String(value)
+    .split(/[,\n]/)
+    .map(term => term.trim())
+    .filter(Boolean);
+}
+
+function threadfinM3uHaystack(record) {
+  const attributes = record.attributes || {};
+  return [
+    record.name,
+    attributes["group-title"],
+    attributes["tvg-id"],
+    attributes["tvg-name"],
+    attributes["channel-id"],
+    attributes["channel-number"],
+    attributes["tvg-chno"],
+    record.urlTail
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function threadfinMappingHaystack(channel, key) {
+  return [
+    key,
+    channel?.["x-channelID"],
+    channel?.["x-name"],
+    channel?.name,
+    channel?.["x-group-title"],
+    channel?.["group-title"],
+    channel?.["x-category"],
+    channel?.["x-mapping"],
+    channel?.["x-xmltv-file"],
+    channel?.["tvg-id"],
+    channel?.["tvg-name"],
+    threadfinUrlTail(channel?.url)
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function threadfinMatchesAny(haystack, terms) {
+  return terms.length === 0 || terms.some(term => haystack.includes(term.toLowerCase()));
+}
+
+function threadfinMatchesAll(haystack, terms) {
+  return terms.length === 0 || terms.every(term => haystack.includes(term.toLowerCase()));
+}
+
+function summarizeThreadfinM3uGroups(records, options = {}) {
+  const searchTerms = threadfinTerms(options.search);
+  const groups = new Map();
+  for (const record of records) {
+    if (!threadfinMatchesAll(threadfinM3uHaystack(record), searchTerms)) {
+      continue;
+    }
+    const groupTitle = record.attributes?.["group-title"] || "";
+    if (!groups.has(groupTitle)) {
+      groups.set(groupTitle, []);
+    }
+    groups.get(groupTitle).push(record);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+    .map(([groupTitle, groupRecords]) => compactObject({
+      groupTitle,
+      count: groupRecords.length,
+      channels: options.includeChannels
+        ? groupRecords.slice(0, options.channelsPerGroup || 10).map(sanitizeM3uRecord)
+        : undefined
+    }));
+}
+
+async function threadfinReadM3uPlaylist(input = {}) {
+  const body = await threadfinWs("getServerConfig");
+  const settings = body.settings || {};
+  const playlistId = input.playlistId || input.playlist_id;
+  const { id, source } = threadfinConfigSource(settings, "m3u", playlistId);
+  const text = await threadfinFetchSourceText(source, settings, "m3u");
+  return {
+    body,
+    settings,
+    id,
+    source,
+    records: parseThreadfinM3u(text)
+  };
+}
+
+async function threadfinTryM3uGroupSummary(settings, source) {
+  try {
+    const text = await threadfinFetchSourceText(source, settings, "m3u");
+    const records = parseThreadfinM3u(text);
+    return {
+      totalChannels: records.length,
+      totalGroups: new Set(records.map(record => record.attributes?.["group-title"] || "")).size,
+      groups: summarizeThreadfinM3uGroups(records).slice(0, 100)
+    };
+  } catch (error) {
+    return { error: redactText(error.message) };
+  }
+}
+
+async function threadfinListSourceGroups(input = {}) {
+  const { id, source, records } = await threadfinReadM3uPlaylist(input);
+  const groups = summarizeThreadfinM3uGroups(records, {
+    includeChannels: input.includeChannels,
+    channelsPerGroup: input.channelsPerGroup,
+    search: input.search
+  });
+  return {
+    playlistId: id,
+    playlist: summarizeThreadfinSource(id, "m3u", source, false),
+    totalChannels: records.length,
+    totalGroups: groups.length,
+    groups: groups.slice(0, input.limit || 100)
+  };
+}
+
+async function threadfinFindSourceChannels(input = {}) {
+  const { id, source, records } = await threadfinReadM3uPlaylist(input);
+  const group = input.groupTitle || input.group_title || input.group;
+  const includeTerms = threadfinTerms(input.includeTokens || input.include_tokens);
+  const searchTerms = threadfinTerms(input.search);
+  const filtered = records.filter(record => {
+    const recordGroup = record.attributes?.["group-title"] || "";
+    if (group && normalizedLookupName(recordGroup) !== normalizedLookupName(group)) {
+      return false;
+    }
+    const haystack = threadfinM3uHaystack(record);
+    return threadfinMatchesAny(haystack, includeTerms) && threadfinMatchesAll(haystack, searchTerms);
+  });
+  const limit = input.limit || 100;
+  return {
+    playlistId: id,
+    playlist: summarizeThreadfinSource(id, "m3u", source, false),
+    total: filtered.length,
+    returned: Math.min(filtered.length, limit),
+    records: filtered.slice(0, limit).map(record => compactObject({
+      ...sanitizeM3uRecord(record),
+      matchedTerms: [...includeTerms, ...searchTerms].filter(term => threadfinM3uHaystack(record).includes(term.toLowerCase()))
+    }))
+  };
+}
+
+async function threadfinSaveGroupFilter(input) {
+  const id = String(input.id ?? input.filterId ?? input.filter_id ?? -1);
+  const currentConfig = await threadfinWs("getServerConfig");
+  const current = currentConfig.settings?.filter?.[id];
+  const data = compactObject({
+    ...(input.patch || {}),
+    name: input.name,
+    description: input.description,
+    type: "group-title",
+    filter: input.groupTitle || input.group_title || input.filter,
+    include: input.include,
+    exclude: input.exclude,
+    startingNumber: input.startingNumber === undefined ? undefined : String(input.startingNumber),
+    "x-category": input["x-category"] || input.xCategory || input.x_category,
+    liveEvent: input.liveEvent,
+    caseSensitive: input.caseSensitive,
+    active: input.active
+  });
+  const proposed = mergeObjectPatch(current || {}, data);
+  const payload = { filter: { [id]: data } };
+  if (input.dryRun) {
+    return threadfinOutput({
+      dryRun: true,
+      command: "saveFilter",
+      payload,
+      before: current ? summarizeThreadfinFilter(id, current, true) : undefined,
+      after: summarizeThreadfinFilter(id, proposed, true),
+      diff: compactDiff(current || {}, proposed),
+      note: "Set dryRun=false and confirm=true to save this Threadfin group-title filter."
+    }, input.includeSensitive);
+  }
+  requireThreadfinConfirm(input, "Threadfin group filter changes");
+  const response = await threadfinWs("saveFilter", payload);
+  const saved = response.settings?.filter?.[id] || proposed;
+  return threadfinOutput({
+    dryRun: false,
+    command: "saveFilter",
+    before: current ? summarizeThreadfinFilter(id, current, true) : undefined,
+    after: summarizeThreadfinFilter(id, saved, true),
+    diff: compactDiff(current || {}, saved),
+    response
+  }, input.includeSensitive);
+}
+
+function threadfinM3uUpdatePayload(id, source) {
+  const update = {};
+  for (const key of [
+    "name",
+    "description",
+    "file.source",
+    "buffer",
+    "tuner",
+    "http_proxy.ip",
+    "http_proxy.port",
+    "http_headers.origin",
+    "http_headers.referer"
+  ]) {
+    if (source?.[key] !== undefined) {
+      update[key] = source[key];
+    }
+  }
+  return { files: { m3u: { [id]: update } } };
+}
+
+async function threadfinUpdateM3u(input = {}) {
+  const body = await threadfinWs("getServerConfig");
+  const settings = body.settings || {};
+  const playlistId = input.playlistId || input.playlist_id;
+  const { id, source } = threadfinConfigSource(settings, "m3u", playlistId);
+  const payload = threadfinM3uUpdatePayload(id, source);
+  const sourceGroups = await threadfinTryM3uGroupSummary(settings, source);
+  const mappingCountBefore = Object.keys(body.xepg?.epgMapping || {}).length;
+  if (input.dryRun) {
+    return threadfinOutput({
+      dryRun: true,
+      command: "updateFileM3U",
+      playlistId: id,
+      playlist: summarizeThreadfinSource(id, "m3u", source, true),
+      payload,
+      mappingCountBefore,
+      sourceGroups,
+      note: "Set dryRun=false and confirm=true to run this Threadfin M3U update."
+    }, input.includeSensitive);
+  }
+  requireThreadfinConfirm(input, "Threadfin M3U updates");
+  const response = await threadfinWs("updateFileM3U", payload);
+  const afterConfig = response?.xepg ? response : await threadfinWs("getServerConfig");
+  return threadfinOutput({
+    dryRun: false,
+    command: "updateFileM3U",
+    playlistId: id,
+    playlist: summarizeThreadfinSource(id, "m3u", source, true),
+    mappingCountBefore,
+    mappingCountAfter: Object.keys(afterConfig.xepg?.epgMapping || {}).length,
+    sourceGroups,
+    response
+  }, input.includeSensitive);
+}
+
+function normalizeThreadfinMappingUpdates(input) {
+  return compactObject({
+    ...(input.updates || input.fields || {}),
+    "x-active": input["x-active"],
+    "x-category": input["x-category"] || input.xCategory || input.x_category,
+    "x-channelID": input["x-channelID"] || input.xChannelID || input.x_channel_id,
+    "x-name": input["x-name"] || input.xName || input.x_name,
+    "x-group-title": input["x-group-title"] || input.xGroupTitle || input.x_group_title,
+    "x-mapping": input["x-mapping"] || input.xMapping || input.x_mapping,
+    "x-xmltv-file": input["x-xmltv-file"] || input.xXmltvFile || input.x_xmltv_file,
+    "x-hide-channel": input["x-hide-channel"]
+  });
+}
+
+function selectThreadfinMappings(mapping, input = {}) {
+  const mappingKeys = new Set([...(input.mappingKeys || []), ...(input.mapping_keys || [])].map(String));
+  const channelNumbers = new Set([...(input.channelNumbers || []), ...(input.channel_numbers || [])].map(String));
+  const groupTitle = input.groupTitle || input.group_title;
+  const playlistId = input.playlistId || input.playlist_id;
+  const xmltvFile = input.xmltvFile || input.xmltv_file;
+  const searchTerms = threadfinTerms(input.searchTokens || input.search_tokens || input.search);
+  if (!mappingKeys.size && !channelNumbers.size && !groupTitle && !searchTerms.length) {
+    throw new Error("At least one Threadfin mapping selector is required");
+  }
+  const selected = [];
+  for (const [key, channel] of Object.entries(mapping || {})) {
+    if (playlistId && channel?.["_file.m3u.id"] !== playlistId) {
+      continue;
+    }
+    if (xmltvFile && channel?.["x-xmltv-file"] !== xmltvFile) {
+      continue;
+    }
+    const selectorMatched =
+      mappingKeys.has(key) ||
+      channelNumbers.has(String(channel?.["x-channelID"] || "")) ||
+      (groupTitle && normalizedLookupName(channel?.["x-group-title"] || channel?.["group-title"]) === normalizedLookupName(groupTitle)) ||
+      (searchTerms.length > 0 && threadfinMatchesAny(threadfinMappingHaystack(channel, key), searchTerms));
+    if (selectorMatched) {
+      selected.push(key);
+    }
+  }
+  return selected.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+async function threadfinSetMappingFields(input = {}) {
+  const body = await threadfinWs("getServerConfig");
+  const currentMapping = body.xepg?.epgMapping || {};
+  const selectedKeys = selectThreadfinMappings(currentMapping, input);
+  if (!selectedKeys.length) {
+    return {
+      dryRun: input.dryRun,
+      command: "saveEpgMapping",
+      selectedMappingKeys: [],
+      changes: [],
+      note: "No Threadfin mappings matched the supplied selectors."
+    };
+  }
+  const updates = normalizeThreadfinMappingUpdates(input);
+  const proposedMapping = mergeObjectPatch(currentMapping, {});
+  const channelNumberStart = input.channelNumberStart ?? input.channel_number_start;
+  const numericChannelNumberStart = channelNumberStart === undefined ? undefined : Number(channelNumberStart);
+  if (channelNumberStart !== undefined && !Number.isFinite(numericChannelNumberStart)) {
+    throw new Error("Threadfin channelNumberStart must be a number when provided");
+  }
+  const changes = selectedKeys.map((key, index) => {
+    const current = currentMapping[key];
+    const patch = { ...updates };
+    if (channelNumberStart !== undefined) {
+      patch["x-channelID"] = String(numericChannelNumberStart + index);
+    }
+    const proposed = mergeObjectPatch(current, patch);
+    proposedMapping[key] = proposed;
+    return {
+      id: key,
+      current: summarizeThreadfinChannel(key, current, input.includeSensitive),
+      proposed: summarizeThreadfinChannel(key, proposed, input.includeSensitive),
+      diff: compactDiff(current, proposed)
+    };
+  });
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      command: "saveEpgMapping",
+      selectedMappingKeys: selectedKeys,
+      changes,
+      note: "Set dryRun=false and confirm=true to save these Threadfin mapping changes."
+    };
+  }
+  requireThreadfinConfirm(input, "Threadfin mapping changes");
+  return threadfinOutput({
+    dryRun: false,
+    command: "saveEpgMapping",
+    selectedMappingKeys: selectedKeys,
+    changes,
+    response: await threadfinWs("saveEpgMapping", { epgMapping: proposedMapping })
+  }, input.includeSensitive);
+}
+
+function parseThreadfinXmltvChannels(text) {
+  const channels = [];
+  const pattern = /<channel\b([^>]*)>([\s\S]*?)<\/channel>/gi;
+  let match;
+  while ((match = pattern.exec(String(text || ""))) !== null) {
+    const attrs = parseM3uAttributes(match[1]);
+    const displayNames = [...match[2].matchAll(/<display-name\b[^>]*>([\s\S]*?)<\/display-name>/gi)]
+      .map(nameMatch => decodeXmlText(nameMatch[1]))
+      .filter(Boolean);
+    channels.push({
+      id: attrs.id,
+      displayNames
+    });
+  }
+  return channels;
+}
+
+async function threadfinFindXmltvChannels(input = {}) {
+  const body = await threadfinWs("getServerConfig");
+  const settings = body.settings || {};
+  const xmltvId = input.xmltvId || input.xmltv_id;
+  const { id, source } = threadfinConfigSource(settings, "xmltv", xmltvId);
+  const terms = threadfinTerms(input.searchTokens || input.search_tokens || input.search);
+  const records = parseThreadfinXmltvChannels(await threadfinFetchSourceText(source, settings, "xmltv"))
+    .map(channel => {
+      const values = [channel.id, ...channel.displayNames].filter(Boolean);
+      const normalizedValues = values.map(normalizedLookupName);
+      const exactTerms = terms.filter(term => normalizedValues.includes(normalizedLookupName(term)));
+      const haystack = values.join(" ").toLowerCase();
+      const candidateTerms = terms.filter(term => haystack.includes(term.toLowerCase()));
+      const matchType = exactTerms.length ? "exact" : candidateTerms.length || terms.length === 0 ? "candidate" : undefined;
+      return compactObject({
+        id: channel.id,
+        displayNames: channel.displayNames,
+        matchType,
+        exactTerms,
+        matchedTerms: [...new Set([...exactTerms, ...candidateTerms])]
+      });
+    })
+    .filter(record => record.matchType);
+  const limit = input.limit || 100;
+  return {
+    xmltvId: id,
+    source: summarizeThreadfinSource(id, "xmltv", source, false),
+    total: records.length,
+    returned: Math.min(records.length, limit),
+    records: records.slice(0, limit)
+  };
+}
+
+async function threadfinFetchPublicText(path) {
+  const response = await fetch(threadfinEndpoint(path), { signal: AbortSignal.timeout(requestTimeoutMs) });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Threadfin ${path} failed: ${response.status} ${response.statusText}: ${redactText(text).slice(0, 500)}`);
+  }
+  return {
+    contentType: response.headers.get("content-type"),
+    text
+  };
+}
+
+async function threadfinFetchFirstPublicText(paths) {
+  const errors = [];
+  for (const path of paths) {
+    try {
+      return { path, ...(await threadfinFetchPublicText(path)) };
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  throw new Error(errors.join("; "));
+}
+
+function threadfinPublicLineupRecord(record) {
+  return compactObject({
+    guideNumber: record?.GuideNumber ?? record?.guideNumber ?? record?.number,
+    guideName: record?.GuideName ?? record?.guideName ?? record?.name,
+    urlTail: threadfinUrlTail(record?.URL || record?.Url || record?.url)
+  });
+}
+
+function threadfinVerifyMatches({ lineup, m3uRecords, expectedNames, expectedNumbers, expectedTokens }) {
+  const expectations = [
+    ...threadfinTerms(expectedNames).map(value => ({ type: "name", value })),
+    ...threadfinTerms(expectedNumbers).map(value => ({ type: "number", value })),
+    ...threadfinTerms(expectedTokens).map(value => ({ type: "token", value }))
+  ];
+  return expectations.map(expectation => {
+    const lower = expectation.value.toLowerCase();
+    const lineupMatches = lineup
+      .map(threadfinPublicLineupRecord)
+      .filter(record => [record.guideNumber, record.guideName, record.urlTail].filter(Boolean).join(" ").toLowerCase().includes(lower));
+    const m3uMatches = m3uRecords
+      .filter(record => threadfinM3uHaystack(record).includes(lower))
+      .map(sanitizeM3uRecord);
+    return {
+      ...expectation,
+      matched: lineupMatches.length > 0 || m3uMatches.length > 0,
+      lineupMatches,
+      m3uMatches
+    };
+  });
+}
+
+async function threadfinVerifyOutput(input = {}) {
+  const [lineupFetch, m3uFetch, discoverFetch] = await Promise.all([
+    threadfinFetchFirstPublicText(["lineup.json"]),
+    threadfinFetchFirstPublicText(["m3u/", "m3u/threadfin.m3u"]),
+    threadfinFetchFirstPublicText(["discover.json"])
+  ]);
+  let lineup = [];
+  let discover = {};
+  try {
+    lineup = JSON.parse(lineupFetch.text);
+  } catch {
+    lineup = [];
+  }
+  try {
+    discover = JSON.parse(discoverFetch.text);
+  } catch {
+    discover = {};
+  }
+  const m3uRecords = parseThreadfinM3u(m3uFetch.text);
+  const expectedNames = input.expectedChannelNames || input.expected_channel_names;
+  const expectedNumbers = input.expectedChannelNumbers || input.expected_channel_numbers;
+  const expectedTokens = input.expectedTokens || input.expected_tokens;
+  return threadfinOutput({
+    endpoints: {
+      lineup: lineupFetch.path,
+      m3u: m3uFetch.path,
+      discover: discoverFetch.path
+    },
+    tunerCount: discover.TunerCount ?? discover.tunerCount,
+    lineupCount: Array.isArray(lineup) ? lineup.length : 0,
+    m3uCount: m3uRecords.length,
+    discover: compactObject({
+      friendlyName: discover.FriendlyName,
+      modelNumber: discover.ModelNumber,
+      firmwareName: discover.FirmwareName,
+      tunerCount: discover.TunerCount ?? discover.tunerCount,
+      deviceId: discover.DeviceID
+    }),
+    matches: threadfinVerifyMatches({
+      lineup: Array.isArray(lineup) ? lineup : [],
+      m3uRecords,
+      expectedNames,
+      expectedNumbers,
+      expectedTokens
+    })
+  }, input.includeSensitive);
+}
+
+function redactThreadfinM3uContent(text) {
+  return String(text || "").split(/\r?\n/).map(line => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith("#")) {
+      const tail = threadfinUrlTail(trimmed);
+      return tail ? `[redacted] ${tail}` : "[redacted]";
+    }
+    return redactText(line);
+  }).join("\n");
+}
+
 async function threadfinConfigSnapshot(includeSensitive = false) {
   const body = await threadfinWs("getServerConfig");
-  return threadfinOutput(body, includeSensitive);
+  return threadfinOutput({
+    summary: threadfinConfigSummary(body),
+    ...body
+  }, includeSensitive);
 }
 
 async function threadfinStatus(includeSensitive = false) {
@@ -3624,6 +4390,7 @@ async function threadfinSaveSource(input) {
       note: "Set dryRun to false to send this Threadfin source change."
     }, input.includeSensitive);
   }
+  requireThreadfinConfirm(input, "Threadfin source changes");
   return threadfinOutput({
     dryRun: false,
     command,
@@ -3639,12 +4406,14 @@ async function threadfinRefreshSource(input) {
     if (input.dryRun) {
       return { dryRun: true, command, payload };
     }
+    requireThreadfinConfirm(input, "Threadfin source refreshes");
     return threadfinOutput({ dryRun: false, command, response: await threadfinWs(command, payload) }, input.includeSensitive);
   }
   const command = `update.${type}`;
   if (input.dryRun) {
     return { dryRun: true, apiCommand: command };
   }
+  requireThreadfinConfirm(input, "Threadfin source refreshes");
   return threadfinOutput({ dryRun: false, apiCommand: command, response: await threadfinApi(command) }, input.includeSensitive);
 }
 
@@ -3662,6 +4431,7 @@ async function threadfinUpdateSettings(input) {
       note: "Set dryRun to false to send this Threadfin settings patch."
     }, input.includeSensitive);
   }
+  requireThreadfinConfirm(input, "Threadfin settings changes");
   return threadfinOutput({
     dryRun: false,
     command: "saveSettings",
@@ -3698,6 +4468,7 @@ async function threadfinSaveFilter(input) {
       diff: compactDiff(current || {}, mergeObjectPatch(current || {}, data))
     }, input.includeSensitive);
   }
+  requireThreadfinConfirm(input, "Threadfin filter changes");
   return threadfinOutput({ dryRun: false, command: "saveFilter", response: await threadfinWs("saveFilter", payload) }, input.includeSensitive);
 }
 
@@ -3728,6 +4499,7 @@ async function threadfinUpdateChannels(input) {
       note: "Set dryRun to false to save the updated Threadfin channel mapping."
     };
   }
+  requireThreadfinConfirm(input, "Threadfin channel mapping changes");
   return threadfinOutput({
     dryRun: false,
     command: "saveEpgMapping",
@@ -3758,6 +4530,7 @@ async function threadfinSaveUser(input) {
     const current = newUser ? undefined : (await threadfinWs("getServerConfig")).users?.[input.id];
     return threadfinOutput({ dryRun: true, command, payload, current }, input.includeSensitive);
   }
+  requireThreadfinConfirm(input, "Threadfin user changes");
   return threadfinOutput({ dryRun: false, command, response: await threadfinWs(command, payload) }, input.includeSensitive);
 }
 
@@ -3785,6 +4558,7 @@ async function threadfinRestoreConfig(input) {
   if (input.dryRun) {
     return { dryRun: true, command: "ThreadfinRestore", base64Bytes: Buffer.byteLength(input.base64 || "", "utf8") };
   }
+  requireThreadfinConfirm(input, "Threadfin restore");
   return threadfinOutput({
     dryRun: false,
     command: "ThreadfinRestore",
@@ -3797,6 +4571,7 @@ async function threadfinSetPpv(input) {
   if (input.dryRun) {
     return { dryRun: true, endpoint: path, enabled: input.enabled };
   }
+  requireThreadfinConfirm(input, "Threadfin PPV changes");
   const response = await fetch(threadfinEndpoint(path), {
     method: "POST",
     signal: AbortSignal.timeout(requestTimeoutMs)
@@ -3845,7 +4620,7 @@ async function threadfinExportOutput(input = {}) {
     length: text.length,
     truncated: text.length > maxChars,
     json: parsed,
-    content: input.includeContent ? text.slice(0, maxChars) : undefined
+    content: input.includeContent ? (input.kind === "m3u" ? redactThreadfinM3uContent(text) : redactText(text)).slice(0, maxChars) : undefined
   }, input.includeSensitive);
 }
 
@@ -5843,6 +6618,19 @@ function registerThreadfinTools(server) {
   const sourceTypeSchema = z.enum(["m3u", "hdhr", "xmltv"]);
   const sourceTypeAllSchema = z.enum(["all", "m3u", "hdhr", "xmltv"]).default("all");
   const includeSensitiveSchema = z.boolean().default(false);
+  const confirmSchema = z.boolean().default(false);
+  const stringTermsSchema = z.union([z.string(), z.array(z.string())]).optional();
+  const stringOrNumberArraySchema = z.array(z.union([z.string(), z.number()])).optional();
+  const mappingFieldsSchema = z.object({
+    "x-active": z.boolean().optional(),
+    "x-category": z.string().optional(),
+    "x-channelID": z.union([z.string(), z.number()]).optional(),
+    "x-name": z.string().optional(),
+    "x-group-title": z.string().optional(),
+    "x-mapping": z.string().optional(),
+    "x-xmltv-file": z.string().optional(),
+    "x-hide-channel": z.boolean().optional()
+  }).catchall(z.any());
 
   server.registerTool("threadfin_status", {
     title: "Threadfin Status",
@@ -5854,7 +6642,7 @@ function registerThreadfinTools(server) {
 
   server.registerTool("threadfin_get_config", {
     title: "Threadfin Get Config",
-    description: "Get Threadfin's full websocket configuration snapshot. Sensitive fields are redacted by default.",
+    description: "Get Threadfin's websocket configuration snapshot with a structured summary. Sensitive fields are redacted by default.",
     inputSchema: {
       includeSensitive: includeSensitiveSchema
     }
@@ -5870,6 +6658,35 @@ function registerThreadfinTools(server) {
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinListSources(input)));
+
+  server.registerTool("threadfin_list_source_groups", {
+    title: "Threadfin List Source Groups",
+    description: "Fetch and parse a configured Threadfin M3U source, returning group-title counts and optional sanitized channel summaries.",
+    inputSchema: {
+      playlistId: z.string().min(1).optional(),
+      playlist_id: z.string().min(1).optional(),
+      search: z.string().min(1).optional(),
+      includeChannels: z.boolean().default(false),
+      channelsPerGroup: z.number().int().min(1).max(100).default(10),
+      limit: z.number().int().min(1).max(500).default(100)
+    }
+  }, async (input) => jsonText(await threadfinListSourceGroups(input)));
+
+  server.registerTool("threadfin_find_source_channels", {
+    title: "Threadfin Find Source Channels",
+    description: "Fetch and parse a configured Threadfin M3U source, then return sanitized channel records matching group, search terms, or include tokens.",
+    inputSchema: {
+      playlistId: z.string().min(1).optional(),
+      playlist_id: z.string().min(1).optional(),
+      group: z.string().min(1).optional(),
+      groupTitle: z.string().min(1).optional(),
+      group_title: z.string().min(1).optional(),
+      includeTokens: stringTermsSchema,
+      include_tokens: stringTermsSchema,
+      search: stringTermsSchema,
+      limit: z.number().int().min(1).max(1000).default(100)
+    }
+  }, async (input) => jsonText(await threadfinFindSourceChannels(input)));
 
   server.registerTool("threadfin_save_source", {
     title: "Threadfin Save Source",
@@ -5890,6 +6707,7 @@ function registerThreadfinTools(server) {
       patch: z.object({}).catchall(z.any()).optional(),
       delete: z.boolean().default(false),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinSaveSource(input)));
@@ -5902,9 +6720,23 @@ function registerThreadfinTools(server) {
       type: sourceTypeSchema,
       id: z.string().min(1).optional(),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinRefreshSource(input)));
+
+  server.registerTool("threadfin_update_m3u", {
+    title: "Threadfin Update M3U",
+    description: "Run Threadfin's updateFileM3U websocket command using the existing playlist configuration fields. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      playlistId: z.string().min(1).optional(),
+      playlist_id: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
+      includeSensitive: includeSensitiveSchema
+    }
+  }, async (input) => jsonText(await threadfinUpdateM3u(input)));
 
   server.registerTool("threadfin_update_settings", {
     title: "Threadfin Update Settings",
@@ -5913,6 +6745,7 @@ function registerThreadfinTools(server) {
     inputSchema: {
       patch: z.object({}).catchall(z.any()),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinUpdateSettings(input)));
@@ -5937,9 +6770,39 @@ function registerThreadfinTools(server) {
       patch: z.object({}).catchall(z.any()).optional(),
       delete: z.boolean().default(false),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinSaveFilter(input)));
+
+  server.registerTool("threadfin_save_group_filter", {
+    title: "Threadfin Save Group Filter",
+    description: "Create or update a Threadfin group-title filter with a before/after summary. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      id: z.union([z.string().min(1), z.number().int()]).optional(),
+      filterId: z.union([z.string().min(1), z.number().int()]).optional(),
+      filter_id: z.union([z.string().min(1), z.number().int()]).optional(),
+      name: z.string().optional(),
+      description: z.string().optional(),
+      groupTitle: z.string().optional(),
+      group_title: z.string().optional(),
+      filter: z.string().optional(),
+      include: z.string().optional(),
+      exclude: z.string().optional(),
+      startingNumber: z.union([z.string(), z.number()]).optional(),
+      "x-category": z.string().optional(),
+      xCategory: z.string().optional(),
+      x_category: z.string().optional(),
+      active: z.boolean().optional(),
+      caseSensitive: z.boolean().optional(),
+      liveEvent: z.boolean().optional(),
+      patch: z.object({}).catchall(z.any()).optional(),
+      dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
+      includeSensitive: includeSensitiveSchema
+    }
+  }, async (input) => jsonText(await threadfinSaveGroupFilter(input)));
 
   server.registerTool("threadfin_list_channels", {
     title: "Threadfin List Channels",
@@ -5973,9 +6836,58 @@ function registerThreadfinTools(server) {
         patch: z.object({}).catchall(z.any())
       })).min(1),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinUpdateChannels(input)));
+
+  server.registerTool("threadfin_set_mapping_fields", {
+    title: "Threadfin Set Mapping Fields",
+    description: "Select Threadfin XEPG mappings by key, channel number, group, playlist, XMLTV file, or search tokens, then patch supported fields. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      mappingKeys: z.array(z.string().min(1)).optional(),
+      mapping_keys: z.array(z.string().min(1)).optional(),
+      channelNumbers: stringOrNumberArraySchema,
+      channel_numbers: stringOrNumberArraySchema,
+      playlistId: z.string().min(1).optional(),
+      playlist_id: z.string().min(1).optional(),
+      xmltvFile: z.string().min(1).optional(),
+      xmltv_file: z.string().min(1).optional(),
+      groupTitle: z.string().min(1).optional(),
+      group_title: z.string().min(1).optional(),
+      searchTokens: stringTermsSchema,
+      search_tokens: stringTermsSchema,
+      search: stringTermsSchema,
+      updates: mappingFieldsSchema.optional(),
+      fields: mappingFieldsSchema.optional(),
+      "x-active": z.boolean().optional(),
+      "x-category": z.string().optional(),
+      xCategory: z.string().optional(),
+      x_category: z.string().optional(),
+      "x-channelID": z.union([z.string(), z.number()]).optional(),
+      xChannelID: z.union([z.string(), z.number()]).optional(),
+      x_channel_id: z.union([z.string(), z.number()]).optional(),
+      "x-name": z.string().optional(),
+      xName: z.string().optional(),
+      x_name: z.string().optional(),
+      "x-group-title": z.string().optional(),
+      xGroupTitle: z.string().optional(),
+      x_group_title: z.string().optional(),
+      "x-mapping": z.string().optional(),
+      xMapping: z.string().optional(),
+      x_mapping: z.string().optional(),
+      "x-xmltv-file": z.string().optional(),
+      xXmltvFile: z.string().optional(),
+      x_xmltv_file: z.string().optional(),
+      "x-hide-channel": z.boolean().optional(),
+      channelNumberStart: z.union([z.string(), z.number()]).optional(),
+      channel_number_start: z.union([z.string(), z.number()]).optional(),
+      dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
+      includeSensitive: includeSensitiveSchema
+    }
+  }, async (input) => jsonText(await threadfinSetMappingFields(input)));
 
   server.registerTool("threadfin_list_xmltv_channels", {
     title: "Threadfin List XMLTV Channels",
@@ -5988,6 +6900,19 @@ function registerThreadfinTools(server) {
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinListXmltvChannels(input)));
+
+  server.registerTool("threadfin_find_xmltv_channels", {
+    title: "Threadfin Find XMLTV Channels",
+    description: "Fetch and parse a configured Threadfin XMLTV source, returning exact and candidate guide channel matches.",
+    inputSchema: {
+      xmltvId: z.string().min(1).optional(),
+      xmltv_id: z.string().min(1).optional(),
+      searchTokens: stringTermsSchema,
+      search_tokens: stringTermsSchema,
+      search: stringTermsSchema,
+      limit: z.number().int().min(1).max(1000).default(100)
+    }
+  }, async (input) => jsonText(await threadfinFindXmltvChannels(input)));
 
   server.registerTool("threadfin_save_user", {
     title: "Threadfin Save User",
@@ -6006,6 +6931,7 @@ function registerThreadfinTools(server) {
       userData: z.object({}).catchall(z.any()).optional(),
       delete: z.boolean().default(false),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinSaveUser(input)));
@@ -6023,12 +6949,14 @@ function registerThreadfinTools(server) {
     description: "Reset Threadfin in-memory web UI logs. Dry-run is enabled by default.",
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
-      dryRun: z.boolean().default(true)
+      dryRun: z.boolean().default(true),
+      confirm: confirmSchema
     }
-  }, async ({ dryRun }) => {
+  }, async ({ dryRun, confirm }) => {
     if (dryRun) {
       return jsonText({ dryRun: true, command: "resetLogs" });
     }
+    requireThreadfinConfirm({ confirm }, "Threadfin log reset");
     return jsonText({ dryRun: false, command: "resetLogs", response: await threadfinWs("resetLogs") });
   });
 
@@ -6049,6 +6977,7 @@ function registerThreadfinTools(server) {
     inputSchema: {
       base64: z.string().min(1),
       dryRun: z.boolean().default(true),
+      confirm: confirmSchema,
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinRestoreConfig(input)));
@@ -6059,7 +6988,8 @@ function registerThreadfinTools(server) {
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
       enabled: z.boolean(),
-      dryRun: z.boolean().default(true)
+      dryRun: z.boolean().default(true),
+      confirm: confirmSchema
     }
   }, async (input) => jsonText(await threadfinSetPpv(input)));
 
@@ -6073,6 +7003,20 @@ function registerThreadfinTools(server) {
       includeSensitive: includeSensitiveSchema
     }
   }, async (input) => jsonText(await threadfinExportOutput(input)));
+
+  server.registerTool("threadfin_verify_output", {
+    title: "Threadfin Verify Output",
+    description: "Check Threadfin public lineup, M3U, and HDHomeRun discovery outputs and return counts plus sanitized expected-channel matches.",
+    inputSchema: {
+      expectedChannelNames: stringTermsSchema,
+      expected_channel_names: stringTermsSchema,
+      expectedChannelNumbers: stringTermsSchema,
+      expected_channel_numbers: stringTermsSchema,
+      expectedTokens: stringTermsSchema,
+      expected_tokens: stringTermsSchema,
+      includeSensitive: includeSensitiveSchema
+    }
+  }, async (input) => jsonText(await threadfinVerifyOutput(input)));
 
   server.registerTool("threadfin_raw_websocket_command", {
     title: "Threadfin Raw Websocket Command",
