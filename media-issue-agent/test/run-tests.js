@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.js";
 import { buildCodexSubprocessEnv, buildRepairCodexArgs, investigationPrompt, runCodexRepair, steeredInvestigationPrompt } from "../src/codex.js";
 import {
   createApproval,
+  createAgentRun,
   ensureJob,
   initDb,
   insertSnapshot,
@@ -244,6 +245,8 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
   assert.notEqual(currentActionApproval.id, firstActionApproval.id);
   assert.equal(steeredDetails.approvals.find(approval => approval.id === firstActionApproval.id).status, "superseded");
   assert.equal(currentActionApproval.payload.plan.classification, "client_side");
+  assert.equal(currentActionApproval.payload.plan.actionSummary.mode, "client_side");
+  assert.match(currentActionApproval.payload.plan.actionSummary.headline, /No server-side repair/);
 
   const resolutionReview = await agent.approve(investigated.jobId, "fixture");
   assert.equal(resolutionReview.status, "awaiting_resolution_approval");
@@ -423,8 +426,17 @@ async function testSubtitleServerActionPlanExecutesRepair() {
     assert.equal(actionApproval.payload.plan.actions.length, 0);
     assert.match(actionApproval.payload.plan.repairPrompt, /Server-side action is required/);
     assert.equal(actionApproval.payload.plan.repairHints, undefined);
+    assert.equal(actionApproval.payload.plan.actionSummary.mode, "server_action");
+    assert.match(actionApproval.payload.plan.actionSummary.headline, /Run autonomous media repair/);
+    assert.match(actionApproval.payload.plan.actionSummary.bullets.join("\n"), /media-mcp/);
+    assert.match(actionApproval.payload.plan.actionSummary.expectedSteps.join("\n"), /download Korean subtitles/i);
+    assert.match(actionApproval.payload.plan.actionSummary.expectedSteps.join("\n"), /refresh Plex metadata/i);
     assert.match(actionApproval.payload.plan.repairPrompt, /configured MCP server named media/);
     assert.match(actionApproval.payload.plan.repairPrompt, /Choose the media tools that fit the evidence/);
+    const detailWithSummary = agent.jobDetails(investigated.jobId);
+    assert.equal(detailWithSummary.pendingActionSummary.mode, "server_action");
+    const approvalFromDetail = detailWithSummary.approvals.find(approval => approval.id === actionApproval.id);
+    assert.equal(approvalFromDetail.payload.plan.actionSummary.mode, "server_action");
 
     const resolutionReview = await agent.approve(investigated.jobId, "fixture");
     assert.equal(resolutionReview.status, "awaiting_resolution_approval");
@@ -933,8 +945,7 @@ function testRepairCodexArgs() {
     serviceTier: "fast"
   });
   assert.ok(args.includes("--dangerously-bypass-approvals-and-sandbox"));
-  assert.ok(args.includes("--ask-for-approval"));
-  assert.ok(args.includes("never"));
+  assert.equal(args.includes("--ask-for-approval"), false);
   assert.ok(args.includes("--json"));
   assert.ok(args.includes("--skip-git-repo-check"));
   assert.ok(args.includes("--ephemeral"));
@@ -1043,6 +1054,55 @@ async function testRepairRunnerUsesOutputLastMessageAndMinimalEnv() {
     } else {
       process.env.MEDIA_ISSUE_AGENT_SECRET_SHOULD_NOT_LEAK = previousSecret;
     }
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testRepairRunnerEarlyExitDoesNotCrashOnEpipe() {
+  const dir = await tempDir();
+  try {
+    const codexBin = path.join(dir, "codex-early-exit.mjs");
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "process.stderr.write('fixture codex argument failure\\n');",
+      "process.exit(2);"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    await assert.rejects(
+      () => runCodexRepair({
+        codexBin,
+        codexWorkspace: path.join(dir, "workspace"),
+        codexHome: path.join(dir, "codex-home"),
+        codexTimeoutMs: 10000,
+        codexRepairTimeoutMs: 10000,
+        mediaMcpUrl: "http://127.0.0.1:9/mcp",
+        mediaMcpBearerToken: "fixture-token"
+      }, "x".repeat(8 * 1024 * 1024), {}),
+      /Codex repair exited with 2/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testStartupRecoversInterruptedRepairRun() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "interrupted-fixture");
+    transitionJob(dbPath, job.id, "detected", "executing");
+    createAgentRun(dbPath, job.id, "repair", "fixture prompt", { model: "gpt-5.5" });
+    const agent = new MediaIssueAgent({ dbPath }, {});
+    await agent.init();
+    const details = agent.jobDetails(job.id);
+    assert.equal(details.job.state, "failed_retryable");
+    assert.match(details.job.lastError, /restarted while repair was running/);
+    assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.match(details.agentRuns[0].error, /restarted while repair was running/);
+    assert.equal(details.agentRunEvents.some(event => event.eventType === "repair_recovered_after_restart"), true);
+    assert.equal(details.auditEvents.some(event => event.eventType === "interrupted_repair_run_recovered"), true);
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -1332,7 +1392,8 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.modal-backdrop/);
     assert.match(cssText, /\.work-area\.detail-open/);
     assert.match(cssText, /\.detail-band\.processing::before/);
-    assert.match(cssText, /\.settings-panel/);
+    assert.match(cssText, /\.runner-strip/);
+    assert.match(cssText, /\.compact-field/);
     assert.match(cssText, /@keyframes processingSweep/);
     const js = await fetch(`${baseUrl}/assets/app.js`, { headers: { authorization: auth } });
     assert.equal(js.status, 200);
@@ -1341,6 +1402,8 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /applyTheme\(document\.documentElement\.dataset\.theme \|\| "dark"\)/);
     assert.match(jsText, /class="job-main"/);
     assert.match(jsText, /\/api\/auth\/login/);
+    assert.match(jsText, /repair-context-dialog/);
+    assert.match(jsText, /openRepairContextDialog/);
     assert.match(jsText, /Re-investigate/);
     assert.match(jsText, /function showEntry/);
     assert.match(jsText, /function showJob/);
@@ -1440,6 +1503,8 @@ async function run() {
   testRepairCodexArgs();
   testCodexEnvAndPromptHardening();
   await testRepairRunnerUsesOutputLastMessageAndMinimalEnv();
+  await testRepairRunnerEarlyExitDoesNotCrashOnEpipe();
+  await testStartupRecoversInterruptedRepairRun();
   await testCodexSettingsPersist();
   await testAuthConfig();
   await testStateTransitions();

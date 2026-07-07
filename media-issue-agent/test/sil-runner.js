@@ -547,6 +547,9 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
   assert.equal(actionApproval.payload.plan.actions.length, 0);
   assert.equal(actionApproval.payload.plan.repairHints, undefined);
+  assert.equal(actionApproval.payload.plan.actionSummary.mode, "server_action");
+  assert.match(actionApproval.payload.plan.actionSummary.headline, /Run autonomous media repair/);
+  assert.match(actionApproval.payload.plan.actionSummary.bullets.join("\n"), /media-mcp/);
   assert.match(actionApproval.payload.plan.repairPrompt, /Autonomous approved media repair execution/);
   assert.match(actionApproval.payload.plan.repairPrompt, /Choose the media tools that fit the evidence/);
 

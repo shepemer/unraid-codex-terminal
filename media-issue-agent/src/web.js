@@ -29,6 +29,33 @@ const HTML = `<!doctype html>
         </div>
       </div>
       <nav class="toolbar" aria-label="Primary actions">
+        <div id="codex-settings-panel" class="runner-strip" aria-label="Codex model settings">
+          <span class="runner-label">Codex</span>
+          <label class="compact-field compact-model">
+            <span>Model</span>
+            <input id="codex-model" type="text" autocomplete="off">
+          </label>
+          <label class="compact-field compact-reasoning">
+            <span>Reasoning</span>
+            <select id="codex-reasoning">
+              <option value="minimal">Minimal</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">Very High</option>
+            </select>
+          </label>
+          <label class="compact-toggle">
+            <input id="codex-fast-mode" type="checkbox">
+            <span>Fast</span>
+          </label>
+          <label class="compact-field compact-tier">
+            <span>Tier</span>
+            <input id="codex-service-tier" type="text" autocomplete="off">
+          </label>
+          <button id="repair-context-button" type="button" class="secondary">Context</button>
+          <button id="codex-settings-save" type="button" class="secondary">Save</button>
+        </div>
         <div class="theme-toggle" aria-label="Theme">
           <button type="button" data-theme-choice="light">Light</button>
           <button type="button" data-theme-choice="dark">Dark</button>
@@ -46,40 +73,6 @@ const HTML = `<!doctype html>
       </div>
       <button id="login-button" type="button">Start Login</button>
       <pre id="login-output" class="login-output hidden"></pre>
-    </section>
-
-    <section id="codex-settings-panel" class="settings-panel panel" aria-labelledby="codex-settings-heading">
-      <div>
-        <span class="eyebrow">Codex Runner</span>
-        <h2 id="codex-settings-heading">Model Settings</h2>
-      </div>
-      <label>
-        <span>Model</span>
-        <input id="codex-model" type="text" autocomplete="off">
-      </label>
-      <label>
-        <span>Reasoning</span>
-        <select id="codex-reasoning">
-          <option value="minimal">Minimal</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">Very High</option>
-        </select>
-      </label>
-      <label class="toggle-label">
-        <input id="codex-fast-mode" type="checkbox">
-        <span>Fast mode</span>
-      </label>
-      <label>
-        <span>Service tier</span>
-        <input id="codex-service-tier" type="text" autocomplete="off">
-      </label>
-      <label class="settings-wide">
-        <span>Repair context</span>
-        <textarea id="codex-repair-context" rows="2" placeholder="Non-secret operating preferences for repair runs"></textarea>
-      </label>
-      <button id="codex-settings-save" type="button" class="secondary">Save</button>
     </section>
 
     <div id="work-area" class="work-area">
@@ -171,6 +164,24 @@ const HTML = `<!doctype html>
       <div class="modal-actions">
         <button id="close-cancel-button" type="button" class="secondary">Cancel</button>
         <button id="close-confirm-button" type="button" class="danger">Close Issue</button>
+      </div>
+    </div>
+  </div>
+  <div id="repair-context-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="repair-context-dialog-title">
+    <div class="modal-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Codex Runner</span>
+          <h2 id="repair-context-dialog-title">Repair Context</h2>
+        </div>
+      </div>
+      <div class="modal-body">
+        <label for="codex-repair-context">Non-secret operating preferences</label>
+        <textarea id="codex-repair-context" rows="7" placeholder="Example: Prefer Sonarr/Radarr replacement over manual files; Bazarr manages subtitles; use exact IDs."></textarea>
+      </div>
+      <div class="modal-actions">
+        <button id="repair-context-cancel-button" type="button" class="secondary">Cancel</button>
+        <button id="repair-context-save-button" type="button">Save Context</button>
       </div>
     </div>
   </div>
@@ -295,12 +306,12 @@ button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
 }
 
 .topbar {
-  min-height: 82px;
+  min-height: 58px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 18px;
-  padding: 16px 20px;
+  gap: 14px;
+  padding: 8px 14px;
   background: color-mix(in srgb, var(--panel) 88%, transparent);
   border-bottom: 1px solid var(--line);
   backdrop-filter: blur(14px);
@@ -317,11 +328,11 @@ button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
 }
 
 .app-mark {
-  width: 40px;
-  height: 40px;
-  display: grid;
+  width: 34px;
+  height: 34px;
+  display: none;
   place-items: center;
-  border-radius: 10px;
+  border-radius: 8px;
   background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--warning) 58%, var(--accent)));
   color: #fff;
   font-size: 13px;
@@ -331,9 +342,9 @@ button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
 }
 
 h1, h2, p { margin: 0; }
-h1 { font-size: 21px; line-height: 1.1; font-weight: 780; letter-spacing: 0; }
+h1 { font-size: 18px; line-height: 1.1; font-weight: 780; letter-spacing: 0; }
 h2 { font-size: 16px; line-height: 1.2; font-weight: 780; letter-spacing: 0; }
-p { color: var(--muted); margin-top: 4px; }
+p { color: var(--muted); margin-top: 2px; }
 
 .eyebrow {
   display: block;
@@ -351,6 +362,91 @@ p { color: var(--muted); margin-top: 4px; }
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.runner-strip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel-2) 88%, transparent);
+  min-width: 0;
+}
+
+.runner-label {
+  padding: 0 6px 0 4px;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 780;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.compact-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.compact-field span,
+.compact-toggle span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.compact-model { width: 170px; }
+.compact-reasoning { width: 158px; }
+.compact-tier { width: 116px; }
+
+.runner-strip input[type="text"],
+.runner-strip select {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 8px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.runner-strip input[type="text"]:focus-visible,
+.runner-strip select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+.compact-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 4px;
+}
+
+.compact-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.runner-strip button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .theme-toggle {
@@ -405,67 +501,6 @@ p { color: var(--muted); margin-top: 4px; }
   min-height: 96px;
   max-height: 220px;
   border-top: 1px solid var(--line);
-}
-
-.settings-panel {
-  display: grid;
-  grid-template-columns: minmax(160px, 1.2fr) minmax(130px, 0.8fr) minmax(130px, 0.8fr) auto minmax(110px, 0.7fr) auto;
-  align-items: end;
-  gap: 12px;
-  margin: 16px 16px 0;
-  padding: 14px;
-}
-
-.settings-panel label {
-  display: grid;
-  gap: 5px;
-  min-width: 0;
-}
-
-.settings-panel label span {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 760;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.settings-panel input[type="text"],
-.settings-panel select,
-.settings-panel textarea {
-  width: 100%;
-  min-height: 36px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 8px 10px;
-  background: var(--panel-2);
-  color: var(--text);
-  font: inherit;
-  resize: vertical;
-}
-
-.settings-panel input[type="text"]:focus-visible,
-.settings-panel select:focus-visible,
-.settings-panel textarea:focus-visible {
-  outline: none;
-  box-shadow: var(--focus);
-}
-
-.settings-wide {
-  grid-column: 1 / -2;
-}
-
-.settings-panel .toggle-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 36px;
-}
-
-.settings-panel .toggle-label input {
-  width: 18px;
-  height: 18px;
-  accent-color: var(--accent);
 }
 
 .work-area {
@@ -939,6 +974,14 @@ pre {
     grid-template-columns: 1fr;
   }
 
+  .topbar .toolbar {
+    justify-content: flex-start;
+  }
+
+  .runner-strip {
+    width: 100%;
+  }
+
   .workspace {
     display: block;
     padding: 12px;
@@ -997,12 +1040,39 @@ pre {
   h1 { font-size: 18px; }
 
   .theme-toggle,
-  .toolbar > button {
+  .toolbar > button,
+  .runner-strip {
     width: 100%;
   }
 
   .theme-toggle button {
     flex: 1;
+  }
+
+  .runner-strip {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .runner-label,
+  .compact-field,
+  .compact-toggle,
+  .runner-strip button {
+    width: 100%;
+  }
+
+  .runner-label {
+    grid-column: 1 / -1;
+  }
+
+  .compact-field {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-model,
+  .compact-reasoning,
+  .compact-tier {
+    width: 100%;
   }
 
   .auth-panel {
@@ -1011,15 +1081,6 @@ pre {
   }
 
   .auth-panel > button {
-    width: 100%;
-  }
-
-  .settings-panel {
-    grid-template-columns: 1fr;
-    margin: 12px 12px 0;
-  }
-
-  .settings-panel > button {
     width: 100%;
   }
 
@@ -1057,6 +1118,10 @@ const el = {
   codexServiceTier: document.getElementById("codex-service-tier"),
   codexRepairContext: document.getElementById("codex-repair-context"),
   codexSettingsSave: document.getElementById("codex-settings-save"),
+  repairContextButton: document.getElementById("repair-context-button"),
+  repairContextDialog: document.getElementById("repair-context-dialog"),
+  repairContextCancelButton: document.getElementById("repair-context-cancel-button"),
+  repairContextSaveButton: document.getElementById("repair-context-save-button"),
   snapshotMeta: document.getElementById("snapshot-meta"),
   issueCount: document.getElementById("issue-count"),
   issueRows: document.getElementById("issue-rows"),
@@ -1375,6 +1440,28 @@ function renderCodexSettings(settings) {
   el.codexFastMode.checked = effective.fastMode !== false;
   el.codexServiceTier.value = effective.serviceTier || "";
   el.codexRepairContext.value = effective.repairContext || "";
+  el.repairContextButton.textContent = effective.repairContext ? "Context Set" : "Context";
+  el.repairContextButton.title = effective.repairContext
+    ? "Edit non-secret repair context"
+    : "Add non-secret repair context";
+}
+
+function currentSavedRepairContext() {
+  const effective = state.codexSettings?.effective || state.codexSettings?.defaults || {};
+  return effective.repairContext || "";
+}
+
+function openRepairContextDialog() {
+  el.codexRepairContext.value = currentSavedRepairContext();
+  el.repairContextDialog.classList.remove("hidden");
+  el.codexRepairContext.focus();
+}
+
+function closeRepairContextDialog({ revert = true } = {}) {
+  if (revert) {
+    el.codexRepairContext.value = currentSavedRepairContext();
+  }
+  el.repairContextDialog.classList.add("hidden");
 }
 
 function renderSnapshot(snapshot) {
@@ -1452,6 +1539,29 @@ function pendingApproval(detail) {
   return (detail.approvals || []).find(approval => approval.status === "pending") || null;
 }
 
+function formatActionSummary(summary) {
+  if (!summary) {
+    return "";
+  }
+  if (typeof summary === "string") {
+    return summary;
+  }
+  const lines = [];
+  if (summary.headline) {
+    lines.push(summary.headline);
+  }
+  for (const bullet of summary.bullets || []) {
+    lines.push(\`- \${bullet}\`);
+  }
+  if (summary.expectedSteps?.length) {
+    lines.push("", "Expected steps from the investigation:");
+    for (const [index, step] of summary.expectedSteps.entries()) {
+      lines.push(\`\${index + 1}. \${step}\`);
+    }
+  }
+  return lines.join("\\n");
+}
+
 function formatJobDetail(detail) {
   const job = detail.job;
   const pending = pendingApproval(detail);
@@ -1466,11 +1576,15 @@ function formatJobDetail(detail) {
   if (pending) {
     lines.push("", \`Pending \${pending.kind} approval #\${pending.id}\`);
     if (pending.payload?.plan) {
-      lines.push("", "Approved repair prompt waiting for your decision:");
+      const actionSummary = formatActionSummary(pending.payload.plan.actionSummary);
+      if (actionSummary) {
+        lines.push("", "Action summary:", actionSummary);
+      }
       if (pending.payload.plan.repairPrompt) {
-        lines.push(pending.payload.plan.repairPrompt);
+        lines.push("", "Full repair context:", pending.payload.plan.repairPrompt);
       } else {
-        lines.push(formatJson(pending.payload.plan));
+        const { actionSummary: _actionSummary, ...planDetails } = pending.payload.plan;
+        lines.push("", "Plan details:", formatJson(planDetails));
       }
     }
     if (pending.payload?.executionResult) {
@@ -1627,7 +1741,7 @@ async function refresh() {
   scheduleAuthRefresh();
 }
 
-async function saveCodexSettings() {
+async function saveCodexSettings(options = {}) {
   setBusy(true);
   try {
     const result = await api("/api/settings/codex", {
@@ -1641,6 +1755,9 @@ async function saveCodexSettings() {
       })
     });
     renderCodexSettings(result.settings);
+    if (options.closeRepairContextDialog) {
+      closeRepairContextDialog({ revert: false });
+    }
     toast("Codex settings saved");
   } catch (error) {
     toast(error.message);
@@ -1919,6 +2036,14 @@ el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
 el.loginButton.addEventListener("click", startLogin);
 el.codexSettingsSave.addEventListener("click", saveCodexSettings);
+el.repairContextButton.addEventListener("click", openRepairContextDialog);
+el.repairContextCancelButton.addEventListener("click", () => closeRepairContextDialog());
+el.repairContextSaveButton.addEventListener("click", () => saveCodexSettings({ closeRepairContextDialog: true }));
+el.repairContextDialog.addEventListener("click", event => {
+  if (event.target === el.repairContextDialog) {
+    closeRepairContextDialog();
+  }
+});
 for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
