@@ -510,6 +510,25 @@ async function run() {
       commandRecords.set(queued.id, queued);
       return sendJson(res, 200, queued);
     }
+    if (req.method === "GET" && path === "history") {
+      return sendJson(res, 200, {
+        page: 1,
+        pageSize: Number(query.pageSize || 10),
+        totalRecords: 1,
+        records: [{
+          id: 5001,
+          episodeId: Number(query.episodeId || 101),
+          seriesId: 10,
+          eventType: "downloadFolderImported",
+          sourceTitle: "Show.S01E01.1080p-GRP",
+          quality: { quality: { name: "WEBDL-1080p" } },
+          languages: [{ name: "English" }],
+          protocol: "usenet",
+          indexer: "Mock Indexer",
+          date: "2026-07-02T00:00:00Z"
+        }]
+      });
+    }
     if (req.method === "GET" && path === "command") {
       return sendJson(res, 200, [...commandRecords.values()]);
     }
@@ -527,6 +546,30 @@ async function run() {
       return sendJson(res, 200, { deleted: true, id: Number(path.split("/")[1]) });
     }
     if (req.method === "GET" && path === "release") {
+      if (service === "sonarr" && query.seriesId && query.seasonNumber) {
+        return sendJson(res, 200, [
+          {
+            guid: "sonarr-season-guid",
+            indexerId: 11,
+            indexer: "Mock Indexer",
+            title: "Show.S01.1080p-GRP",
+            releaseType: "seasonPack",
+            downloadAllowed: true,
+            downloadUrl: "https://example.invalid/download?apikey=secret",
+            rejections: []
+          },
+          {
+            guid: "sonarr-single-guid",
+            indexerId: 11,
+            indexer: "Mock Indexer",
+            title: "Show.S01E01.1080p-GRP",
+            releaseType: "singleEpisode",
+            downloadAllowed: true,
+            downloadUrl: "https://example.invalid/download?apikey=secret",
+            rejections: []
+          }
+        ]);
+      }
       return sendJson(res, 200, [{
         guid: `${service}-guid`,
         indexerId: service === "sonarr" ? 11 : 22,
@@ -542,6 +585,13 @@ async function run() {
         grabbed: true,
         ...body,
         downloadUrl: "https://example.invalid/grab?token=secret"
+      });
+    }
+    if (req.method === "POST" && path === "history/failed/5001") {
+      return sendJson(res, 200, {
+        id: 5001,
+        markedFailed: true,
+        blocklisted: true
       });
     }
     if (req.method === "GET" && path === "qualityprofile") {
@@ -728,7 +778,9 @@ async function run() {
       "sonarr_queue_item_files",
       "sonarr_import_queue_item",
       "sonarr_interactive_search_episode",
+      "sonarr_interactive_search_season",
       "sonarr_grab_release",
+      "sonarr_blocklist_episode_file_source",
       "sonarr_download_client_scan",
       "sonarr_command_cancel",
       "sonarr_quality_profiles",
@@ -1027,6 +1079,12 @@ async function run() {
     assert.equal(sonarrReleases.records[0].guid, "sonarr-guid");
     assert.equal(sonarrReleases.records[0].downloadUrl, undefined);
     assert.deepEqual(lastCall().query, { episodeId: "101" });
+    const sonarrSeasonReleases = await tool("sonarr_interactive_search_season", { seriesId: 10, seasonNumber: 1, limit: 5 });
+    assert.equal(sonarrSeasonReleases.records.length, 1);
+    assert.equal(sonarrSeasonReleases.records[0].guid, "sonarr-season-guid");
+    assert.equal(sonarrSeasonReleases.records[0].releaseType, "seasonPack");
+    assert.equal(sonarrSeasonReleases.records[0].downloadUrl, undefined);
+    assert.deepEqual(lastCall().query, { seriesId: "10", seasonNumber: "1" });
     const radarrReleases = await tool("radarr_interactive_search_movie", { movieId: 201, limit: 5 });
     assert.equal(radarrReleases.records[0].guid, "radarr-guid");
     assert.deepEqual(lastCall().query, { movieId: "201" });
@@ -1038,6 +1096,30 @@ async function run() {
     const grab = await tool("sonarr_grab_release", { guid: "sonarr-guid", indexerId: 11, dryRun: false });
     assert.deepEqual(lastCall().body, { guid: "sonarr-guid", indexerId: 11 });
     assert.equal(grab.result.downloadUrl, "[redacted]");
+
+    const beforeDryBlocklist = calls.length;
+    const dryBlocklist = await tool("sonarr_blocklist_episode_file_source", {
+      seriesId: 10,
+      episodeIds: [101],
+      sourceTitle: "Show.S01E01.1080p-GRP",
+      dryRun: true
+    });
+    assert.equal(dryBlocklist.blocklisted, false);
+    assert.equal(dryBlocklist.blocklistEntry.sourceTitle, "Show.S01E01.1080p-GRP");
+    assert.equal(dryBlocklist.matchedHistory.id, 5001);
+    assert.equal(dryBlocklist.endpoint.path, "/api/v3/history/failed/5001");
+    assert.equal(calls.slice(beforeDryBlocklist).filter(call => call.method === "POST" && call.path === "history/failed/5001").length, 0);
+
+    const blocklisted = await tool("sonarr_blocklist_episode_file_source", {
+      seriesId: 10,
+      episodeIds: [101],
+      sourceTitle: "Show.S01E01.1080p-GRP",
+      dryRun: false
+    });
+    assert.equal(blocklisted.blocklisted, true);
+    assert.equal(lastCall().method, "POST");
+    assert.equal(lastCall().path, "history/failed/5001");
+    assert.equal(blocklisted.result.markedFailed, true);
 
     const beforeDryCancel = calls.length;
     const dryCancel = await tool("sonarr_command_cancel", { commandId: 777, dryRun: true });

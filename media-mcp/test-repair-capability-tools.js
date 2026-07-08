@@ -52,16 +52,21 @@ async function run() {
   const episodeFile = path.join(tvDir, "Fixture Series - S13E03.mkv");
   const compareEpisodeFile = path.join(tvDir, "Fixture Series - S13E03.compare.mkv");
   const hangingProbeFile = path.join(tvDir, "Fixture Series - S13E04.hang.mkv");
+  const plexRoot = path.join(tempRoot, "plex-root");
+  const plexTvDir = path.join(plexRoot, "tv", "Fixture Series", "Season 13");
+  const plexMappedEpisodeFile = path.join(plexTvDir, "Fixture Series - S13E03.mkv");
   const fakeBinDir = path.join(tempRoot, "bin");
   await mkdir(movieDir, { recursive: true });
   await mkdir(deleteDir, { recursive: true });
   await mkdir(tvDir, { recursive: true });
+  await mkdir(plexTvDir, { recursive: true });
   await mkdir(fakeBinDir, { recursive: true });
   await writeFile(movieFile, "movie fixture\n");
   await writeFile(deleteFile, "delete fixture\n");
   await writeFile(episodeFile, "episode fixture\n");
   await writeFile(compareEpisodeFile, "compare fixture\n");
   await writeFile(hangingProbeFile, "hanging fixture\n");
+  await writeFile(plexMappedEpisodeFile, "episode fixture\n");
   const fakeFfprobe = path.join(fakeBinDir, "ffprobe");
   await writeFile(fakeFfprobe, [
     "#!/usr/bin/env node",
@@ -138,6 +143,25 @@ async function run() {
         }
       });
     }
+    if (req.method === "GET" && url.pathname === "/plex/library/metadata/show-55/children") {
+      return sendJson(res, 200, {
+        MediaContainer: {
+          Metadata: [{
+            ratingKey: "season-13",
+            key: "/library/metadata/season-13",
+            type: "season",
+            title: "Season 13",
+            parentTitle: "Fixture Series",
+            parentRatingKey: "show-55",
+            index: 13,
+            librarySectionID: "2",
+            librarySectionTitle: "TV",
+            leafCount: 12,
+            viewedLeafCount: 1
+          }]
+        }
+      });
+    }
     if (req.method === "GET" && url.pathname === "/plex/library/metadata/episode-1301") {
       return sendJson(res, 200, {
         MediaContainer: {
@@ -145,6 +169,8 @@ async function run() {
             ratingKey: "episode-1301",
             type: "episode",
             title: "Building Fixture",
+            librarySectionID: "2",
+            librarySectionTitle: "TV",
             Media: [{
               id: 501,
               Part: [{
@@ -156,6 +182,16 @@ async function run() {
           }]
         }
       });
+    }
+    if (req.method === "PUT" && url.pathname === "/plex/library/sections/2/refresh") {
+      assert.deepEqual(Object.fromEntries(url.searchParams), { path: "/tv/Fixture Series/Season 13" });
+      return sendJson(res, 200, { refreshed: true, sectionKey: "2" });
+    }
+    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/episode-1301/refresh") {
+      return sendJson(res, 200, { refreshed: true, ratingKey: "episode-1301" });
+    }
+    if (req.method === "PUT" && url.pathname === "/plex/library/metadata/episode-1301/analyze") {
+      return sendJson(res, 200, { analyzed: true, ratingKey: "episode-1301" });
     }
     if (req.method === "PUT" && url.pathname === "/plex/library/sections/1/refresh") {
       assert.deepEqual(Object.fromEntries(url.searchParams), { path: "/movies/Fixture Movie (2026)" });
@@ -247,7 +283,7 @@ async function run() {
       MEDIA_MCP_HOST: "127.0.0.1",
       MEDIA_MCP_PORT: String(mediaPort),
       MEDIA_MCP_PATH_MAPS: `/movies=${mediaRoot},/tv=${mediaRoot}`,
-      MEDIA_MCP_MEDIA_ROOTS: mediaRoot,
+      MEDIA_MCP_MEDIA_ROOTS: `${mediaRoot},${plexRoot}`,
       MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS: "1000",
       PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
       PLEX_URL: `http://127.0.0.1:${mockPort}/plex`,
@@ -320,7 +356,9 @@ async function run() {
     assert.ok(toolNames.has("media_file_delete"));
     assert.ok(toolNames.has("media_probe_video_content"));
     assert.ok(toolNames.has("plex_delete_metadata"));
+    assert.ok(toolNames.has("plex_list_show_seasons"));
     assert.ok(toolNames.has("plex_list_season_children"));
+    assert.ok(toolNames.has("plex_scan_library_path"));
     assert.ok(toolNames.has("radarr_delete_movie_file"));
     assert.ok(toolNames.has("sonarr_list_episodes"));
     assert.ok(toolNames.has("sonarr_replace_episode_files"));
@@ -448,6 +486,30 @@ async function run() {
     assert.equal(seasonChildren.children[0].ratingKey, "episode-1301");
     assert.equal(seasonChildren.children[0].parts[0].file, "/tv/Fixture Series/Season 13/Fixture Series - S13E03.mkv");
 
+    const showSeasons = await tool("plex_list_show_seasons", {
+      ratingKey: "show-55"
+    });
+    assert.equal(showSeasons.total, 1);
+    assert.equal(showSeasons.seasons[0].ratingKey, "season-13");
+    assert.equal(showSeasons.seasons[0].childCount, 12);
+
+    const plexScanDry = await tool("plex_scan_library_path", {
+      ratingKey: "episode-1301",
+      analyzeMetadata: true,
+      dryRun: true
+    });
+    assert.equal(plexScanDry.dryRun, true);
+    assert.deepEqual(plexScanDry.actions.map(action => action.type), ["scan_path", "refresh_metadata", "analyze_metadata"]);
+    assert.equal(plexScanDry.paths[0], "/tv/Fixture Series/Season 13");
+
+    const plexScanRun = await tool("plex_scan_library_path", {
+      ratingKey: "episode-1301",
+      analyzeMetadata: true,
+      dryRun: false
+    });
+    assert.equal(plexScanRun.ok, true);
+    assert.deepEqual(plexScanRun.results.map(result => result.action), ["scan_path", "refresh_metadata", "analyze_metadata"]);
+
     const probe = await tool("media_probe_video_content", {
       ratingKey: "episode-1301",
       includeFrameHashes: true,
@@ -460,6 +522,11 @@ async function run() {
     assert.equal(probe.frameHashes[0].algorithm, "average_hash_8x8");
     assert.equal(probe.comparison.resolvedPath, compareEpisodeFile);
     assert.equal(probe.comparison.hammingDistances[0].distance, 0);
+
+    const suffixMappedProbe = await tool("media_probe_video_content", {
+      path: "/opaque/plex/library/tv/Fixture Series/Season 13/Fixture Series - S13E03.mkv"
+    });
+    assert.equal(suffixMappedProbe.resolvedPath, plexMappedEpisodeFile);
 
     const timedOutProbe = await tool("media_probe_video_content", {
       path: "/tv/Fixture Series/Season 13/Fixture Series - S13E04.hang.mkv"
