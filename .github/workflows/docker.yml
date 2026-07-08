@@ -74,9 +74,58 @@ jobs:
           npm --prefix media-issue-agent run test:web
           npm --prefix media-issue-agent run sil
 
-  build:
-    needs: media-issue-agent-sil
+  trivy-cache:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Warm Trivy cache
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: Dockerfile
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          version: v0.70.0
+          format: table
+          exit-code: "0"
+          hide-progress: true
+
+  build-images:
+    name: build image (${{ matrix.name }})
+    needs:
+      - media-issue-agent-sil
+      - trivy-cache
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: codex-terminal
+            image_env: TERMINAL_IMAGE
+            dockerfile: Dockerfile
+            build_args: ""
+          - name: unraid-mcp
+            image_env: MCP_IMAGE
+            dockerfile: Dockerfile.unraid-mcp
+            build_args: |
+              UNRAID_MCP_VERSION=1.2.4
+          - name: media-mcp
+            image_env: MEDIA_MCP_IMAGE
+            dockerfile: Dockerfile.media-mcp
+            build_args: ""
+          - name: media-issue-agent
+            image_env: ISSUE_AGENT_IMAGE
+            dockerfile: Dockerfile.media-issue-agent
+            build_args: ""
+          - name: utilities-mcp
+            image_env: UTILITIES_MCP_IMAGE
+            dockerfile: Dockerfile.utilities-mcp
+            build_args: ""
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -89,159 +138,50 @@ jobs:
       - name: Compute image tags
         id: image-tags
         shell: bash
+        env:
+          IMAGE_ENV: ${{ matrix.image_env }}
         run: |
           set -euo pipefail
 
           image_sha="$(git rev-parse HEAD)"
-          terminal_base="${REGISTRY}/${{ github.repository_owner }}/${TERMINAL_IMAGE}"
-          mcp_base="${REGISTRY}/${{ github.repository_owner }}/${MCP_IMAGE}"
-          media_mcp_base="${REGISTRY}/${{ github.repository_owner }}/${MEDIA_MCP_IMAGE}"
-          issue_agent_base="${REGISTRY}/${{ github.repository_owner }}/${ISSUE_AGENT_IMAGE}"
-          utilities_mcp_base="${REGISTRY}/${{ github.repository_owner }}/${UTILITIES_MCP_IMAGE}"
-          terminal_tags=("${terminal_base}:${image_sha}")
-          mcp_tags=("${mcp_base}:${image_sha}")
-          media_mcp_tags=("${media_mcp_base}:${image_sha}")
-          issue_agent_tags=("${issue_agent_base}:${image_sha}")
-          utilities_mcp_tags=("${utilities_mcp_base}:${image_sha}")
+          image_name="${!IMAGE_ENV}"
+          image_base="${REGISTRY}/${{ github.repository_owner }}/${image_name}"
+          image_tags=("${image_base}:${image_sha}")
 
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "branch" ] && [ "${{ github.ref_name }}" = "main" ]; then
-            terminal_tags+=("${terminal_base}:main")
-            mcp_tags+=("${mcp_base}:main")
-            media_mcp_tags+=("${media_mcp_base}:main")
-            issue_agent_tags+=("${issue_agent_base}:main")
-            utilities_mcp_tags+=("${utilities_mcp_base}:main")
+            image_tags+=("${image_base}:main")
           fi
 
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            terminal_tags+=("${terminal_base}:${GITHUB_REF_NAME}")
-            mcp_tags+=("${mcp_base}:${GITHUB_REF_NAME}")
-            media_mcp_tags+=("${media_mcp_base}:${GITHUB_REF_NAME}")
-            issue_agent_tags+=("${issue_agent_base}:${GITHUB_REF_NAME}")
-            utilities_mcp_tags+=("${utilities_mcp_base}:${GITHUB_REF_NAME}")
+            image_tags+=("${image_base}:${GITHUB_REF_NAME}")
           fi
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            terminal_tags+=("${terminal_base}:${{ inputs.channel }}")
-            mcp_tags+=("${mcp_base}:${{ inputs.channel }}")
-            media_mcp_tags+=("${media_mcp_base}:${{ inputs.channel }}")
-            issue_agent_tags+=("${issue_agent_base}:${{ inputs.channel }}")
-            utilities_mcp_tags+=("${utilities_mcp_base}:${{ inputs.channel }}")
+            image_tags+=("${image_base}:${{ inputs.channel }}")
           fi
 
           {
             echo "image_sha=${image_sha}"
-            echo "terminal_tags<<EOF"
-            printf '%s\n' "${terminal_tags[@]}"
-            echo "EOF"
-            echo "mcp_tags<<EOF"
-            printf '%s\n' "${mcp_tags[@]}"
-            echo "EOF"
-            echo "media_mcp_tags<<EOF"
-            printf '%s\n' "${media_mcp_tags[@]}"
-            echo "EOF"
-            echo "issue_agent_tags<<EOF"
-            printf '%s\n' "${issue_agent_tags[@]}"
-            echo "EOF"
-            echo "utilities_mcp_tags<<EOF"
-            printf '%s\n' "${utilities_mcp_tags[@]}"
+            echo "image_ref=${image_base}:${image_sha}"
+            echo "tags<<EOF"
+            printf '%s\n' "${image_tags[@]}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Build codex-terminal
+      - name: Build ${{ matrix.name }}
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          file: Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           load: true
-          tags: ${{ steps.image-tags.outputs.terminal_tags }}
+          build-args: ${{ matrix.build_args }}
+          tags: ${{ steps.image-tags.outputs.tags }}
 
-      - name: Scan codex-terminal
+      - name: Scan ${{ matrix.name }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.TERMINAL_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          version: v0.70.0
-          format: table
-          exit-code: "1"
-
-      - name: Build unraid-mcp
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: Dockerfile.unraid-mcp
-          platforms: linux/amd64
-          load: true
-          build-args: |
-            UNRAID_MCP_VERSION=1.2.4
-          tags: ${{ steps.image-tags.outputs.mcp_tags }}
-
-      - name: Scan unraid-mcp
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MCP_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          version: v0.70.0
-          format: table
-          exit-code: "1"
-
-      - name: Build media-mcp
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: Dockerfile.media-mcp
-          platforms: linux/amd64
-          load: true
-          tags: ${{ steps.image-tags.outputs.media_mcp_tags }}
-
-      - name: Scan media-mcp
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.MEDIA_MCP_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          version: v0.70.0
-          format: table
-          exit-code: "1"
-
-      - name: Build media-issue-agent
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: Dockerfile.media-issue-agent
-          platforms: linux/amd64
-          load: true
-          tags: ${{ steps.image-tags.outputs.issue_agent_tags }}
-
-      - name: Scan media-issue-agent
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.ISSUE_AGENT_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          version: v0.70.0
-          format: table
-          exit-code: "1"
-
-      - name: Build utilities-mcp
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: Dockerfile.utilities-mcp
-          platforms: linux/amd64
-          load: true
-          tags: ${{ steps.image-tags.outputs.utilities_mcp_tags }}
-
-      - name: Scan utilities-mcp
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.UTILITIES_MCP_IMAGE }}:${{ steps.image-tags.outputs.image_sha }}
+          image-ref: ${{ steps.image-tags.outputs.image_ref }}
           vuln-type: os,library
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -257,52 +197,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push codex-terminal
+      - name: Push ${{ matrix.name }}
         if: github.event_name != 'pull_request'
         run: |
           while IFS= read -r image_tag; do
             [ -n "${image_tag}" ] || continue
             docker push "${image_tag}"
           done <<'EOF'
-          ${{ steps.image-tags.outputs.terminal_tags }}
+          ${{ steps.image-tags.outputs.tags }}
           EOF
 
-      - name: Push unraid-mcp
-        if: github.event_name != 'pull_request'
+  build:
+    needs: build-images
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm image builds
         run: |
-          while IFS= read -r image_tag; do
-            [ -n "${image_tag}" ] || continue
-            docker push "${image_tag}"
-          done <<'EOF'
-          ${{ steps.image-tags.outputs.mcp_tags }}
-          EOF
-
-      - name: Push media-mcp
-        if: github.event_name != 'pull_request'
-        run: |
-          while IFS= read -r image_tag; do
-            [ -n "${image_tag}" ] || continue
-            docker push "${image_tag}"
-          done <<'EOF'
-          ${{ steps.image-tags.outputs.media_mcp_tags }}
-          EOF
-
-      - name: Push media-issue-agent
-        if: github.event_name != 'pull_request'
-        run: |
-          while IFS= read -r image_tag; do
-            [ -n "${image_tag}" ] || continue
-            docker push "${image_tag}"
-          done <<'EOF'
-          ${{ steps.image-tags.outputs.issue_agent_tags }}
-          EOF
-
-      - name: Push utilities-mcp
-        if: github.event_name != 'pull_request'
-        run: |
-          while IFS= read -r image_tag; do
-            [ -n "${image_tag}" ] || continue
-            docker push "${image_tag}"
-          done <<'EOF'
-          ${{ steps.image-tags.outputs.utilities_mcp_tags }}
-          EOF
+          if [ "${{ needs.build-images.result }}" != "success" ]; then
+            echo "Docker image build or scan matrix did not pass: ${{ needs.build-images.result }}"
+            exit 1
+          fi
+          echo "All Docker image build and scan matrix jobs passed."
