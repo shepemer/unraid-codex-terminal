@@ -1134,51 +1134,41 @@ pre {
   position: relative;
   isolation: isolate;
   min-width: 82px;
-  min-height: 34px;
-  padding: 4px 8px;
-  border: 1px solid color-mix(in srgb, var(--success) 45%, var(--line));
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--success) 12%, var(--panel));
-  color: #9af3b1;
-  font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0;
+  min-height: 36px;
+  padding: 0 14px;
+  border-color: color-mix(in srgb, var(--success) 55%, var(--line));
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--success) 24%, var(--panel)),
+      color-mix(in srgb, var(--success) 34%, var(--panel)),
+      color-mix(in srgb, var(--success) 24%, var(--panel)));
+  background-size: 220% 100%;
+  color: color-mix(in srgb, var(--success) 72%, var(--text));
   text-align: center;
-  text-transform: uppercase;
   overflow: hidden;
   cursor: pointer;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 16%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent);
+  animation: mcpDetectedButtonBg 1.8s ease-in-out infinite;
 }
 
 .mcp-gap-detected:hover,
 .mcp-gap-detected:focus-visible {
-  border-color: color-mix(in srgb, var(--success) 72%, var(--line));
-  color: #c9ffd6;
-  box-shadow: 0 0 20px 2px color-mix(in srgb, var(--success) 28%, transparent);
-}
-
-.mcp-gap-detected::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: inherit;
+  color: color-mix(in srgb, var(--success) 78%, var(--text));
+  border-color: color-mix(in srgb, var(--success) 55%, var(--line));
   background:
-    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--success) 58%, transparent), transparent 68%),
-    color-mix(in srgb, var(--success) 22%, transparent);
-  animation: mcpDetectedPulse 1.35s ease-in-out infinite;
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--success) 26%, var(--panel)),
+      color-mix(in srgb, var(--success) 38%, var(--panel)),
+      color-mix(in srgb, var(--success) 26%, var(--panel)));
+  background-size: 220% 100%;
 }
 
-@keyframes mcpDetectedPulse {
+@keyframes mcpDetectedButtonBg {
   0%, 100% {
-    opacity: 0.54;
-    transform: scale(0.96);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 42%, transparent);
+    background-position: 0% 50%;
   }
   50% {
-    opacity: 1;
-    transform: scale(1.03);
-    box-shadow: 0 0 18px 4px color-mix(in srgb, var(--success) 30%, transparent);
+    background-position: 100% 50%;
   }
 }
 
@@ -2454,10 +2444,20 @@ function mcpGapHtml(item) {
       </div>
       <div class="mcp-gap-actions">
         <button class="secondary mcp-gap-remove\${detected ? " detected" : ""}" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
-        \${detected ? \`<button class="mcp-gap-detected" type="button" data-mcp-gap-detection="\${item.id}" title="Show detection reasoning">DETECTED</button>\` : ""}
+        \${detected ? \`<button class="secondary mcp-gap-detected" type="button" data-mcp-gap-detection="\${item.id}" aria-label="Show detection reasoning for \${escapeHtml(item.title)}" title="Show detection reasoning">DETECTED</button>\` : ""}
       </div>
     </article>
   \`;
+}
+
+function bindMcpGapDetectionButtons() {
+  for (const button of el.mcpGapsList.querySelectorAll("[data-mcp-gap-detection]")) {
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openMcpGapDetectionDialog(Number(button.dataset.mcpGapDetection));
+    });
+  }
 }
 
 function renderMcpGaps(items) {
@@ -2467,6 +2467,7 @@ function renderMcpGaps(items) {
     return;
   }
   el.mcpGapsList.innerHTML = items.map(mcpGapHtml).join("");
+  bindMcpGapDetectionButtons();
 }
 
 async function loadMcpGaps() {

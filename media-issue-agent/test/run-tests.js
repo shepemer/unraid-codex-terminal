@@ -2393,7 +2393,7 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.issue-card\.issue-processing/);
     assert.match(cssText, /\.drawer-backdrop/);
     assert.match(cssText, /\.mcp-gap-detected/);
-    assert.match(cssText, /@keyframes mcpDetectedPulse/);
+    assert.match(cssText, /@keyframes mcpDetectedButtonBg/);
     assert.match(cssText, /\.steer-panel textarea \{[\s\S]*min-height: 42px;[\s\S]*max-height: 132px;[\s\S]*resize: none;/);
     assert.match(cssText, /@media \(max-width: 700px\)/);
     assert.match(cssText, /\.app-shell\.runner-settings-open \.runner-strip/);
