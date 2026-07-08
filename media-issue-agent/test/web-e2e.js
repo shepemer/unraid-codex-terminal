@@ -41,8 +41,15 @@ async function createFakeCodexBin(root, logPath) {
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
+    "if (prompt.includes('MCP capability gap audit')) kind = 'mcp-capability-check';",
     "appendFileSync(process.env.WEB_E2E_CODEX_LOG, `${JSON.stringify({ kind })}\\n`);",
-    "if (kind === 'comment-draft') {",
+    "if (kind === 'mcp-capability-check') {",
+    "  const itemIds = [...prompt.matchAll(/\\\"id\\\":\\s*(\\d+)/g)].map(match => Number(match[1]));",
+    "  const result = { summary: 'Fixture capability check completed.', results: itemIds.map(itemId => ({ itemId, detected: true, toolName: 'sonarr_replace_fixture_episode', matchType: 'agent_reasoned', confidence: 'high', reason: 'The available fixture replacement tool satisfies this request.' })) };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'comment-draft') {",
     "  process.stdout.write('Reviewed as a client-side playback problem. No server-side media action was applied.\\nAutomated response from Codex.\\n');",
     "} else if (kind === 'steered-investigation') {",
     "  process.stdout.write('Revised investigation: client-side app playback issue. No server-side action is required.\\n');",
@@ -275,7 +282,8 @@ async function testIssueStateActionMatrix(browser) {
       { source: "seerr", issueId: "203", date: "2026-01-03T00:00:00Z", reporter: "Fixture", mediaTitle: "Approved", status: "open", description: "Approved issue" },
       { source: "seerr", issueId: "204", date: "2026-01-04T00:00:00Z", reporter: "Fixture", mediaTitle: "Resolution", status: "open", description: "Resolution issue" },
       { source: "seerr", issueId: "205", date: "2026-01-05T00:00:00Z", reporter: "Fixture", mediaTitle: "Closed", status: "open", description: "Closed issue" },
-      { source: "seerr", issueId: "206", date: "2026-01-06T00:00:00Z", reporter: "Fixture", mediaTitle: "Terminal", status: "open", description: "Terminal repair issue" }
+      { source: "seerr", issueId: "206", date: "2026-01-06T00:00:00Z", reporter: "Fixture", mediaTitle: "Terminal", status: "open", description: "Terminal repair issue" },
+      { source: "seerr", issueId: "207", date: "2026-01-07T00:00:00Z", reporter: "Fixture", mediaTitle: "Reopened stale", status: "resolved", description: "Resolved source row reopened locally.", lifecycle: "closed" }
     ];
     insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
 
@@ -316,6 +324,8 @@ async function testIssueStateActionMatrix(browser) {
       category: "sonarr"
     }]);
 
+    ensureJob(dbPath, "seerr", "207");
+
     const pageHandle = await newPage(browser, harness.baseUrl);
     context = pageHandle.context;
     const page = pageHandle.page;
@@ -349,6 +359,10 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 5)).toHaveClass(/issue-closed/);
     await expect(row(page, 6).getByRole("button", { name: "Review repair" })).toBeVisible();
     await expect(row(page, 6).getByRole("button", { name: "Re-investigate" })).toHaveCount(0);
+    await expect(row(page, 7).locator("td").nth(6)).toHaveText("open");
+    await expect(row(page, 7)).not.toHaveClass(/issue-closed/);
+    await expect(row(page, 7).getByRole("button", { name: "Investigate" })).toBeVisible();
+    await expect(row(page, 7).getByRole("button", { name: "Close" })).toBeVisible();
 
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
@@ -566,7 +580,7 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
     await expect(page.locator("#investigation-output")).toContainText("Action summary");
-    await expect(page.locator("#investigation-output")).toContainText("Full repair context");
+    await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
     await expect(page.locator("#detail-processing")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
     assert.equal(await codexInvocationCount(harness.codexLogPath), 1);
@@ -683,6 +697,7 @@ async function testManualCloseReopenBrowser(browser) {
 
     await page.getByRole("button", { name: "Poll Now" }).click();
     await expect(row(page, 1)).toContainText("Manual Close Fixture");
+    await expect(row(page, 1).locator("td").nth(6)).toHaveText("open");
     await expect(row(page, 1).getByRole("button", { name: "Investigate" })).toBeVisible();
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
 
@@ -698,6 +713,7 @@ async function testManualCloseReopenBrowser(browser) {
     await page.getByRole("button", { name: "Close Issue" }).click();
     await expect(page.locator("#close-dialog")).toBeHidden();
     await expect(row(page, 1)).toHaveClass(/issue-closed/);
+    await expect(row(page, 1).locator("td").nth(6)).toHaveText("closed");
     await expect(row(page, 1).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toHaveCount(0);
     await expect(page.locator("#detail-heading")).toHaveText("Issue Summary");
@@ -713,6 +729,7 @@ async function testManualCloseReopenBrowser(browser) {
 
     await page.locator("#reopen-button").click();
     await expect(row(page, 1)).not.toHaveClass(/issue-closed/);
+    await expect(row(page, 1).locator("td").nth(6)).toHaveText("open");
     await expect(row(page, 1).getByRole("button", { name: "Investigate" })).toBeVisible();
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
     assert.ok(fakeMcp.calls.some(call => call.name === "seerr_add_issue_comment" && call.args.issueId === 401 && call.args.message === "Re-opened issue."));
@@ -938,6 +955,7 @@ async function testMobileTriageLayoutAndManualActions(browser) {
     await expect(card(page, 1)).toBeVisible();
     await expect(card(page, 1)).toContainText("Mobile Close Fixture");
     await expect(card(page, 1)).toContainText("Close and reopen from a phone.");
+    await expect(card(page, 1).locator(".status-pill")).toHaveText("open");
     await expect(card(page, 1)).not.toContainText("Hidden Close Reporter");
     await expect(card(page, 1)).not.toContainText("502");
     await expect(card(page, 1).getByRole("button", { name: "Investigate" })).toBeVisible();
@@ -963,6 +981,7 @@ async function testMobileTriageLayoutAndManualActions(browser) {
     await page.getByRole("button", { name: "Close Issue" }).click();
     await expect(page.locator("#close-dialog")).toBeHidden();
     await expect(card(page, 1)).toHaveClass(/issue-closed/);
+    await expect(card(page, 1).locator(".status-pill")).toHaveText("closed");
     await expect(card(page, 1).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(page.locator("#detail-heading")).toHaveText("Issue Summary");
     await expect(page.locator("#detail-band")).toBeVisible();
@@ -971,6 +990,7 @@ async function testMobileTriageLayoutAndManualActions(browser) {
 
     await page.locator("#reopen-button").click();
     await expect(card(page, 1)).not.toHaveClass(/issue-closed/);
+    await expect(card(page, 1).locator(".status-pill")).toHaveText("open");
     await expect(card(page, 1).getByRole("button", { name: "Investigate" })).toBeVisible();
     await expect(card(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
     assert.ok(fakeMcp.calls.some(call => call.name === "seerr_add_issue_comment" && call.args.issueId === 502 && call.args.message === "Re-opened issue."));
@@ -1005,7 +1025,7 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#investigation-output")).toContainText("Action summary");
-    await expect(page.locator("#investigation-output")).toContainText("Full repair context");
+    await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
     await expect(card(page, 1)).toHaveClass(/issue-active/);
     await assertMobileDetailSheet(page);
     await assertNoHorizontalOverflow(page);
@@ -1144,6 +1164,7 @@ async function testMobileSeededApprovalRejectAndRetryControls(browser) {
     await page.locator(`[data-job-id="${retryJob.id}"]`).click();
     await expect(page.locator("#repair-retry-panel")).toBeHidden();
     await expect(page.locator("#steer-panel")).toBeVisible();
+    await expect(page.locator("#retry-same-repair-button")).toBeVisible();
     await page.locator("#steer-input").fill("Revise the failed mobile repair plan.");
     await expect(page.locator("#steer-button")).toBeEnabled();
     await assertMobileDetailSheet(page);

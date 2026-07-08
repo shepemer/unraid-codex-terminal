@@ -856,8 +856,34 @@ async function testRepairRunnerRecordsMissingMcpItems() {
 async function testMissingMcpCapabilityCheckUsesLiveTools() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-capability-check-fixture");
+  const promptPath = path.join(dir, "capability-check-prompt.txt");
+  const argsPath = path.join(dir, "capability-check-args.json");
   const calls = [];
   try {
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "let input = '';",
+      "process.stdin.on('data', chunk => { input += chunk; });",
+      "process.stdin.on('end', () => {",
+      `  fs.writeFileSync(${JSON.stringify(promptPath)}, input);`,
+      `  fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv));`,
+      "  const result = {",
+      "    summary: 'Compared requested MCP gaps against live tools by request intent.',",
+      "    results: [",
+      "      { itemId: 1, detected: true, toolName: 'media.media_file_delete', matchType: 'agent_reasoned', confidence: 'high', reason: 'The tool exposes scoped stat/delete for exact media paths.' },",
+      "      { itemId: 2, detected: false, toolName: 'radarr_delete_movie_file', matchType: 'partial', confidence: 'medium', reason: 'The available tool deletes a movie file, but this request also asks for replacement-search behavior.' },",
+      "      { itemId: 3, detected: false, toolName: null, matchType: 'not_detected', confidence: 'high', reason: 'No available tool satisfies this fixture capability.' }",
+      "    ]",
+      "  };",
+      "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+      "  if (outputPathIndex >= 0) fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
+      "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+      "});"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
     await initDb(dbPath);
     const job = ensureJob(dbPath, "plex", "capability-check-fixture");
     upsertMissingMcpItems(dbPath, job.id, null, [
@@ -869,7 +895,7 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
       },
       {
         title: "Radarr movie file deletion",
-        description: "Delete one exact Radarr movieFileId without queueing a replacement search.",
+        description: "Delete one exact Radarr movieFileId and queue an exact replacement search.",
         suggestedToolName: "radarr_delete_movie_file",
         category: "radarr"
       },
@@ -880,7 +906,23 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
         category: "fixture"
       }
     ]);
-    const agent = new MediaIssueAgent({ dbPath }, {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 10000,
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: true,
+      codexServiceTier: "fast",
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000,
+      logPath: path.join(dir, "agent.log"),
+      recoverStaleRunSeconds: 120
+    }, {
       async listTools() {
         calls.push({ name: "tools/list" });
         return [
@@ -894,12 +936,27 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
     assert.equal(calls.filter(call => call.name === "tools/list").length, 1);
     assert.equal(result.toolCount, 2);
     assert.equal(result.items.length, 3);
+    assert.equal(result.mode, "codex_agent");
+    assert.match(result.summary, /Compared requested MCP gaps/);
     const detectedNames = result.results.filter(entry => entry.detected).map(entry => entry.suggestedToolName).sort();
-    assert.deepEqual(detectedNames, ["media_file_delete", "radarr_delete_movie_file"]);
+    assert.deepEqual(detectedNames, ["media_file_delete"]);
+    const detected = result.results.find(entry => entry.suggestedToolName === "media_file_delete");
+    assert.equal(detected.toolName, "media_file_delete");
+    const partial = result.results.find(entry => entry.suggestedToolName === "radarr_delete_movie_file");
+    assert.equal(partial.detected, false);
+    assert.equal(partial.matchType, "partial");
     const missing = result.results.find(entry => entry.suggestedToolName === "fixture_missing_tool");
     assert.equal(missing.detected, false);
+    const prompt = await readFile(promptPath, "utf8");
+    assert.match(prompt, /suggestedToolName field is only a historical hint/);
+    assert.match(prompt, /Radarr movie file deletion/);
+    assert.match(prompt, /Delete exact Radarr movie files/);
+    const args = JSON.parse(await readFile(argsPath, "utf8"));
+    assert.ok(args.includes("--dangerously-bypass-approvals-and-sandbox"));
+    assert.ok(args.includes('mcp_servers.media.default_tools_approval_mode="approve"'));
   } finally {
     await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
   }
 }
 
@@ -1003,6 +1060,267 @@ async function testRepairRunnerNeedsOperatorDecisionCanRetryWithNote() {
     assert.equal(details.job.state, "awaiting_resolution_approval");
     assert.equal(details.agentRuns.length, 2);
     assert.match(details.agentRuns[0].prompt, /Use replacement option/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function testRepairPromptCompactsOversizedEvidence() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "oversized-evidence-fixture");
+    const hugeRaw = `raw-json-fixture-${"x".repeat(120000)}`;
+    const largeDiagnosticText = `large-diagnostic-fixture-${"d".repeat(180000)}`;
+    const evidence = {
+      entry: {
+        source: "plex",
+        issueId: "oversized-evidence-fixture",
+        mediaTitle: "Fixture Movie",
+        description: "Fixture report",
+        rawJson: hugeRaw,
+        raw: { rawJson: hugeRaw, plexRatingKey: "900001" }
+      },
+      details: {
+        issue: { source: "plex", id: "oversized-evidence-fixture", message: "Fixture report", rawJson: hugeRaw },
+        plex: {
+          ratingKey: "900001",
+          metadata: {
+            ratingKey: "900001",
+            title: "Fixture Movie",
+            rawJson: hugeRaw
+          }
+        },
+        tautulli: {
+          history: {
+            records: Array.from({ length: 12 }, (_, index) => ({
+              id: index + 1,
+              title: `Fixture history ${index + 1}`,
+              message: index === 0 ? largeDiagnosticText : `Fixture record ${index + 1}`
+            }))
+          }
+        }
+      },
+      steeringHistory: [{
+        sequence: 1,
+        actor: "fixture",
+        message: "Retry the same repair after adding tools.",
+        createdAt: "2026-01-01T00:00:00Z"
+      }]
+    };
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Investigation summary: remove the bad media copy and verify Plex no longer exposes it.",
+      evidence
+    });
+    const agent = new MediaIssueAgent({
+      dbPath,
+      logPath: path.join(dir, "agent.log"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      recoverStaleRunSeconds: 120
+    }, {
+      async listTools() {
+        return Array.from({ length: 40 }, (_, index) => ({
+          name: `fixture_tool_${index + 1}`,
+          description: `Fixture tool ${index + 1} description ${"y".repeat(2000)}`,
+          inputSchema: {
+            required: ["ratingKey"],
+            properties: {
+              ratingKey: { type: "string", description: "Plex rating key." },
+              longField: { type: "string", description: "z".repeat(2000) }
+            }
+          }
+        }));
+      }
+    });
+    await agent.init();
+    const built = await agent.buildExecutionRepairPrompt(job.id, "fixture", {
+      payload: {
+        source: "plex",
+        issueId: "oversized-evidence-fixture",
+        summary: "Investigation summary: remove the bad media copy and verify Plex no longer exposes it.",
+        evidence,
+        plan: {
+          classification: "server_action",
+          executionMode: "approved_repair_agent"
+        }
+      }
+    });
+    assert.ok(built.prompt.length < 1048576, `prompt length ${built.prompt.length} should fit Codex input limit`);
+    assert.doesNotMatch(built.prompt, /raw-json-fixture/);
+    assert.doesNotMatch(built.prompt, new RegExp(`d{${12000}}`));
+    assert.match(built.prompt, /900001/);
+    assert.match(built.prompt, /fixture_tool_1/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testRetryRepairWithoutNoteRerunsSameInvestigation() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-same-retry-fixture");
+  try {
+    const finalResult = {
+      status: "fixed",
+      summary: "Retried the same approved repair and verified it.",
+      actionsTaken: ["Ran the same approved media repair again."],
+      verification: { status: "passed", details: "Fixture verification passed." },
+      draftComment: "Retried the repair and verified the issue is resolved. Automated response from Codex.",
+      closeRecommended: true,
+      missingMcpItems: []
+    };
+    await writeFile(codexBin, [
+      "#!/bin/sh",
+      "cat >/dev/null",
+      `printf '%s\\n' ${JSON.stringify(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(finalResult) } }))}`
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "same-retry-fixture");
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Investigation summary: server-side repair is required.",
+      evidence: { entry: { source: "plex", issueId: "same-retry-fixture" } }
+    });
+    transitionJob(dbPath, job.id, "detected", "awaiting_action_approval", "Previous repair failed.");
+    createAgentRun(dbPath, job.id, "repair", "previous prompt", {});
+    createApproval(dbPath, job.id, "action", {
+      source: "plex",
+      issueId: "same-retry-fixture",
+      summary: "Investigation summary: server-side repair is required.",
+      evidence: { entry: { source: "plex", issueId: "same-retry-fixture" } },
+      plan: {
+        classification: "server_action",
+        executionMode: "approved_repair_agent",
+        actionSummary: {
+          mode: "server_action",
+          headline: "Run autonomous media repair for plex issue same-retry-fixture",
+          bullets: [],
+          expectedSteps: []
+        }
+      }
+    });
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 10000,
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: true,
+      codexServiceTier: "fast",
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000,
+      logPath: path.join(dir, "agent.log"),
+      recoverStaleRunSeconds: 120
+    }, {
+      async listTools() {
+        return [{ name: "fixture_repair", description: "Fixture repair tool." }];
+      }
+    });
+    await agent.init();
+    const result = await agent.retryRepair(job.id, "", "fixture");
+    assert.equal(result.status, "awaiting_resolution_approval");
+    const details = jobDetails(dbPath, job.id);
+    assert.equal(details.job.state, "awaiting_resolution_approval");
+    assert.equal(details.approvals.find(approval => approval.kind === "action").status, "approved");
+    assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 1);
+    assert.equal(details.auditEvents.some(event => event.eventType === "repair_retry_same_investigation_started"), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function testRepairAgentEventsAreCompactedForJobDetail() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-large-event-fixture.mjs");
+  try {
+    const finalResult = {
+      status: "fixed",
+      summary: "Completed and verified compact event fixture repair.",
+      actionsTaken: ["Read large tool output.", "Verified the repair."],
+      verification: { status: "passed", details: "Fixture verification passed." },
+      draftComment: "Completed and verified this repair. Automated response from Codex.",
+      closeRecommended: true,
+      missingMcpItems: []
+    };
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      "process.stdin.on('end', () => {",
+      "  const huge = 'x'.repeat(200000);",
+      "  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_get_metadata', status: 'completed', arguments: { ratingKey: '900001' }, result: { content: [{ type: 'text', text: huge }] } } }));",
+      `  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: ${JSON.stringify(JSON.stringify(finalResult))} } }));`,
+      "});"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "large-event-fixture");
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Investigation summary: run a server-side repair and verify it.",
+      evidence: { entry: { source: "plex", issueId: "large-event-fixture", plexRatingKey: "900001" } }
+    });
+    transitionJob(dbPath, job.id, "detected", "awaiting_action_approval");
+    createApproval(dbPath, job.id, "action", {
+      source: "plex",
+      issueId: "large-event-fixture",
+      summary: "Investigation summary: run a server-side repair and verify it.",
+      evidence: { entry: { source: "plex", issueId: "large-event-fixture", plexRatingKey: "900001" } },
+      plan: {
+        classification: "server_action",
+        executionMode: "approved_repair_agent",
+        actionSummary: {
+          mode: "server_action",
+          headline: "Run autonomous media repair for plex issue large-event-fixture",
+          bullets: [],
+          expectedSteps: []
+        }
+      }
+    });
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 10000,
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: true,
+      codexServiceTier: "fast",
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000,
+      logPath: path.join(dir, "agent.log"),
+      recoverStaleRunSeconds: 120
+    }, {
+      async listTools() {
+        return [{ name: "plex_get_metadata", description: "Read Plex metadata." }];
+      }
+    });
+    await agent.init();
+    const result = await agent.approve(job.id, "fixture");
+    assert.equal(result.status, "awaiting_resolution_approval");
+    const details = agent.jobDetails(job.id);
+    const event = details.agentRunEvents.find(row => row.eventType === "item.completed" && row.payload?.item?.type === "mcp_tool_call");
+    assert.ok(event, "expected stored MCP tool event");
+    const stored = JSON.stringify(event.payload);
+    assert.ok(stored.length < 12000, `stored event should be compact, got ${stored.length} chars`);
+    assert.doesNotMatch(stored, /x{10000}/);
+    assert.match(stored, /resultSummary/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -1396,6 +1714,31 @@ async function testStartupDoesNotRecoverFreshRunningRepairRun() {
   }
 }
 
+async function testStartupDoesNotRecoverLiveOwnerStaleRepairRun() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "live-owner-stale-fixture");
+    transitionJob(dbPath, job.id, "detected", "executing");
+    const run = createAgentRun(dbPath, job.id, "repair", "fixture prompt", { model: "gpt-5.5" });
+    sqliteExec(dbPath, `
+UPDATE agent_runs
+SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')
+WHERE id = ${run.id};
+`);
+    const agent = new MediaIssueAgent({ dbPath, recoverStaleRunSeconds: 120 }, {});
+    await agent.init();
+    const details = agent.jobDetails(job.id);
+    assert.equal(details.job.state, "executing");
+    assert.equal(details.job.lastError, null);
+    assert.equal(details.agentRuns[0].status, "running");
+    assert.equal(details.auditEvents.some(event => event.eventType === "interrupted_repair_run_recovered"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function testStartupRecoversStaleInterruptedRepairRun() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -1406,7 +1749,8 @@ async function testStartupRecoversStaleInterruptedRepairRun() {
     const run = createAgentRun(dbPath, job.id, "repair", "fixture prompt", { model: "gpt-5.5" });
     sqliteExec(dbPath, `
 UPDATE agent_runs
-SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')
+SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes'),
+    owner_pid = 999999
 WHERE id = ${run.id};
 `);
     const agent = new MediaIssueAgent({ dbPath, recoverStaleRunSeconds: 120 }, {});
@@ -1776,6 +2120,7 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="detail-band"/);
     assert.match(pageText, /id="detail-close-button"/);
     assert.match(pageText, /id="detail-processing"/);
+    assert.match(pageText, /Retry same repair/);
     assert.match(pageText, /id="continue-button"/);
     assert.match(pageText, /id="reopen-button"/);
     assert.match(pageText, /id="steer-panel"/);
@@ -1843,15 +2188,20 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function formatSteeringHistory/);
     assert.match(jsText, /function formatRepairActivityEvent/);
     assert.match(jsText, /function formatAgentRunSummary/);
+    assert.match(jsText, /function retrySameRepair/);
     assert.match(jsText, /function captureOutputScroll/);
     assert.match(jsText, /function restoreOutputScroll/);
     assert.match(jsText, /Steering history:/);
     assert.match(jsText, /Live repair activity:/);
+    assert.match(jsText, /Repair prompt preview:/);
+    assert.doesNotMatch(jsText, /Full repair context:/);
     assert.match(jsText, /Calling /);
     assert.match(jsText, /Result from /);
     assert.match(jsText, /function openCloseDialog/);
     assert.match(jsText, /function showIssueSummary/);
     assert.match(jsText, /function reopenIssue/);
+    assert.match(jsText, /function displayIssueStatus/);
+    assert.match(jsText, /function applyIssueMutation/);
     assert.match(jsText, /function closeDetail/);
     assert.match(jsText, /function setDetailProcessing/);
     assert.match(jsText, /function sortJobs/);
@@ -1951,6 +2301,9 @@ async function run() {
   await testRepairRunnerRecordsMissingMcpItems();
   await testMissingMcpCapabilityCheckUsesLiveTools();
   await testRepairRunnerNeedsOperatorDecisionCanRetryWithNote();
+  await testRepairPromptCompactsOversizedEvidence();
+  await testRetryRepairWithoutNoteRerunsSameInvestigation();
+  await testRepairAgentEventsAreCompactedForJobDetail();
   await testRepairRunnerUnverifiedFixedFailsWithoutResolution();
   await testRepairResultWithoutCloseRecommendationPostsCommentOnly();
   await testReopenedSourceMarkerOverridesStaleClosedJobState();
@@ -1959,6 +2312,7 @@ async function run() {
   await testRepairRunnerUsesOutputLastMessageAndMinimalEnv();
   await testRepairRunnerEarlyExitDoesNotCrashOnEpipe();
   await testStartupDoesNotRecoverFreshRunningRepairRun();
+  await testStartupDoesNotRecoverLiveOwnerStaleRepairRun();
   await testStartupRecoversStaleInterruptedRepairRun();
   await testCodexSettingsPersist();
   await testJobListPrioritizesActiveWork();

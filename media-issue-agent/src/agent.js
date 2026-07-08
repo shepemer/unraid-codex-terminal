@@ -38,7 +38,7 @@ import {
   dismissMissingMcpItem,
   upsertInvestigation
 } from "./db.js";
-import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, runCodexRepair, steeredInvestigationPrompt } from "./codex.js";
+import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, runCodexMcpCapabilityCheck, runCodexRepair, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
@@ -165,6 +165,72 @@ function appendSteeringToEvidence(evidence, { actor, message, previousSummary })
 function latestSteeringMessage(evidence = {}) {
   const history = steeringHistoryFromEvidence(evidence);
   return history.at(-1)?.message || "";
+}
+
+function truncateForPrompt(value, maxLength = 4000) {
+  const text = String(value || "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength).trim()}...[truncated ${text.length - maxLength} chars]`;
+}
+
+function compactForRepairPrompt(value, key = "", depth = 0) {
+  const normalizedKey = String(key || "");
+  if (/^(rawJson|raw|sourceUri|promptSafety)$/i.test(normalizedKey)) {
+    return undefined;
+  }
+  if (/^(thumb|art|theme|grandparentThumb|grandparentArt|grandparentTheme|parentThumb|Image|UltraBlurColors)$/i.test(normalizedKey)) {
+    return undefined;
+  }
+  if (value === undefined || value === null) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const maxLength = /^(summary|description|message|comment|comments|note|notes|text|error|lastError)$/i.test(normalizedKey) ? 5000 : 1200;
+    return truncateForPrompt(value, maxLength);
+  }
+  if (typeof value !== "object") {
+    return value;
+  }
+  if (depth >= 6) {
+    return "[omitted nested detail]";
+  }
+  if (Array.isArray(value)) {
+    const maxItems = /^(records|history|agentRunEvents|events)$/i.test(normalizedKey) ? 6 : 12;
+    const items = value.slice(0, maxItems)
+      .map(item => compactForRepairPrompt(item, normalizedKey, depth + 1))
+      .filter(item => item !== undefined);
+    if (value.length > maxItems) {
+      items.push({ omittedItemCount: value.length - maxItems });
+    }
+    return items;
+  }
+  const output = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    const compacted = compactForRepairPrompt(childValue, childKey, depth + 1);
+    if (compacted !== undefined) {
+      output[childKey] = compacted;
+    }
+  }
+  return output;
+}
+
+function buildRepairPromptPreview(summary, operatorMessage = "") {
+  const lines = [
+    "Autonomous approved media repair execution.",
+    "Use the configured MCP server named media to inspect, repair, and verify the issue directly.",
+    "Choose the media tools that fit the evidence and current tool briefing.",
+    "Do not delegate media-side work back to the server owner/operator.",
+    "Do not post reporter comments or close the issue before final approval.",
+    "",
+    "Investigation summary:",
+    truncateForPrompt(summary, 7000)
+  ];
+  if (String(operatorMessage || "").trim()) {
+    lines.push("", "Latest trusted steering note:", truncateForPrompt(operatorMessage, 1200));
+  }
+  return lines.join("\n");
 }
 
 function extractInvestigationActionSteps(summary) {
@@ -300,7 +366,7 @@ function buildPlan(entry, evidence, summary, operatorMessage = "") {
   const clientSideText = textSuggestsClientSide(summary, operatorMessage);
   const serverSide = textSuggestsServerSide(summary, operatorMessage) || !clientSideText;
   const clientSide = !serverSide && clientSideText;
-  const repairPrompt = serverSide ? buildRepairPrompt(effectiveEntry, evidence, summary, operatorMessage) : undefined;
+  const repairPrompt = serverSide ? buildRepairPromptPreview(summary, operatorMessage) : undefined;
   const plan = {
     classification: serverSide ? "server_action" : "client_side",
     executionMode: serverSide ? "approved_repair_agent" : "none",
@@ -308,7 +374,7 @@ function buildPlan(entry, evidence, summary, operatorMessage = "") {
     requiresServerAction: serverSide,
     repairPrompt,
     note: serverSide
-      ? "Approval will run the autonomous Codex repair runner with this exact prompt."
+      ? "Approval will run the autonomous Codex repair runner using the current investigation, compacted evidence, and live media-mcp tool briefing."
       : "Determination is client-side or no server-side action is required."
   };
   plan.actionSummary = buildActionSummary(effectiveEntry, summary, plan);
@@ -526,14 +592,117 @@ function repairWorkspaceFor(config, jobId) {
   return path.join(root, `job-${jobId}`);
 }
 
+function compactToolSchema(schema) {
+  if (!schema || typeof schema !== "object") {
+    return null;
+  }
+  const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const compactProperties = Object.entries(properties).slice(0, 30).map(([name, property]) => ({
+    name,
+    type: Array.isArray(property?.type) ? property.type.join("|") : property?.type || property?.anyOf?.map(item => item.type).filter(Boolean).join("|") || "unknown",
+    description: property?.description ? truncateForPrompt(property.description, 240) : undefined,
+    enum: Array.isArray(property?.enum) ? property.enum.slice(0, 12) : undefined
+  }));
+  return {
+    required: Array.isArray(schema.required) ? schema.required.slice(0, 30) : [],
+    properties: compactProperties,
+    omittedPropertyCount: Math.max(0, Object.keys(properties).length - compactProperties.length)
+  };
+}
+
 function toolBriefingFromTools(tools = []) {
   return {
     tools: tools.map(tool => ({
       name: tool.name,
-      description: tool.description || "",
-      inputSchema: tool.inputSchema || tool.input_schema || null
+      description: truncateForPrompt(tool.description || "", 700),
+      inputSchema: compactToolSchema(tool.inputSchema || tool.input_schema || null)
     })).filter(tool => tool.name)
   };
+}
+
+function compactRepairEventPayload(event) {
+  const payload = event.payload || {};
+  if (event.eventType === "repair_mcp_tool_call") {
+    return {
+      toolName: payload.toolName,
+      arguments: compactForRepairPrompt(payload.arguments || {}, "arguments")
+    };
+  }
+  if (event.eventType === "repair_mcp_tool_result") {
+    return {
+      calls: payload.calls,
+      status: payload.status,
+      resultSummary: payload.resultSummary || compactForRepairPrompt(payload.result, "result", 4)
+    };
+  }
+  if (payload.item?.type === "mcp_tool_call") {
+    return {
+      type: payload.item.type,
+      toolName: payload.item.name || payload.item.tool,
+      status: payload.item.status,
+      arguments: payload.item.arguments ? compactForRepairPrompt(payload.item.arguments, "arguments") : undefined,
+      resultSummary: payload.item.resultSummary || (payload.item.result ? compactForRepairPrompt(payload.item.result, "result", 4) : undefined),
+      error: payload.item.error ? truncateForPrompt(payload.item.error, 1000) : undefined
+    };
+  }
+  if (payload.text || payload.error) {
+    return {
+      text: payload.text ? truncateForPrompt(payload.text, 1000) : undefined,
+      error: payload.error ? truncateForPrompt(payload.error, 1000) : undefined
+    };
+  }
+  return compactForRepairPrompt(payload, "eventPayload", 4);
+}
+
+function compactAgentRunEventForStorage(event) {
+  const compacted = compactForRepairPrompt(event, "agentRunEvent", 0);
+  if (event?.type === "repair_mcp_tool_call") {
+    return {
+      type: event.type,
+      toolName: event.toolName,
+      arguments: compactForRepairPrompt(event.arguments || {}, "arguments")
+    };
+  }
+  if (event?.type === "repair_mcp_tool_result") {
+    return {
+      type: event.type,
+      calls: event.calls,
+      status: event.status,
+      resultSummary: compactForRepairPrompt(event.result, "result", 4)
+    };
+  }
+  if (event?.item?.type === "mcp_tool_call") {
+    return {
+      type: event.type,
+      item: {
+        type: event.item.type,
+        id: event.item.id,
+        server: event.item.server,
+        tool: event.item.tool || event.item.name,
+        name: event.item.name || event.item.tool,
+        status: event.item.status,
+        arguments: compactForRepairPrompt(event.item.arguments || {}, "arguments"),
+        resultSummary: event.item.result ? compactForRepairPrompt(event.item.result, "result", 4) : undefined,
+        error: event.item.error ? truncateForPrompt(event.item.error, 1000) : undefined
+      }
+    };
+  }
+  if (event?.type === "stdout" || event?.type === "stderr") {
+    return {
+      type: event.type,
+      text: truncateForPrompt(event.text || "", 2000)
+    };
+  }
+  if (event?.type === "item.completed" && event?.item?.type === "agent_message") {
+    return {
+      type: event.type,
+      item: {
+        type: event.item.type,
+        text: truncateForPrompt(event.item.text || "", 3000)
+      }
+    };
+  }
+  return compacted;
 }
 
 function compactRepairHistory(details) {
@@ -554,68 +723,97 @@ function compactRepairHistory(details) {
     recentEvents: (details.agentRunEvents || []).slice(0, 25).map(event => ({
       runId: event.runId,
       eventType: event.eventType,
-      payload: event.payload,
+      payload: compactRepairEventPayload(event),
       createdAt: event.createdAt
     }))
   };
 }
 
-function normalizeCapabilityText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function capabilityTerms(...values) {
-  const stopWords = new Set(["a", "an", "and", "or", "the", "to", "for", "of", "with", "by", "in", "on", "one", "exact", "tool", "mcp", "media", "capability", "capabilities", "expose"]);
-  return [...new Set(values
-    .flatMap(value => normalizeCapabilityText(value).split(" "))
-    .filter(term => term.length >= 3 && !stopWords.has(term)))];
-}
-
-function detectMissingMcpCapability(item, tools) {
-  const suggestedToolName = String(item.suggestedToolName || "").trim();
-  const normalizedSuggested = normalizeCapabilityText(suggestedToolName);
-  const normalizedSuggestedUnderscore = suggestedToolName.toLowerCase();
-  const exact = tools.find(tool => {
-    const name = String(tool.name || "").toLowerCase();
-    return name && (name === normalizedSuggestedUnderscore || normalizeCapabilityText(name) === normalizedSuggested);
-  });
-  if (exact) {
-    return {
-      detected: true,
-      matchType: "suggested_tool_name",
-      toolName: exact.name,
-      toolTitle: exact.title || exact.name,
-      reason: `Live media-mcp tools/list includes ${exact.name}.`
-    };
+function parseJsonObjectFromModel(output, label) {
+  const trimmed = String(output || "").trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  const candidates = [trimmed];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
   }
-  const itemTerms = capabilityTerms(item.title, item.description, item.category);
-  if (itemTerms.length < 3) {
-    return { detected: false };
-  }
-  let best = null;
-  for (const tool of tools) {
-    const toolText = normalizeCapabilityText([tool.name, tool.title, tool.description].filter(Boolean).join(" "));
-    const matchedTerms = itemTerms.filter(term => toolText.includes(term));
-    const categoryMatch = item.category && toolText.includes(normalizeCapabilityText(item.category));
-    const score = matchedTerms.length + (categoryMatch ? 1 : 0);
-    if (score >= 4 && (!best || score > best.score)) {
-      best = { tool, score, matchedTerms };
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`${label} must be a JSON object`);
+      }
+      return parsed;
+    } catch (error) {
+      lastError = error;
     }
   }
-  if (best) {
-    return {
-      detected: true,
-      matchType: "description_overlap",
-      toolName: best.tool.name,
-      toolTitle: best.tool.title || best.tool.name,
-      reason: `Live media-mcp tool ${best.tool.name} overlaps this requested capability.`
-    };
+  throw new Error(`${label} did not return valid JSON: ${lastError?.message || "unknown parse error"}`);
+}
+
+function normalizeMcpToolNameForLookup(value) {
+  const name = String(value || "").trim().toLowerCase();
+  return name.startsWith("media.") ? name.slice("media.".length) : name;
+}
+
+function parseMcpCapabilityCheckResult(output, items, tools) {
+  const parsed = parseJsonObjectFromModel(output, "MCP capability check agent");
+  const rawResults = Array.isArray(parsed.results) ? parsed.results : [];
+  const toolsByName = new Map(tools.map(tool => [normalizeMcpToolNameForLookup(tool.name), tool]).filter(([name]) => name));
+  const resultsByItemId = new Map();
+  for (const raw of rawResults) {
+    const itemId = Number(raw?.itemId);
+    if (!Number.isInteger(itemId)) {
+      continue;
+    }
+    const requestedToolName = String(raw?.toolName || "").trim();
+    const requestedLookupName = normalizeMcpToolNameForLookup(requestedToolName);
+    const availableTool = requestedLookupName ? toolsByName.get(requestedLookupName) : null;
+    let detected = raw?.detected === true;
+    let matchType = String(raw?.matchType || (detected ? "agent_reasoned" : "not_detected")).trim() || "not_detected";
+    let reason = String(raw?.reason || "").trim();
+    if (detected && !availableTool) {
+      detected = false;
+      matchType = "not_detected";
+      reason = requestedToolName
+        ? `Capability check agent cited ${requestedToolName}, but that tool is not present in live media-mcp tools/list.`
+        : "Capability check agent marked this detected without naming an available tool.";
+    }
+    resultsByItemId.set(itemId, {
+      detected,
+      toolName: detected ? availableTool.name : (requestedToolName || null),
+      toolTitle: detected ? availableTool.title || availableTool.name : null,
+      matchType,
+      confidence: String(raw?.confidence || "").trim() || null,
+      reason: reason || (detected
+        ? `Capability check agent determined ${availableTool.name} satisfies this request.`
+        : "Capability check agent did not find an available MCP tool that satisfies this request.")
+    });
   }
-  return { detected: false };
+  return {
+    summary: String(parsed.summary || "").trim(),
+    results: items.map(item => {
+      const detection = resultsByItemId.get(Number(item.id)) || {
+        detected: false,
+        toolName: null,
+        toolTitle: null,
+        matchType: "not_detected",
+        confidence: null,
+        reason: "Capability check agent did not return a decision for this request."
+      };
+      return {
+        itemId: item.id,
+        title: item.title,
+        suggestedToolName: item.suggestedToolName || null,
+        category: item.category || null,
+        ...detection
+      };
+    })
+  };
 }
 
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
@@ -788,11 +986,13 @@ export class MediaIssueAgent {
           this.diagnostic("warn", "interrupted_repair_runs_recovered", { count: recovered });
           recordAudit(this.config.dbPath, "interrupted_repair_runs_recovered", sanitizeValue({ count: recovered }));
         }
-        this.diagnostic("info", "agent_initialized", {
-          dbPath: this.config.dbPath,
-          logPath: this.config.logPath,
-          recoverStaleRunSeconds: this.config.recoverStaleRunSeconds
-        });
+        if (!this.config.suppressInitLog) {
+          this.diagnostic("info", "agent_initialized", {
+            dbPath: this.config.dbPath,
+            logPath: this.config.logPath,
+            recoverStaleRunSeconds: this.config.recoverStaleRunSeconds
+          });
+        }
       })();
     }
     await this.initPromise;
@@ -867,9 +1067,11 @@ export class MediaIssueAgent {
   async checkMissingMcpCapabilities(actor = "operator") {
     await this.init();
     const items = this.missingMcpItems();
+    const startedAt = Date.now();
     this.diagnostic("info", "missing_mcp_capability_check_started", {
       actor,
-      itemCount: items.length
+      itemCount: items.length,
+      mode: "codex_agent"
     });
     let tools;
     try {
@@ -881,22 +1083,35 @@ export class MediaIssueAgent {
       });
       throw error;
     }
-    const results = items.map(item => {
-      const detection = detectMissingMcpCapability(item, tools);
-      return {
-        itemId: item.id,
-        title: item.title,
-        suggestedToolName: item.suggestedToolName || null,
-        category: item.category || null,
-        ...detection
-      };
-    });
+    let output;
+    let parsed;
+    const settings = this.codexSettings().effective;
+    try {
+      output = await runCodexMcpCapabilityCheck(this.config, items, tools, settings, {
+        onEvent: event => this.diagnostic("debug", "missing_mcp_capability_agent_event", { event })
+      });
+      parsed = parseMcpCapabilityCheckResult(output.finalMessage, items, tools);
+    } catch (error) {
+      this.diagnostic("error", "missing_mcp_capability_check_failed", {
+        actor,
+        mode: "codex_agent",
+        error: error.message
+      });
+      throw error;
+    }
+    const results = parsed.results;
     const detected = results.filter(result => result.detected);
     this.diagnostic("info", "missing_mcp_capability_check_completed", {
       actor,
+      mode: "codex_agent",
       itemCount: items.length,
       toolCount: tools.length,
       detectedCount: detected.length,
+      durationMs: Date.now() - startedAt,
+      model: output.settings?.model,
+      reasoningEffort: output.settings?.reasoningEffort,
+      fastMode: output.settings?.fastMode,
+      summary: parsed.summary,
       detected: detected.map(result => ({
         itemId: result.itemId,
         toolName: result.toolName,
@@ -908,7 +1123,9 @@ export class MediaIssueAgent {
       toolCount: tools.length,
       items,
       results,
-      detectedItemIds: detected.map(result => result.itemId)
+      detectedItemIds: detected.map(result => result.itemId),
+      summary: parsed.summary,
+      mode: "codex_agent"
     };
   }
 
@@ -1355,12 +1572,31 @@ export class MediaIssueAgent {
       throw new Error(`Job ${jobId} has a pending resolution approval; approve it to retry closure actions.`);
     }
     const actionApproval = this.jobDetails(jobId).approvals.find(approval => approval.kind === "action" && approval.status === "approved");
-    if (!actionApproval || actionApproval.payload?.plan?.executionMode !== "approved_repair_agent") {
-      throw new Error(`Job ${jobId} has no approved autonomous repair prompt to revise`);
-    }
     const retryNote = redactText(String(note || "").trim());
     if (!retryNote) {
-      throw new Error("Repair steering note is required");
+      const pendingAction = pendingApprovalForJob(this.config.dbPath, jobId, "action");
+      if (pendingAction?.payload?.plan?.executionMode === "approved_repair_agent") {
+        this.diagnostic("info", "repair_retry_same_investigation_started", {
+          jobId,
+          actor,
+          approvalId: pendingAction.id
+        });
+        recordAudit(this.config.dbPath, "repair_retry_same_investigation_started", sanitizeValue({ actor, approvalId: pendingAction.id }), jobId);
+        return this.approve(jobId, actor);
+      }
+      if (actionApproval?.payload?.plan?.executionMode === "approved_repair_agent" && ["failed_retryable", "failed_terminal"].includes(job.state)) {
+        this.diagnostic("info", "repair_retry_same_investigation_started", {
+          jobId,
+          actor,
+          approvalId: actionApproval.id
+        });
+        recordAudit(this.config.dbPath, "repair_retry_same_investigation_started", sanitizeValue({ actor, approvalId: actionApproval.id }), jobId);
+        return this.executeApprovedPlan(jobId, actor);
+      }
+      throw new Error(`Job ${jobId} has no autonomous repair prompt to retry`);
+    }
+    if (!actionApproval || actionApproval.payload?.plan?.executionMode !== "approved_repair_agent") {
+      throw new Error(`Job ${jobId} has no approved autonomous repair prompt to revise`);
     }
     this.diagnostic("info", "repair_retry_converted_to_investigation_steering", {
       jobId,
@@ -1474,13 +1710,19 @@ export class MediaIssueAgent {
         "Do not post reporter comments or close the issue; media-issue-agent will request final human approval for that."
       ]
     };
-    const prompt = repairExecutionPrompt({
+    const compactEvidence = compactForRepairPrompt({
       job: details.job,
-      investigation: details.investigation,
+      investigation: {
+        status: details.investigation?.status,
+        summary: details.investigation?.summary,
+        error: details.investigation?.error,
+        updatedAt: details.investigation?.updatedAt,
+        evidence: details.investigation?.evidence
+      },
       approvedBy: actor,
-      originalEvidence: payload.evidence,
       retryRequested: Boolean(retryNote)
-    }, approvedPlan, {
+    });
+    const prompt = repairExecutionPrompt(compactEvidence, approvedPlan, {
       runtimeContext: settings.repairContext,
       scratchWorkspace: workspace,
       toolBriefing,
@@ -1490,6 +1732,14 @@ export class MediaIssueAgent {
         previousJobError: details.job.lastError || "",
         guidance: "Use this trusted note to retry the already approved repair. Do not require a new investigation unless evidence is missing."
       } : null
+    });
+    this.diagnostic("info", "repair_prompt_prepared", {
+      jobId,
+      actor,
+      promptLength: prompt.length,
+      compactedEvidenceLength: JSON.stringify(compactEvidence).length,
+      toolCount: toolBriefing?.tools?.length || 0,
+      retry: Boolean(retryNote)
     });
     return { prompt, workspace, settings, toolBriefing };
   }
@@ -1558,7 +1808,7 @@ export class MediaIssueAgent {
         codexWorkspace: workspace,
         onEvent: event => {
           const eventType = event?.type || "event";
-          recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, sanitizeValue(event));
+          recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, sanitizeValue(compactAgentRunEventForStorage(event)));
           this.diagnostic("debug", "repair_agent_event", {
             jobId,
             runId: agentRun.id,

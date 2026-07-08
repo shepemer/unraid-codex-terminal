@@ -52,8 +52,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     requireCodexAuth: ["investigate", "approve", "continue", "steer"].includes(command),
     requireWebPassword: ["serve", "web"].includes(command)
   });
+  if (command === "status") {
+    config.suppressInitLog = true;
+  }
   const agent = new MediaIssueAgent(config);
-  await agent.init();
+  if (command !== "status") {
+    await agent.init();
+  }
 
   if (command === "serve") {
     await agent.serve();

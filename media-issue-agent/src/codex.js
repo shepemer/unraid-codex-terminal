@@ -235,6 +235,28 @@ export function repairExecutionPrompt(evidence, approvedPlan, context = {}) {
   ].join("\n");
 }
 
+export function mcpCapabilityCheckPrompt(items, tools) {
+  return [
+    "MCP capability gap audit.",
+    "You are Codex running inside media-issue-agent with access to the same media MCP server configuration used by autonomous repair runs.",
+    "Your job is only to compare requested missing MCP capabilities against the current available media MCP tools.",
+    "Do not repair media, do not call mutating tools, do not post comments, and do not close or reopen issues.",
+    "Reason from each request's title, description, category, reason, and surrounding context. The suggestedToolName field is only a historical hint and may be wrong or incomplete.",
+    "Mark a request detected only when the available tools can satisfy the requested capability well enough for the repair runner to use it.",
+    "Do not mark a capability detected merely because a suggested tool name appears; compare the request intent and context against tool names and descriptions.",
+    "If available tools only partially satisfy a request, set detected false with matchType partial and explain the blocker.",
+    "Return strict JSON only with this shape:",
+    "{\"summary\":\"short audit summary\",\"results\":[{\"itemId\":123,\"detected\":true,\"toolName\":\"available_tool_name_or_null\",\"matchType\":\"agent_reasoned|partial|not_detected\",\"confidence\":\"high|medium|low\",\"reason\":\"why this available tool does or does not satisfy the requested capability\"}]}",
+    "Include exactly one results entry for every requested itemId.",
+    "",
+    "Requested missing MCP items JSON with untrusted text marked:",
+    JSON.stringify(promptPayload(items), null, 2),
+    "",
+    "Current live media MCP tools/list JSON:",
+    JSON.stringify(sanitizeValue(tools), null, 2)
+  ].join("\n");
+}
+
 function tomlValue(value) {
   if (typeof value === "boolean") {
     return value ? "true" : "false";
@@ -644,4 +666,9 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
     await proxy?.close();
     await rm(outputDir, { recursive: true, force: true });
   }
+}
+
+export async function runCodexMcpCapabilityCheck(config, items, tools, settings = {}, hooks = {}) {
+  const prompt = mcpCapabilityCheckPrompt(items, tools);
+  return runCodexRepair(config, prompt, settings, hooks);
 }
