@@ -8,9 +8,11 @@ import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import {
   createApproval,
+  createAgentRun,
   ensureJob,
   initDb,
   insertSnapshot,
+  recordAgentRunEvent,
   setPendingApprovals,
   transitionJob,
   upsertMissingMcpItems,
@@ -87,14 +89,19 @@ async function startFakeMediaMcp(issues) {
       if (body.method === "tools/list") {
         calls.push({ name: "tools/list", args: {} });
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(jsonRpcResult(body.id, {
-          tools: [
-            { name: "media_diagnose_issue", description: "Collect read-only diagnostics for a media issue." },
-            { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." },
-            { name: "seerr_resolve_issue", description: "Resolve a Seerr issue after approval." },
-            { name: "seerr_reopen_issue", description: "Reopen a Seerr issue after approval." }
-          ]
-        })));
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            tools: [
+              { name: "media_diagnose_issue", description: "Collect read-only diagnostics for a media issue." },
+              { name: "sonarr_replace_fixture_episode", description: "Replace a fixture episode for MCP gap detection tests." },
+              { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." },
+              { name: "seerr_resolve_issue", description: "Resolve a Seerr issue after approval." },
+              { name: "seerr_reopen_issue", description: "Reopen a Seerr issue after approval." }
+            ]
+          }
+        }));
         return;
       }
       if (body.method !== "tools/call") {
@@ -316,6 +323,14 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
     await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
     await expect(page.locator("#mcp-gaps-list")).toContainText("sonarr_replace_fixture_episode");
+    await page.locator("#mcp-gaps-check-button").click();
+    await expect(page.locator(".mcp-gap-detected")).toHaveText("DETECTED");
+    await expect(page.locator("[data-remove-mcp-gap]")).toHaveClass(/detected/);
+    await page.locator("#mcp-gaps-close-button").click();
+    await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
+    await page.locator("#mcp-gaps-button").click();
+    await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
+    await expect(page.locator(".mcp-gap-detected")).toHaveCount(0);
     await page.locator("[data-remove-mcp-gap]").click();
     await expect(page.locator("#mcp-gaps-list")).toContainText("No active missing MCP items");
     await page.locator("#mcp-gaps-close-button").click();
@@ -332,7 +347,7 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 5).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(row(page, 5).getByRole("button", { name: "Close" })).toHaveCount(0);
     await expect(row(page, 5)).toHaveClass(/issue-closed/);
-    await expect(row(page, 6).getByRole("button", { name: "Retry repair" })).toBeVisible();
+    await expect(row(page, 6).getByRole("button", { name: "Review repair" })).toBeVisible();
     await expect(row(page, 6).getByRole("button", { name: "Re-investigate" })).toHaveCount(0);
 
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
@@ -379,10 +394,11 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#work-area")).not.toHaveClass(/detail-open/);
     await expect(row(page, 5)).not.toHaveClass(/issue-active/);
 
-    await row(page, 6).getByRole("button", { name: "Retry repair" }).click();
+    await row(page, 6).getByRole("button", { name: "Review repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
     await expect(page.locator("#investigation-output")).toContainText("Failed");
-    await expect(page.locator("#repair-retry-panel")).toBeVisible();
+    await expect(page.locator("#steer-panel")).toBeVisible();
+    await expect(page.locator("#approval-actions")).toBeHidden();
   } finally {
     await context?.close();
     await harness?.close();
@@ -400,6 +416,24 @@ async function testJobListRowsDoNotOverlap(browser) {
     harness = await startHarness(root, fakeMcp);
     const dbPath = harness.config.dbPath;
     await initDb(dbPath);
+    const activeJob = ensureJob(dbPath, "plex", "active-repair");
+    transitionJob(dbPath, activeJob.id, "detected", "executing");
+    const activeRun = createAgentRun(dbPath, activeJob.id, "repair", "Fixture repair prompt", { model: "fixture-model" });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "repair_mcp_tool_call", {
+      type: "repair_mcp_tool_call",
+      toolName: "sonarr_replace_episode",
+      arguments: { episodeId: 1234, monitored: true }
+    });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "repair_mcp_tool_result", {
+      type: "repair_mcp_tool_result",
+      calls: [{ toolName: "sonarr_replace_episode" }],
+      status: 200,
+      result: { ok: true, summary: "Replacement request accepted by Sonarr." }
+    });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "item.completed", {
+      type: "item.completed",
+      item: { type: "mcp_tool_call", name: "media.plex_refresh_metadata", status: "completed" }
+    });
     for (let index = 0; index < 16; index += 1) {
       const issueId = index % 3 === 0
         ? `e293935c-859c-49e5-a782-a5bfce703950-${index}`
@@ -412,7 +446,30 @@ async function testJobListRowsDoNotOverlap(browser) {
     context = pageHandle.context;
     const page = pageHandle.page;
     await page.setViewportSize({ width: 720, height: 1100 });
-    await expect(page.locator(".job-row")).toHaveCount(16);
+    await expect(page.locator(".job-row")).toHaveCount(17);
+    await expect(page.locator(".job-row").first()).toHaveClass(/processing/);
+    await expect(page.locator(".job-row").first().locator(".job-main strong")).toHaveText("Issue repair");
+    await expect(page.locator(".job-row").first().locator(".job-main span")).toContainText(`Job ${activeJob.id} · Plex issue active-repair`);
+    await page.locator(".job-row").first().click();
+    await expect(page.locator("#investigation-output")).toContainText("Live repair activity:");
+    await expect(page.locator("#investigation-output")).toContainText("Run 1 · repair · running · model fixture-model");
+    await expect(page.locator("#investigation-output")).toContainText("Calling sonarr_replace_episode");
+    await expect(page.locator("#investigation-output")).toContainText("Result from sonarr_replace_episode: HTTP 200");
+    await expect(page.locator("#investigation-output")).toContainText("accepted by Sonarr");
+    await expect(page.locator("#investigation-output")).toContainText("Codex completed plex_refresh_metadata");
+    await expect(page.locator("#investigation-output")).not.toContainText('"toolName"');
+    await page.locator("#investigation-output").evaluate(element => {
+      element.scrollTop = element.scrollHeight;
+    });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "stdout", {
+      type: "stdout",
+      text: "fresh activity marker after background refresh"
+    });
+    await expect(page.locator("#investigation-output")).toContainText("activity marker after background", { timeout: 4000 });
+    const bottomGap = await page.locator("#investigation-output").evaluate(element => {
+      return element.scrollHeight - element.scrollTop - element.clientHeight;
+    });
+    assert.ok(bottomGap < 48, `Expected output scroll to stay near bottom, got gap ${bottomGap}`);
 
     const layout = await page.evaluate(() => {
       return [...document.querySelectorAll(".job-row")].slice(0, 12).map((row, index) => {
@@ -519,11 +576,50 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 2);
 
-    await page.locator("#steer-input").fill("Treat this as a client-side app issue with no server-side action.");
+    const emptySteeringBox = await page.locator("#steer-input").evaluate(element => {
+      const style = window.getComputedStyle(element);
+      return {
+        height: element.getBoundingClientRect().height,
+        lineHeight: Number.parseFloat(style.lineHeight),
+        paddingTop: Number.parseFloat(style.paddingTop),
+        paddingBottom: Number.parseFloat(style.paddingBottom),
+        borderTop: Number.parseFloat(style.borderTopWidth),
+        borderBottom: Number.parseFloat(style.borderBottomWidth)
+      };
+    });
+    const oneRowHeight = emptySteeringBox.lineHeight
+      + emptySteeringBox.paddingTop
+      + emptySteeringBox.paddingBottom
+      + emptySteeringBox.borderTop
+      + emptySteeringBox.borderBottom
+      + 2;
+    assert.ok(emptySteeringBox.height <= oneRowHeight, JSON.stringify(emptySteeringBox));
+    await page.locator("#steer-input").fill("Treat this as a client-side app issue with no server-side action.\nMention that the user should restart the app.");
+    const steeringBox = await page.locator("#steer-input").evaluate(element => {
+      const style = window.getComputedStyle(element);
+      return {
+        height: element.getBoundingClientRect().height,
+        lineHeight: Number.parseFloat(style.lineHeight),
+        paddingTop: Number.parseFloat(style.paddingTop),
+        paddingBottom: Number.parseFloat(style.paddingBottom),
+        borderTop: Number.parseFloat(style.borderTopWidth),
+        borderBottom: Number.parseFloat(style.borderBottomWidth)
+      };
+    });
+    const fiveRowMax = (steeringBox.lineHeight * 5)
+      + steeringBox.paddingTop
+      + steeringBox.paddingBottom
+      + steeringBox.borderTop
+      + steeringBox.borderBottom
+      + 2;
+    assert.ok(steeringBox.height <= fiveRowMax, JSON.stringify(steeringBox));
     await page.locator("#steer-button").click();
+    await expect(page.locator("#steer-input")).toHaveValue("");
     await expect(page.locator("#investigation-output")).toContainText("Revised investigation");
     await expect(page.locator("#investigation-output")).toContainText("Pending action approval");
     await expect(page.locator("#investigation-output")).toContainText("No server-side repair will run");
+    await expect(page.locator("#investigation-output")).toContainText("Steering history:");
+    await expect(page.locator("#investigation-output")).toContainText("Mention that the user should restart the app.");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 3);
 
     await page.locator("#approve-button").click();
@@ -1046,9 +1142,10 @@ async function testMobileSeededApprovalRejectAndRetryControls(browser) {
     await page.locator("#detail-close-button").click();
     await page.locator("#activity-drawer-button").click();
     await page.locator(`[data-job-id="${retryJob.id}"]`).click();
-    await expect(page.locator("#repair-retry-panel")).toBeVisible();
-    await page.locator("#repair-retry-input").fill("Try again with the synthetic mobile note.");
-    await expect(page.locator("#repair-retry-button")).toBeEnabled();
+    await expect(page.locator("#repair-retry-panel")).toBeHidden();
+    await expect(page.locator("#steer-panel")).toBeVisible();
+    await page.locator("#steer-input").fill("Revise the failed mobile repair plan.");
+    await expect(page.locator("#steer-button")).toBeEnabled();
     await assertMobileDetailSheet(page);
     await assertNoHorizontalOverflow(page);
   } finally {

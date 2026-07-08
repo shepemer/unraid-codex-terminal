@@ -449,12 +449,13 @@ async function testDelegatingDraftRejectedBeforeFallback() {
     }];
     const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
-    await assert.rejects(
-      () => agent.approve(investigated.jobId, "fixture"),
-      /Draft resolution delegated/
-    );
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
+    assert.match(returned.message, /Review or steer the investigation/);
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /Draft resolution delegated/);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });

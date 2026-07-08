@@ -21,6 +21,7 @@ RUN groupmod -n mcp node \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        ffmpeg \
         libgnutls30 \
         p7zip-full \
         unrar \

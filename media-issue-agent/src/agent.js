@@ -121,6 +121,52 @@ function splitInlineActionText(value) {
     .filter(Boolean);
 }
 
+function steeringHistoryFromEvidence(evidence = {}) {
+  const history = Array.isArray(evidence?.steeringHistory)
+    ? evidence.steeringHistory
+    : [];
+  const entries = history
+    .filter(entry => entry && typeof entry === "object" && String(entry.message || "").trim())
+    .map((entry, index) => ({
+      sequence: Number(entry.sequence) || index + 1,
+      createdAt: entry.createdAt || null,
+      actor: entry.actor || "operator",
+      message: String(entry.message || "").trim(),
+      previousSummary: entry.previousSummary || ""
+    }));
+  if (!entries.length && evidence?.steering?.message) {
+    entries.push({
+      sequence: Number(evidence.steering.sequence) || 1,
+      createdAt: evidence.steering.createdAt || null,
+      actor: evidence.steering.actor || "operator",
+      message: String(evidence.steering.message || "").trim(),
+      previousSummary: evidence.steering.previousSummary || ""
+    });
+  }
+  return entries;
+}
+
+function appendSteeringToEvidence(evidence, { actor, message, previousSummary }) {
+  const history = steeringHistoryFromEvidence(evidence);
+  const entry = {
+    sequence: history.length + 1,
+    createdAt: new Date().toISOString(),
+    actor: actor || "operator",
+    message,
+    previousSummary: previousSummary || ""
+  };
+  return sanitizeValue({
+    ...(evidence || {}),
+    steering: entry,
+    steeringHistory: [...history, entry]
+  });
+}
+
+function latestSteeringMessage(evidence = {}) {
+  const history = steeringHistoryFromEvidence(evidence);
+  return history.at(-1)?.message || "";
+}
+
 function extractInvestigationActionSteps(summary) {
   const lines = String(summary || "").split(/\r?\n/);
   const steps = [];
@@ -514,6 +560,64 @@ function compactRepairHistory(details) {
   };
 }
 
+function normalizeCapabilityText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function capabilityTerms(...values) {
+  const stopWords = new Set(["a", "an", "and", "or", "the", "to", "for", "of", "with", "by", "in", "on", "one", "exact", "tool", "mcp", "media", "capability", "capabilities", "expose"]);
+  return [...new Set(values
+    .flatMap(value => normalizeCapabilityText(value).split(" "))
+    .filter(term => term.length >= 3 && !stopWords.has(term)))];
+}
+
+function detectMissingMcpCapability(item, tools) {
+  const suggestedToolName = String(item.suggestedToolName || "").trim();
+  const normalizedSuggested = normalizeCapabilityText(suggestedToolName);
+  const normalizedSuggestedUnderscore = suggestedToolName.toLowerCase();
+  const exact = tools.find(tool => {
+    const name = String(tool.name || "").toLowerCase();
+    return name && (name === normalizedSuggestedUnderscore || normalizeCapabilityText(name) === normalizedSuggested);
+  });
+  if (exact) {
+    return {
+      detected: true,
+      matchType: "suggested_tool_name",
+      toolName: exact.name,
+      toolTitle: exact.title || exact.name,
+      reason: `Live media-mcp tools/list includes ${exact.name}.`
+    };
+  }
+  const itemTerms = capabilityTerms(item.title, item.description, item.category);
+  if (itemTerms.length < 3) {
+    return { detected: false };
+  }
+  let best = null;
+  for (const tool of tools) {
+    const toolText = normalizeCapabilityText([tool.name, tool.title, tool.description].filter(Boolean).join(" "));
+    const matchedTerms = itemTerms.filter(term => toolText.includes(term));
+    const categoryMatch = item.category && toolText.includes(normalizeCapabilityText(item.category));
+    const score = matchedTerms.length + (categoryMatch ? 1 : 0);
+    if (score >= 4 && (!best || score > best.score)) {
+      best = { tool, score, matchedTerms };
+    }
+  }
+  if (best) {
+    return {
+      detected: true,
+      matchType: "description_overlap",
+      toolName: best.tool.name,
+      toolTitle: best.tool.title || best.tool.name,
+      reason: `Live media-mcp tool ${best.tool.name} overlaps this requested capability.`
+    };
+  }
+  return { detected: false };
+}
+
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
 function normalizeCodexSettings(values = {}, defaults = {}) {
@@ -758,6 +862,54 @@ export class MediaIssueAgent {
 
   missingMcpItems() {
     return listMissingMcpItems(this.config.dbPath);
+  }
+
+  async checkMissingMcpCapabilities(actor = "operator") {
+    await this.init();
+    const items = this.missingMcpItems();
+    this.diagnostic("info", "missing_mcp_capability_check_started", {
+      actor,
+      itemCount: items.length
+    });
+    let tools;
+    try {
+      tools = typeof this.client.listTools === "function" ? await this.client.listTools() : [];
+    } catch (error) {
+      this.diagnostic("error", "missing_mcp_capability_check_failed", {
+        actor,
+        error: error.message
+      });
+      throw error;
+    }
+    const results = items.map(item => {
+      const detection = detectMissingMcpCapability(item, tools);
+      return {
+        itemId: item.id,
+        title: item.title,
+        suggestedToolName: item.suggestedToolName || null,
+        category: item.category || null,
+        ...detection
+      };
+    });
+    const detected = results.filter(result => result.detected);
+    this.diagnostic("info", "missing_mcp_capability_check_completed", {
+      actor,
+      itemCount: items.length,
+      toolCount: tools.length,
+      detectedCount: detected.length,
+      detected: detected.map(result => ({
+        itemId: result.itemId,
+        toolName: result.toolName,
+        matchType: result.matchType
+      }))
+    });
+    return {
+      checkedAt: new Date().toISOString(),
+      toolCount: tools.length,
+      items,
+      results,
+      detectedItemIds: detected.map(result => result.itemId)
+    };
   }
 
   removeMissingMcpItem(itemId, actor = "operator") {
@@ -1075,6 +1227,7 @@ export class MediaIssueAgent {
     const allowedStates = new Set([
       "awaiting_action_approval",
       "failed_retryable",
+      "failed_terminal",
       "blocked_needs_human"
     ]);
     if (!allowedStates.has(job.state)) {
@@ -1084,6 +1237,7 @@ export class MediaIssueAgent {
     transitionJob(this.config.dbPath, jobId, [
       "awaiting_action_approval",
       "failed_retryable",
+      "failed_terminal",
       "blocked_needs_human"
     ], "investigating");
     supersedePendingApprovals(this.config.dbPath, jobId, "action");
@@ -1093,13 +1247,10 @@ export class MediaIssueAgent {
       messageLength: operatorMessage.length
     });
     recordAudit(this.config.dbPath, "operator_steered_investigation", sanitizeValue({ actor, message: operatorMessage }), jobId);
-    const evidence = sanitizeValue({
-      ...current.evidence,
-      steering: {
-        actor,
-        message: operatorMessage,
-        previousSummary: current.summary
-      }
+    const evidence = appendSteeringToEvidence(current.evidence, {
+      actor,
+      message: operatorMessage,
+      previousSummary: current.summary
     });
     let summary;
     try {
@@ -1195,31 +1346,77 @@ export class MediaIssueAgent {
   }
 
   async retryRepair(jobId, note, actor = "operator") {
+    await this.init();
     const job = jobForId(this.config.dbPath, jobId);
     if (!job) {
       throw new Error(`Job ${jobId} was not found`);
-    }
-    if (!["failed_retryable", "failed_terminal"].includes(job.state)) {
-      throw new Error(`Job ${jobId} cannot retry repair from ${job.state}`);
     }
     if (pendingApprovalForJob(this.config.dbPath, jobId, "resolution")) {
       throw new Error(`Job ${jobId} has a pending resolution approval; approve it to retry closure actions.`);
     }
     const actionApproval = this.jobDetails(jobId).approvals.find(approval => approval.kind === "action" && approval.status === "approved");
     if (!actionApproval || actionApproval.payload?.plan?.executionMode !== "approved_repair_agent") {
-      throw new Error(`Job ${jobId} has no approved autonomous repair prompt to retry`);
+      throw new Error(`Job ${jobId} has no approved autonomous repair prompt to revise`);
     }
     const retryNote = redactText(String(note || "").trim());
     if (!retryNote) {
-      throw new Error("Repair retry note is required");
+      throw new Error("Repair steering note is required");
     }
-    this.diagnostic("info", "repair_retry_requested", {
+    this.diagnostic("info", "repair_retry_converted_to_investigation_steering", {
       jobId,
       actor,
       noteLength: retryNote.length
     });
-    recordAudit(this.config.dbPath, "repair_retry_requested", sanitizeValue({ actor, note: retryNote }), jobId);
-    return this.executeApprovedPlan(jobId, actor, { repairRetryNote: retryNote });
+    recordAudit(this.config.dbPath, "repair_retry_converted_to_investigation_steering", sanitizeValue({ actor, note: retryNote }), jobId);
+    return this.steerInvestigation(jobId, retryNote, actor);
+  }
+
+  returnRepairToInvestigationReview(jobId, actor, message, context = {}) {
+    const details = this.jobDetails(jobId);
+    if (!details?.investigation) {
+      setJobState(this.config.dbPath, jobId, "failed_retryable", message);
+      throw new Error(`${message}; no cached investigation is available to revise.`);
+    }
+    const failureContext = sanitizeValue({
+      actor,
+      message,
+      agentRunId: context.agentRunId || null,
+      repairResult: context.repairResult || null,
+      returnedAt: new Date().toISOString()
+    });
+    const evidence = sanitizeValue({
+      ...(details.investigation.evidence || {}),
+      previousRepairFailure: failureContext
+    });
+    const investigation = upsertInvestigation(this.config.dbPath, jobId, {
+      status: "ready",
+      summary: details.investigation.summary,
+      evidence
+    });
+    supersedePendingApprovals(this.config.dbPath, jobId, "action");
+    const approval = createApproval(this.config.dbPath, jobId, "action", buildPlan(details.job, evidence, investigation.summary));
+    setJobState(this.config.dbPath, jobId, "awaiting_action_approval", message);
+    this.diagnostic("warn", "repair_returned_to_investigation_review", {
+      jobId,
+      actor,
+      approvalId: approval.id,
+      agentRunId: context.agentRunId || null,
+      message
+    });
+    recordAudit(this.config.dbPath, "repair_returned_to_investigation_review", sanitizeValue({
+      actor,
+      approvalId: approval.id,
+      agentRunId: context.agentRunId || null,
+      message
+    }), jobId);
+    return {
+      jobId,
+      status: "awaiting_action_approval",
+      approvalId: approval.id,
+      approvalKind: "action",
+      message: "Repair did not complete. Review or steer the investigation, then approve the revised repair plan.",
+      summary: investigation.summary
+    };
   }
 
   async continueJob(jobId, actor = "operator", context = {}) {
@@ -1268,7 +1465,7 @@ export class MediaIssueAgent {
       issueId: payload.issueId || details.job.issueId,
       classification: plan.classification || "server_action",
       summary: payload.summary || details.investigation?.summary || "",
-      operatorMessage: payload.evidence?.steering?.message || "",
+      operatorMessage: latestSteeringMessage(payload.evidence),
       instructions: [
         "Use media-mcp directly through the configured Codex MCP server named media.",
         "Investigate, repair, and verify the approved issue as far as the available media tools allow.",
@@ -1428,8 +1625,10 @@ export class MediaIssueAgent {
           proposedChoices: repairResult.proposedChoices
         });
         recordAudit(this.config.dbPath, "repair_agent_needs_operator_decision", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
-        setJobState(this.config.dbPath, jobId, "failed_retryable", redactText(message));
-        throw new Error(message);
+        return this.returnRepairToInvestigationReview(jobId, actor, redactText(message), {
+          agentRunId: agentRun.id,
+          repairResult
+        });
       }
       if (repairResult.status === "failed_retryable" || repairResult.status === "failed_terminal") {
         const message = repairResult.summary || `Repair runner returned ${repairResult.status}`;
@@ -1442,8 +1641,10 @@ export class MediaIssueAgent {
           missingMcpItemCount: repairResult.missingMcpItems.length
         });
         recordAudit(this.config.dbPath, "repair_agent_failed", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
-        setJobState(this.config.dbPath, jobId, repairResult.status, redactText(message));
-        throw new Error(message);
+        return this.returnRepairToInvestigationReview(jobId, actor, redactText(message), {
+          agentRunId: agentRun.id,
+          repairResult
+        });
       }
     } catch (error) {
       const message = redactText(error.message);
@@ -1458,8 +1659,11 @@ export class MediaIssueAgent {
       });
       recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, runId: agentRun.id, error: error.message }), jobId);
       const current = jobForId(this.config.dbPath, jobId);
-      if (current?.state !== "failed_retryable" && current?.state !== "failed_terminal") {
-        setJobState(this.config.dbPath, jobId, "failed_retryable", message);
+      if (current?.state !== "awaiting_action_approval") {
+        return this.returnRepairToInvestigationReview(jobId, actor, message, {
+          agentRunId: agentRun.id,
+          repairResult
+        });
       }
       throw error;
     } finally {
@@ -1511,36 +1715,44 @@ export class MediaIssueAgent {
     }
     if (textDelegatesOwnerWork(draft)) {
       const note = "Draft resolution delegated media-side work back to the server owner/operator.";
-      transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
       this.diagnostic("error", "resolution_draft_rejected", {
         jobId,
         actor,
         reason: note
       });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message: draft }), jobId);
-      throw new Error(note);
+      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+        agentRunId: executionResult?.agentRunId || null,
+        repairResult: executionResult
+      });
     }
     const message = normalizeDraftComment(details.job.source, draft, executionResult);
     if (textDelegatesOwnerWork(message)) {
       const note = "Draft resolution delegated media-side work back to the server owner/operator.";
-      transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
       this.diagnostic("error", "resolution_draft_rejected", {
         jobId,
         actor,
         reason: note
       });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message }), jobId);
-      throw new Error(note);
+      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+        agentRunId: executionResult?.agentRunId || null,
+        repairResult: executionResult
+      });
     }
     const validation = validateDraftComment(details.job.source, message);
     if (!validation.valid) {
-      transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", validation.errors.join("; "));
+      const note = validation.errors.join("; ");
       this.diagnostic("error", "resolution_draft_validation_failed", {
         jobId,
         actor,
         errors: validation.errors
       });
-      throw new Error(`Draft comment failed validation: ${validation.errors.join("; ")}`);
+      recordAudit(this.config.dbPath, "resolution_draft_validation_failed", sanitizeValue({ actor, errors: validation.errors }), jobId);
+      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+        agentRunId: executionResult?.agentRunId || null,
+        repairResult: executionResult
+      });
     }
     const approval = createApproval(this.config.dbPath, jobId, "resolution", {
       source: details.job.source,

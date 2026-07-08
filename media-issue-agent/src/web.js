@@ -147,8 +147,8 @@ const HTML = `<!doctype html>
         </div>
         <pre id="investigation-output">Select an issue to investigate.</pre>
         <div id="steer-panel" class="steer-panel hidden">
-          <textarea id="steer-input" rows="3" placeholder="Steer the investigation"></textarea>
-          <button id="steer-button" type="button" class="secondary">Send</button>
+          <textarea id="steer-input" rows="1" placeholder="Steer the investigation or repair plan"></textarea>
+          <button id="steer-button" type="button" class="secondary">Update investigation</button>
         </div>
         <div id="repair-retry-panel" class="steer-panel hidden">
           <textarea id="repair-retry-input" rows="3" placeholder="Retry repair with trusted guidance"></textarea>
@@ -220,6 +220,9 @@ const HTML = `<!doctype html>
         <div>
           <span class="eyebrow">Media MCP</span>
           <h2 id="mcp-gaps-dialog-title">Missing MCP Items</h2>
+        </div>
+        <div class="toolbar">
+          <button id="mcp-gaps-check-button" type="button" class="secondary">Check MCP Capabilities</button>
         </div>
       </div>
       <div class="modal-body">
@@ -929,14 +932,17 @@ pre {
 
 .steer-panel textarea {
   width: 100%;
-  min-height: 76px;
+  min-height: 42px;
+  max-height: 132px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  resize: vertical;
+  resize: none;
   padding: 10px;
+  overflow-y: hidden;
   background: var(--panel-2);
   color: var(--text);
   font: inherit;
+  line-height: 1.35;
 }
 
 .steer-panel textarea:focus-visible {
@@ -1066,6 +1072,13 @@ pre {
   background: var(--panel-2);
 }
 
+.mcp-gap-item.detected {
+  border-color: color-mix(in srgb, var(--success) 48%, var(--line));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--success-soft) 48%, transparent), transparent 58%),
+    var(--panel-2);
+}
+
 .mcp-gap-title {
   margin: 0;
   color: var(--text);
@@ -1086,6 +1099,59 @@ pre {
 
 .mcp-gap-remove {
   min-width: 82px;
+}
+
+.mcp-gap-actions {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+.mcp-gap-remove.detected {
+  border-color: color-mix(in srgb, var(--success) 55%, var(--line));
+  background: color-mix(in srgb, var(--success) 26%, var(--panel));
+  color: color-mix(in srgb, var(--success) 72%, var(--text));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent);
+}
+
+.mcp-gap-detected {
+  position: relative;
+  isolation: isolate;
+  min-width: 82px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #9af3b1;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-align: center;
+  text-transform: uppercase;
+  overflow: hidden;
+}
+
+.mcp-gap-detected::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--success) 58%, transparent), transparent 68%),
+    color-mix(in srgb, var(--success) 22%, transparent);
+  animation: mcpDetectedPulse 1.35s ease-in-out infinite;
+}
+
+@keyframes mcpDetectedPulse {
+  0%, 100% {
+    opacity: 0.54;
+    transform: scale(0.96);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 42%, transparent);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.03);
+    box-shadow: 0 0 18px 4px color-mix(in srgb, var(--success) 30%, transparent);
+  }
 }
 
 .modal-backdrop.hidden {
@@ -1509,7 +1575,15 @@ pre {
     grid-template-columns: 1fr;
   }
 
+  .mcp-gap-actions {
+    justify-items: stretch;
+  }
+
   .mcp-gap-remove {
+    width: 100%;
+  }
+
+  .mcp-gap-detected {
     width: 100%;
   }
 
@@ -1563,6 +1637,8 @@ const JS = `const state = {
   authOk: false,
   loginRunning: false,
   codexSettings: null,
+  mcpGapItems: [],
+  mcpGapDetections: {},
   activityOpen: false,
   runnerSettingsOpen: false,
   authTimer: null,
@@ -1596,6 +1672,7 @@ const el = {
   mcpGapsButton: document.getElementById("mcp-gaps-button"),
   mcpGapsDialog: document.getElementById("mcp-gaps-dialog"),
   mcpGapsList: document.getElementById("mcp-gaps-list"),
+  mcpGapsCheckButton: document.getElementById("mcp-gaps-check-button"),
   mcpGapsCloseButton: document.getElementById("mcp-gaps-close-button"),
   runnerSettingsButton: document.getElementById("runner-settings-button"),
   runnerSettingsCloseButton: document.getElementById("runner-settings-close-button"),
@@ -1643,6 +1720,22 @@ const PROCESSING_JOB_STATES = new Set([
   "drafting_comment",
   "closing_issue"
 ]);
+
+function autoResizeSteerInput() {
+  if (!el.steerInput) {
+    return;
+  }
+  const input = el.steerInput;
+  input.style.height = "auto";
+  const styles = window.getComputedStyle(input);
+  const lineHeight = Number.parseFloat(styles.lineHeight) || 20;
+  const padding = (Number.parseFloat(styles.paddingTop) || 0) + (Number.parseFloat(styles.paddingBottom) || 0);
+  const border = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
+  const maxHeight = Math.ceil((lineHeight * 5) + padding + border);
+  const nextHeight = Math.min(input.scrollHeight + border, maxHeight);
+  input.style.height = \`\${nextHeight}px\`;
+  input.style.overflowY = input.scrollHeight + border > maxHeight ? "auto" : "hidden";
+}
 
 function toast(message) {
   el.toast.textContent = message;
@@ -1797,6 +1890,91 @@ function isProcessingState(stateName) {
   return PROCESSING_JOB_STATES.has(String(stateName || ""));
 }
 
+function jobActivityRank(job) {
+  const stateName = String(job?.state || "");
+  if (isProcessingState(stateName)) {
+    return 0;
+  }
+  if ([
+    "detected",
+    "queued_for_investigation",
+    "investigating",
+    "awaiting_action_approval",
+    "awaiting_comment_approval",
+    "awaiting_resolution_approval",
+    "posting_comment",
+    "failed_retryable",
+    "blocked_needs_human"
+  ].includes(stateName)) {
+    return 1;
+  }
+  if (stateName === "failed_terminal") {
+    return 2;
+  }
+  if (["closed", "dry_run_complete"].includes(stateName)) {
+    return 3;
+  }
+  return 2;
+}
+
+function jobUpdatedTime(job) {
+  const timestamp = Date.parse(job?.updatedAt || job?.createdAt || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortJobs(jobs) {
+  return [...(jobs || [])].sort((left, right) => {
+    const rank = jobActivityRank(left) - jobActivityRank(right);
+    if (rank !== 0) return rank;
+    const updated = jobUpdatedTime(right) - jobUpdatedTime(left);
+    if (updated !== 0) return updated;
+    return Number(right.id || 0) - Number(left.id || 0);
+  });
+}
+
+function sourceLabel(source) {
+  const normalized = String(source || "").toLowerCase();
+  if (normalized === "plex") return "Plex";
+  if (normalized === "seerr") return "Seerr";
+  return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : "Media";
+}
+
+function jobEntry(job) {
+  return state.entries.find(entry => Number(entry.jobId) === Number(job.id))
+    || state.entries.find(entry => entry.source === job.source && String(entry.issueId) === String(job.issueId))
+    || null;
+}
+
+function jobOperationLabel(job) {
+  const stateName = String(job?.state || "");
+  if (["detected", "queued_for_investigation", "investigating", "awaiting_action_approval"].includes(stateName)) {
+    return "Issue investigation";
+  }
+  if (["approved_for_execution", "executing", "waiting_for_plex_verification", "drafting_comment", "awaiting_resolution_approval", "failed_retryable", "failed_terminal"].includes(stateName)) {
+    return "Issue repair";
+  }
+  if (["awaiting_comment_approval", "posting_comment"].includes(stateName)) {
+    return "Issue comment";
+  }
+  if (["closing_issue", "closed"].includes(stateName)) {
+    return "Issue closure";
+  }
+  if (stateName === "dry_run_complete") {
+    return "Issue dry run";
+  }
+  if (stateName === "blocked_needs_human") {
+    return "Issue review";
+  }
+  return "Issue job";
+}
+
+function jobContextLabel(job) {
+  const entry = jobEntry(job);
+  const mediaTitle = String(entry?.mediaTitle || "").trim();
+  const sourceIssue = \`\${sourceLabel(job.source)} issue \${job.issueId}\`;
+  return mediaTitle ? \`\${mediaTitle} · \${sourceIssue}\` : sourceIssue;
+}
+
 function statusBadgeClass(status) {
   const normalized = String(status || "").toLowerCase();
   if (!normalized) return "status-pill muted";
@@ -1842,16 +2020,17 @@ function renderStats(status) {
 }
 
 function renderJobs(jobs) {
-  state.jobs = jobs;
-  if (!jobs.length) {
+  const orderedJobs = sortJobs(jobs);
+  state.jobs = orderedJobs;
+  if (!orderedJobs.length) {
     el.jobList.innerHTML = '<div class="empty">No jobs yet.</div>';
     return;
   }
-  el.jobList.innerHTML = jobs.map(job => \`
+  el.jobList.innerHTML = orderedJobs.map(job => \`
     <button class="\${["job-row", Number(state.activeJobId) === Number(job.id) ? "active" : "", isProcessingState(job.state) ? "processing" : ""].filter(Boolean).join(" ")}" type="button" data-job-id="\${job.id}">
       <div class="job-main">
-        <strong>Job \${escapeHtml(job.id)}</strong>
-        <span>\${escapeHtml(job.source)} \${escapeHtml(job.issueId)}</span>
+        <strong>\${escapeHtml(jobOperationLabel(job))}</strong>
+        <span title="\${escapeHtml(jobContextLabel(job))}">Job \${escapeHtml(job.id)} · \${escapeHtml(jobContextLabel(job))}</span>
       </div>
       <span class="\${badgeClass(job.state)}">\${escapeHtml(stateLabel(job.state))}</span>
     </button>
@@ -1882,7 +2061,7 @@ function issueOpenJobLabel(entry) {
     return "Approve fix";
   }
   if (["failed_retryable", "failed_terminal"].includes(stateName) && entryHasApprovedRepair(entry)) {
-    return "Retry repair";
+    return "Review repair";
   }
   if (isProcessingState(stateName)) {
     return "View repair";
@@ -2001,6 +2180,9 @@ function formatEntryMetadata(entry) {
 function setSteerVisible(visible) {
   el.steerPanel.classList.toggle("hidden", !visible);
   el.steerButton.disabled = !visible || state.busy || !state.authOk;
+  if (visible) {
+    autoResizeSteerInput();
+  }
 }
 
 function setRepairRetryVisible(visible) {
@@ -2093,19 +2275,25 @@ function mcpGapHtml(item) {
   const job = item.jobId ? \`Job \${item.jobId}\${item.jobSource ? \` · \${item.jobSource} \${item.jobIssueId || ""}\` : ""}\` : "No linked job";
   const category = item.category ? \`Category: \${item.category}\` : "";
   const meta = [tool, category, job, item.updatedAt ? \`Updated: \${item.updatedAt}\` : ""].filter(Boolean).join(" · ");
+  const detection = state.mcpGapDetections[String(item.id)] || null;
+  const detected = Boolean(detection?.detected);
   return \`
-    <article class="mcp-gap-item" data-mcp-gap-id="\${item.id}">
+    <article class="mcp-gap-item\${detected ? " detected" : ""}" data-mcp-gap-id="\${item.id}">
       <div>
         <h3 class="mcp-gap-title">\${escapeHtml(item.title)}</h3>
         <p class="mcp-gap-description">\${escapeHtml(item.description)}</p>
         <p class="mcp-gap-meta">\${escapeHtml(meta)}</p>
       </div>
-      <button class="secondary mcp-gap-remove" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
+      <div class="mcp-gap-actions">
+        <button class="secondary mcp-gap-remove\${detected ? " detected" : ""}" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
+        \${detected ? \`<div class="mcp-gap-detected" title="\${escapeHtml(detection.reason || "")}">DETECTED</div>\` : ""}
+      </div>
     </article>
   \`;
 }
 
 function renderMcpGaps(items) {
+  state.mcpGapItems = items;
   if (!items.length) {
     el.mcpGapsList.innerHTML = '<div class="empty">No active missing MCP items.</div>';
     return;
@@ -2120,6 +2308,7 @@ async function loadMcpGaps() {
 }
 
 async function openMcpGapsDialog() {
+  state.mcpGapDetections = {};
   el.mcpGapsDialog.classList.remove("hidden");
   try {
     await loadMcpGaps();
@@ -2130,7 +2319,37 @@ async function openMcpGapsDialog() {
 }
 
 function closeMcpGapsDialog() {
+  state.mcpGapDetections = {};
+  renderMcpGaps(state.mcpGapItems || []);
   el.mcpGapsDialog.classList.add("hidden");
+}
+
+async function checkMcpCapabilities() {
+  setBusy(true);
+  const previousLabel = el.mcpGapsCheckButton.textContent;
+  el.mcpGapsCheckButton.disabled = true;
+  el.mcpGapsCheckButton.textContent = "Checking...";
+  try {
+    const result = await api("/api/mcp-missing-items/check-capabilities", { method: "POST", body: "{}" });
+    const detections = {};
+    for (const entry of result.results || []) {
+      if (entry.detected) {
+        detections[String(entry.itemId)] = entry;
+      }
+    }
+    state.mcpGapDetections = detections;
+    renderMcpGaps(result.items || state.mcpGapItems || []);
+    const detectedCount = Object.keys(detections).length;
+    toast(detectedCount
+      ? \`Detected \${detectedCount} MCP \${detectedCount === 1 ? "capability" : "capabilities"}\`
+      : "No requested MCP capabilities detected yet");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    el.mcpGapsCheckButton.disabled = false;
+    el.mcpGapsCheckButton.textContent = previousLabel;
+    setBusy(false);
+  }
 }
 
 async function removeMcpGap(itemId) {
@@ -2138,6 +2357,7 @@ async function removeMcpGap(itemId) {
   try {
     await api(\`/api/mcp-missing-items/\${itemId}\`, { method: "DELETE" });
     toast("Missing MCP item removed");
+    delete state.mcpGapDetections[String(itemId)];
     await loadMcpGaps();
   } catch (error) {
     toast(error.message);
@@ -2268,6 +2488,164 @@ function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function compactActivityText(value, maxLength = 180) {
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > maxLength ? text.slice(0, maxLength - 1).trim() + "..." : text;
+}
+
+function activityToolName(value) {
+  return String(value || "media tool").replace(/^media\./, "");
+}
+
+function summarizeActivityArguments(value) {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  const parts = Object.entries(value)
+    .filter(([, entryValue]) => entryValue !== undefined && entryValue !== null && entryValue !== "")
+    .slice(0, 4)
+    .map(([key, entryValue]) => {
+      if (typeof entryValue === "string" || typeof entryValue === "number" || typeof entryValue === "boolean") {
+        return key + "=" + compactActivityText(entryValue, 48);
+      }
+      if (Array.isArray(entryValue)) {
+        return key + "=" + entryValue.length + " items";
+      }
+      return key + "=object";
+    });
+  return parts.length ? " (" + parts.join(", ") + ")" : "";
+}
+
+function summarizeActivityResult(value) {
+  if (value === undefined || value === null || value === "") {
+    return "";
+  }
+  const items = Array.isArray(value) ? value : [value];
+  const summaries = [];
+  for (const item of items.slice(0, 2)) {
+    if (typeof item === "string") {
+      summaries.push(compactActivityText(item, 120));
+    } else if (item && typeof item === "object") {
+      if (item.error?.message || item.error) {
+        summaries.push("error: " + compactActivityText(item.error.message || item.error, 120));
+      } else if (item.summary) {
+        summaries.push(compactActivityText(item.summary, 120));
+      } else if (item.message) {
+        summaries.push(compactActivityText(item.message, 120));
+      } else if (item.title) {
+        summaries.push(compactActivityText(item.title, 120));
+      } else if (item.status || item.ok !== undefined) {
+        summaries.push("status " + compactActivityText(item.status || (item.ok ? "ok" : "not ok"), 80));
+      }
+    }
+  }
+  return summaries.length ? " - " + summaries.join("; ") : "";
+}
+
+function summarizeAgentMessage(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    const status = parsed.status ? String(parsed.status).replaceAll("_", " ") : "result";
+    const summary = parsed.summary ? ": " + compactActivityText(parsed.summary, 180) : "";
+    return status + summary;
+  } catch {
+    return compactActivityText(trimmed, 180);
+  }
+}
+
+function readableEventType(value) {
+  return String(value || "event").replaceAll("_", " ");
+}
+
+function formatRepairActivityEvent(event) {
+  const payload = event.payload || {};
+  const eventType = event.eventType || payload.type || "event";
+  const prefix = event.createdAt + " · run " + event.runId + " · ";
+  if (eventType === "repair_mcp_tool_call") {
+    return prefix + "Calling " + activityToolName(payload.toolName) + summarizeActivityArguments(payload.arguments) + ".";
+  }
+  if (eventType === "repair_mcp_tool_result") {
+    const tools = (payload.calls || []).map(call => activityToolName(call.toolName)).join(", ") || "media tool";
+    const status = payload.status ? "HTTP " + payload.status : "completed";
+    return prefix + "Result from " + tools + ": " + status + summarizeActivityResult(payload.result) + ".";
+  }
+  if (eventType === "repair_mcp_proxy_blocked") {
+    return prefix + "Blocked issue-lifecycle tool " + activityToolName(payload.toolName) + ": " + compactActivityText(payload.message, 180) + ".";
+  }
+  if (eventType === "repair_mcp_proxy_error") {
+    return prefix + "Media MCP proxy error: " + compactActivityText(payload.error, 180) + ".";
+  }
+  if (eventType === "codex_exit") {
+    return prefix + "Codex process exited" + (payload.stderr ? " with stderr output recorded in logs." : ".");
+  }
+  if (eventType === "stderr") {
+    return prefix + "Codex stderr: " + compactActivityText(payload.text, 180);
+  }
+  if (eventType === "stdout") {
+    return prefix + "Codex output: " + compactActivityText(payload.text, 180);
+  }
+  if (eventType === "item.completed") {
+    const item = payload.item || {};
+    if (item.type === "mcp_tool_call") {
+      const status = item.status ? " (" + String(item.status).replaceAll("_", " ") + ")" : "";
+      const error = item.error ? ": " + compactActivityText(item.error, 160) : ".";
+      return prefix + "Codex completed " + activityToolName(item.name) + status + error;
+    }
+    if (item.type === "agent_message" || item.type === "message") {
+      return prefix + "Codex reported " + summarizeAgentMessage(item.text || item.message || item.content) + ".";
+    }
+  }
+  if (payload.text) {
+    return prefix + readableEventType(eventType) + ": " + compactActivityText(payload.text, 180);
+  }
+  if (payload.error) {
+    return prefix + readableEventType(eventType) + ": " + compactActivityText(payload.error, 180);
+  }
+  return prefix + readableEventType(eventType) + ".";
+}
+
+function formatAgentRunSummary(run) {
+  const parts = [
+    "Run " + run.id,
+    run.kind || "agent",
+    String(run.status || "unknown").replaceAll("_", " ")
+  ];
+  if (run.config?.model) {
+    parts.push("model " + run.config.model);
+  }
+  if (run.config?.reasoningEffort) {
+    parts.push("reasoning " + run.config.reasoningEffort);
+  }
+  if (run.config?.fastMode !== undefined) {
+    parts.push(run.config.fastMode ? "fast mode" : "standard mode");
+  }
+  const lines = ["- " + parts.join(" · ")];
+  if (run.startedAt) {
+    lines.push("  Started: " + run.startedAt);
+  }
+  if (run.completedAt) {
+    lines.push("  Completed: " + run.completedAt);
+  }
+  if (run.error) {
+    lines.push("  Error: " + compactActivityText(run.error, 220));
+  }
+  if (run.finalResult?.summary || run.finalResult?.status) {
+    const status = run.finalResult.status ? String(run.finalResult.status).replaceAll("_", " ") : "result";
+    const summary = run.finalResult.summary ? " - " + compactActivityText(run.finalResult.summary, 220) : "";
+    lines.push("  Result: " + status + summary);
+  }
+  return lines.join("\\n");
+}
+
 function pendingApproval(detail) {
   return (detail.approvals || []).find(approval => approval.status === "pending") || null;
 }
@@ -2291,6 +2669,41 @@ function formatActionSummary(summary) {
     for (const [index, step] of summary.expectedSteps.entries()) {
       lines.push(\`\${index + 1}. \${step}\`);
     }
+  }
+  return lines.join("\\n");
+}
+
+function steeringHistoryFromInvestigation(investigation) {
+  const evidence = investigation?.evidence || {};
+  const history = Array.isArray(evidence.steeringHistory) ? evidence.steeringHistory : [];
+  const entries = history
+    .filter(entry => entry?.message)
+    .map((entry, index) => ({
+      sequence: Number(entry.sequence) || index + 1,
+      createdAt: entry.createdAt || "unknown time",
+      actor: entry.actor || "operator",
+      message: String(entry.message || "").trim()
+    }));
+  if (!entries.length && evidence.steering?.message) {
+    entries.push({
+      sequence: Number(evidence.steering.sequence) || 1,
+      createdAt: evidence.steering.createdAt || "unknown time",
+      actor: evidence.steering.actor || "operator",
+      message: String(evidence.steering.message || "").trim()
+    });
+  }
+  return entries;
+}
+
+function formatSteeringHistory(investigation) {
+  const history = steeringHistoryFromInvestigation(investigation);
+  if (!history.length) {
+    return "";
+  }
+  const lines = ["Steering history:"];
+  for (const entry of history) {
+    lines.push(\`\${entry.sequence}. \${entry.createdAt} · \${entry.actor}\`);
+    lines.push(entry.message);
   }
   return lines.join("\\n");
 }
@@ -2329,6 +2742,10 @@ function formatJobDetail(detail) {
   }
   if (detail.investigation?.summary) {
     lines.push("", "Investigation:", detail.investigation.summary);
+    const steeringHistory = formatSteeringHistory(detail.investigation);
+    if (steeringHistory) {
+      lines.push("", steeringHistory);
+    }
   }
   if (detail.plannedActions?.length) {
     lines.push("", "Planned/executed actions:");
@@ -2357,19 +2774,7 @@ function formatJobDetail(detail) {
   if (detail.agentRuns?.length) {
     lines.push("", "Autonomous Codex repair runs:");
     for (const run of detail.agentRuns) {
-      lines.push(formatJson({
-        id: run.id,
-        kind: run.kind,
-        status: run.status,
-        model: run.config?.model,
-        reasoningEffort: run.config?.reasoningEffort,
-        fastMode: run.config?.fastMode,
-        serviceTier: run.config?.serviceTier,
-        startedAt: run.startedAt,
-        completedAt: run.completedAt,
-        error: run.error,
-        finalResult: run.finalResult
-      }));
+      lines.push(formatAgentRunSummary(run));
     }
   }
   if (detail.missingMcpItems?.length) {
@@ -2388,7 +2793,7 @@ function formatJobDetail(detail) {
   if (detail.agentRunEvents?.length) {
     lines.push("", "Live repair activity:");
     for (const event of detail.agentRunEvents.slice(0, 12).reverse()) {
-      lines.push(\`- \${event.createdAt} run \${event.runId} \${event.eventType}: \${formatJson(event.payload)}\`);
+      lines.push("- " + formatRepairActivityEvent(event));
     }
   }
   if (detail.auditEvents?.length) {
@@ -2413,8 +2818,9 @@ function updateJobControls(detail) {
   const hasPendingResolution = pending?.kind === "resolution";
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
-  setRepairRetryVisible(["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution);
-  setSteerVisible(stateName === "awaiting_action_approval");
+  setRepairRetryVisible(false);
+  setSteerVisible(stateName === "awaiting_action_approval"
+    || (["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution));
 }
 
 function shouldPollJob(detail) {
@@ -2438,6 +2844,26 @@ function startJobPolling() {
   }, 1600);
 }
 
+function captureOutputScroll() {
+  return {
+    top: el.output.scrollTop,
+    bottomGap: el.output.scrollHeight - el.output.scrollTop - el.output.clientHeight,
+    atBottom: el.output.scrollHeight - el.output.scrollTop - el.output.clientHeight < 48
+  };
+}
+
+function restoreOutputScroll(snapshot) {
+  if (!snapshot) {
+    return;
+  }
+  if (snapshot.atBottom) {
+    el.output.scrollTop = el.output.scrollHeight;
+    return;
+  }
+  const maxTop = Math.max(0, el.output.scrollHeight - el.output.clientHeight);
+  el.output.scrollTop = Math.min(snapshot.top, maxTop);
+}
+
 async function showJob(jobId, options = {}) {
   state.activeJobId = Number(jobId);
   state.activeEntryIndex = entryIndexForJob(jobId);
@@ -2452,9 +2878,11 @@ async function showJob(jobId, options = {}) {
   el.continueButton.classList.add("hidden");
   updateIssueRowHighlights();
   try {
+    const outputScroll = options.quiet ? captureOutputScroll() : null;
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
     mergeJobDetailState(result.detail);
     el.output.textContent = formatJobDetail(result.detail);
+    restoreOutputScroll(outputScroll);
     updateJobControls(result.detail);
     const processing = shouldPollJob(result.detail);
     setDetailProcessing(processing, processing ? stateLabel(result.detail.job.state) : "Processing");
@@ -2767,6 +3195,7 @@ async function steerInvestigation() {
       body: JSON.stringify({ message })
     });
     el.steerInput.value = "";
+    autoResizeSteerInput();
     el.output.textContent = result.result.summary;
     toast("Investigation revised");
     await refresh();
@@ -2807,6 +3236,7 @@ el.logsDialog.addEventListener("click", event => {
   }
 });
 el.mcpGapsButton.addEventListener("click", openMcpGapsDialog);
+el.mcpGapsCheckButton.addEventListener("click", checkMcpCapabilities);
 el.mcpGapsCloseButton.addEventListener("click", closeMcpGapsDialog);
 el.mcpGapsDialog.addEventListener("click", event => {
   if (event.target === el.mcpGapsDialog) {
@@ -2857,6 +3287,7 @@ el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
 el.repairRetryButton.addEventListener("click", retryRepair);
 el.steerButton.addEventListener("click", steerInvestigation);
+el.steerInput.addEventListener("input", autoResizeSteerInput);
 el.repairRetryInput.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     retryRepair();
@@ -3089,6 +3520,11 @@ export function createWebHandler(agent, config) {
       }
       if (req.method === "GET" && url.pathname === "/api/mcp-missing-items") {
         sendJson(res, 200, { ok: true, items: agent.missingMcpItems() });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/mcp-missing-items/check-capabilities") {
+        await readJson(req);
+        sendJson(res, 200, { ok: true, ...(await agent.checkMissingMcpCapabilities("web")) });
         return;
       }
       const missingMcpItemMatch = url.pathname.match(/^\/api\/mcp-missing-items\/(\d+)$/);

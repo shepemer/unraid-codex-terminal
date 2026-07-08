@@ -973,7 +973,16 @@ SELECT
   attempts,
   last_error AS lastError
 FROM jobs
-ORDER BY updated_at DESC, id DESC
+ORDER BY
+  CASE
+    WHEN state IN ('approved_for_execution', 'executing', 'waiting_for_plex_verification', 'drafting_comment', 'closing_issue') THEN 0
+    WHEN state IN ('detected', 'queued_for_investigation', 'investigating', 'awaiting_action_approval', 'awaiting_comment_approval', 'awaiting_resolution_approval', 'posting_comment', 'failed_retryable', 'blocked_needs_human') THEN 1
+    WHEN state IN ('failed_terminal') THEN 2
+    WHEN state IN ('closed', 'dry_run_complete') THEN 3
+    ELSE 2
+  END,
+  updated_at DESC,
+  id DESC
 LIMIT ${capped};
 `, { json: true });
 }
