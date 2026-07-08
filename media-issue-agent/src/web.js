@@ -235,6 +235,21 @@ const HTML = `<!doctype html>
       </div>
     </div>
   </div>
+  <div id="mcp-gap-detection-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="mcp-gap-detection-title">
+    <div class="modal-panel mcp-gap-detection-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">MCP Capability</span>
+          <h2 id="mcp-gap-detection-title">Detection Reasoning</h2>
+        </div>
+      </div>
+      <div id="mcp-gap-detection-body" class="modal-body">
+      </div>
+      <div class="modal-actions">
+        <button id="mcp-gap-detection-close-button" type="button" class="secondary">Close</button>
+      </div>
+    </div>
+  </div>
   <div id="runner-settings-backdrop" class="drawer-backdrop hidden"></div>
   <div id="activity-drawer-backdrop" class="drawer-backdrop hidden"></div>
   <div id="toast" role="status" aria-live="polite"></div>
@@ -1119,40 +1134,98 @@ pre {
   position: relative;
   isolation: isolate;
   min-width: 82px;
-  padding: 4px 8px;
-  border-radius: 999px;
-  color: #9af3b1;
-  font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0;
-  text-align: center;
-  text-transform: uppercase;
-  overflow: hidden;
-}
-
-.mcp-gap-detected::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: inherit;
+  min-height: 36px;
+  padding: 0 14px;
+  border-color: color-mix(in srgb, var(--success) 55%, var(--line));
   background:
-    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--success) 58%, transparent), transparent 68%),
-    color-mix(in srgb, var(--success) 22%, transparent);
-  animation: mcpDetectedPulse 1.35s ease-in-out infinite;
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--success) 24%, var(--panel)),
+      color-mix(in srgb, var(--success) 34%, var(--panel)),
+      color-mix(in srgb, var(--success) 24%, var(--panel)));
+  background-size: 220% 100%;
+  color: color-mix(in srgb, var(--success) 72%, var(--text));
+  text-align: center;
+  overflow: hidden;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent);
+  animation: mcpDetectedButtonBg 1.8s ease-in-out infinite;
 }
 
-@keyframes mcpDetectedPulse {
+.mcp-gap-detected:hover,
+.mcp-gap-detected:focus-visible {
+  color: color-mix(in srgb, var(--success) 78%, var(--text));
+  border-color: color-mix(in srgb, var(--success) 55%, var(--line));
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--success) 26%, var(--panel)),
+      color-mix(in srgb, var(--success) 38%, var(--panel)),
+      color-mix(in srgb, var(--success) 26%, var(--panel)));
+  background-size: 220% 100%;
+}
+
+@keyframes mcpDetectedButtonBg {
   0%, 100% {
-    opacity: 0.54;
-    transform: scale(0.96);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 42%, transparent);
+    background-position: 0% 50%;
   }
   50% {
-    opacity: 1;
-    transform: scale(1.03);
-    box-shadow: 0 0 18px 4px color-mix(in srgb, var(--success) 30%, transparent);
+    background-position: 100% 50%;
   }
+}
+
+.mcp-gap-detection-panel {
+  max-width: min(620px, calc(100vw - 28px));
+}
+
+.mcp-detection-summary {
+  display: grid;
+  gap: 9px;
+}
+
+.mcp-detection-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.28;
+}
+
+.mcp-detection-reason {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.mcp-detection-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 7px 12px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.mcp-detection-fields dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.mcp-detection-fields dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.mcp-detection-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .modal-backdrop.hidden {
@@ -1675,6 +1748,10 @@ const el = {
   mcpGapsList: document.getElementById("mcp-gaps-list"),
   mcpGapsCheckButton: document.getElementById("mcp-gaps-check-button"),
   mcpGapsCloseButton: document.getElementById("mcp-gaps-close-button"),
+  mcpGapDetectionDialog: document.getElementById("mcp-gap-detection-dialog"),
+  mcpGapDetectionTitle: document.getElementById("mcp-gap-detection-title"),
+  mcpGapDetectionBody: document.getElementById("mcp-gap-detection-body"),
+  mcpGapDetectionCloseButton: document.getElementById("mcp-gap-detection-close-button"),
   runnerSettingsButton: document.getElementById("runner-settings-button"),
   runnerSettingsCloseButton: document.getElementById("runner-settings-close-button"),
   runnerSettingsBackdrop: document.getElementById("runner-settings-backdrop"),
@@ -2303,6 +2380,54 @@ function downloadLogs() {
   }
 }
 
+function humanizeMcpValue(value) {
+  return String(value || "")
+    .replace(/^media\./, "")
+    .replaceAll("_", " ")
+    .replace(/\\s+/g, " ")
+    .trim() || "Not specified";
+}
+
+function mcpGapDetectionReasonHtml(item, detection) {
+  const fields = [
+    ["Detected tool", detection.toolName || detection.suggestedToolName || item.suggestedToolName || "Not specified"],
+    ["Match type", humanizeMcpValue(detection.matchType)],
+    ["Confidence", humanizeMcpValue(detection.confidence)],
+    ["Policy", humanizeMcpValue(detection.decisionPolicy || "deterministic metadata policy")]
+  ];
+  const agent = detection.agentDecision;
+  const agentLine = agent
+    ? \`Agent advisory: \${agent.detected ? "detected" : "not detected"}\${agent.toolName ? \` via \${agent.toolName}\` : ""}\${agent.matchType ? \` (\${humanizeMcpValue(agent.matchType)})\` : ""}.\`
+    : "Agent advisory was not available for this item.";
+  return \`
+    <div class="mcp-detection-summary">
+      <p class="mcp-detection-title">\${escapeHtml(item?.title || "Detected MCP capability")}</p>
+      <p class="mcp-detection-reason">\${escapeHtml(detection.reason || "The live MCP tool metadata satisfied this requested capability.")}</p>
+      <dl class="mcp-detection-fields">
+        \${fields.map(([label, value]) => \`<dt>\${escapeHtml(label)}</dt><dd>\${escapeHtml(value)}</dd>\`).join("")}
+      </dl>
+      <p class="mcp-detection-note">\${escapeHtml(agentLine)}</p>
+    </div>
+  \`;
+}
+
+function openMcpGapDetectionDialog(itemId) {
+  const item = (state.mcpGapItems || []).find(candidate => Number(candidate.id) === Number(itemId));
+  const detection = state.mcpGapDetections[String(itemId)];
+  if (!detection) {
+    toast("Detection details are no longer available. Run the check again.");
+    return;
+  }
+  el.mcpGapDetectionTitle.textContent = "Detection Reasoning";
+  el.mcpGapDetectionBody.innerHTML = mcpGapDetectionReasonHtml(item, detection);
+  el.mcpGapDetectionDialog.classList.remove("hidden");
+}
+
+function closeMcpGapDetectionDialog() {
+  el.mcpGapDetectionDialog.classList.add("hidden");
+  el.mcpGapDetectionBody.textContent = "";
+}
+
 function mcpGapHtml(item) {
   const tool = item.suggestedToolName ? \`Tool: \${item.suggestedToolName}\` : "Tool: unspecified";
   const job = item.jobId ? \`Job \${item.jobId}\${item.jobSource ? \` · \${item.jobSource} \${item.jobIssueId || ""}\` : ""}\` : "No linked job";
@@ -2319,10 +2444,20 @@ function mcpGapHtml(item) {
       </div>
       <div class="mcp-gap-actions">
         <button class="secondary mcp-gap-remove\${detected ? " detected" : ""}" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
-        \${detected ? \`<div class="mcp-gap-detected" title="\${escapeHtml(detection.reason || "")}">DETECTED</div>\` : ""}
+        \${detected ? \`<button class="secondary mcp-gap-detected" type="button" data-mcp-gap-detection="\${item.id}" aria-label="Show detection reasoning for \${escapeHtml(item.title)}" title="Show detection reasoning">DETECTED</button>\` : ""}
       </div>
     </article>
   \`;
+}
+
+function bindMcpGapDetectionButtons() {
+  for (const button of el.mcpGapsList.querySelectorAll("[data-mcp-gap-detection]")) {
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openMcpGapDetectionDialog(Number(button.dataset.mcpGapDetection));
+    });
+  }
 }
 
 function renderMcpGaps(items) {
@@ -2332,6 +2467,7 @@ function renderMcpGaps(items) {
     return;
   }
   el.mcpGapsList.innerHTML = items.map(mcpGapHtml).join("");
+  bindMcpGapDetectionButtons();
 }
 
 async function loadMcpGaps() {
@@ -2352,6 +2488,7 @@ async function openMcpGapsDialog() {
 }
 
 function closeMcpGapsDialog() {
+  closeMcpGapDetectionDialog();
   state.mcpGapDetections = {};
   renderMcpGaps(state.mcpGapItems || []);
   el.mcpGapsDialog.classList.add("hidden");
@@ -2582,7 +2719,7 @@ function formatJson(value) {
 
 function compactActivityText(value, maxLength = 180) {
   const text = String(value || "")
-    .replace(/\s+/g, " ")
+    .replace(/\\s+/g, " ")
     .trim();
   if (!text) {
     return "";
@@ -2591,7 +2728,7 @@ function compactActivityText(value, maxLength = 180) {
 }
 
 function activityToolName(value) {
-  return String(value || "media tool").replace(/^media\./, "");
+  return String(value || "media tool").replace(/^media\\./, "");
 }
 
 function summarizeActivityArguments(value) {
@@ -3465,7 +3602,18 @@ el.mcpGapsDialog.addEventListener("click", event => {
     closeMcpGapsDialog();
   }
 });
+el.mcpGapDetectionCloseButton.addEventListener("click", closeMcpGapDetectionDialog);
+el.mcpGapDetectionDialog.addEventListener("click", event => {
+  if (event.target === el.mcpGapDetectionDialog) {
+    closeMcpGapDetectionDialog();
+  }
+});
 el.mcpGapsList.addEventListener("click", event => {
+  const detectionButton = event.target.closest("[data-mcp-gap-detection]");
+  if (detectionButton) {
+    openMcpGapDetectionDialog(Number(detectionButton.dataset.mcpGapDetection));
+    return;
+  }
   const button = event.target.closest("[data-remove-mcp-gap]");
   if (button) {
     removeMcpGap(Number(button.dataset.removeMcpGap));

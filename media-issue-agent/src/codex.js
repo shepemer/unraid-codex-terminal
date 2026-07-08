@@ -240,6 +240,7 @@ export function mcpCapabilityCheckPrompt(items, tools) {
     "MCP capability gap audit.",
     "You are Codex running inside media-issue-agent with access to the same media MCP server configuration used by autonomous repair runs.",
     "Your job is only to compare requested missing MCP capabilities against the current available media MCP tools.",
+    "Your JSON is advisory comparison evidence. media-issue-agent applies a deterministic metadata policy to the final detected/not-detected result.",
     "Do not repair media, do not call mutating tools, do not post comments, and do not close or reopen issues.",
     "Reason from each request's title, description, category, reason, and surrounding context. The suggestedToolName field is only a historical hint and may be wrong or incomplete.",
     "Mark a request detected only when the available tools can satisfy the requested capability well enough for the repair runner to use it.",
