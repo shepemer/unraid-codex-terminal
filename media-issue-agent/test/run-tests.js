@@ -14,6 +14,7 @@ import {
   insertSnapshot,
   investigationForJob,
   jobDetails,
+  listJobs,
   pendingApprovalForJob,
   pruneSnapshots,
   setJobState,
@@ -21,6 +22,7 @@ import {
   snapshotEntry,
   supersedePendingApprovals,
   transitionJob,
+  upsertMissingMcpItems,
   upsertInvestigation
 } from "../src/db.js";
 import { filterOpenIssues, hasPlexClosedComment, issueLifecycleFromComments, issueQueue, issueTableMarkdown } from "../src/issues.js";
@@ -243,10 +245,26 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
   const firstActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
   const steered = await agent.steerInvestigation(investigated.jobId, "Treat this as client-side; no server-side action is needed.", "fixture");
   assert.equal(steered.approvalKind, "action");
-  const steeredDetails = jobDetails(dbPath, investigated.jobId);
-  const currentActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
+  let steeredDetails = jobDetails(dbPath, investigated.jobId);
+  let currentActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
   assert.notEqual(currentActionApproval.id, firstActionApproval.id);
   assert.equal(steeredDetails.approvals.find(approval => approval.id === firstActionApproval.id).status, "superseded");
+  assert.equal(steeredDetails.investigation.evidence.steeringHistory.length, 1);
+  assert.equal(steeredDetails.investigation.evidence.steeringHistory[0].message, "Treat this as client-side; no server-side action is needed.");
+  const firstSteeredApprovalId = currentActionApproval.id;
+
+  const secondSteer = await agent.steerInvestigation(investigated.jobId, "Keep the conclusion client-side with no server-side action and mention app restart guidance.", "fixture");
+  assert.equal(secondSteer.approvalKind, "action");
+  steeredDetails = jobDetails(dbPath, investigated.jobId);
+  currentActionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
+  assert.notEqual(currentActionApproval.id, firstSteeredApprovalId);
+  assert.equal(steeredDetails.approvals.find(approval => approval.id === firstSteeredApprovalId).status, "superseded");
+  assert.equal(steeredDetails.investigation.evidence.steeringHistory.length, 2);
+  assert.deepEqual(steeredDetails.investigation.evidence.steeringHistory.map(entry => entry.message), [
+    "Treat this as client-side; no server-side action is needed.",
+    "Keep the conclusion client-side with no server-side action and mention app restart guidance."
+  ]);
+  assert.equal(steeredDetails.investigation.evidence.steering.message, "Keep the conclusion client-side with no server-side action and mention app restart guidance.");
   assert.equal(currentActionApproval.payload.plan.classification, "client_side");
   assert.equal(currentActionApproval.payload.plan.actionSummary.mode, "client_side");
   assert.match(currentActionApproval.payload.plan.actionSummary.headline, /No server-side repair/);
@@ -622,12 +640,15 @@ async function testRepairRunnerRejectsOwnerDelegation() {
     const actionApproval = pendingApprovalForJob(dbPath, investigated.jobId, "action");
     assert.equal(actionApproval.payload.plan.classification, "server_action");
     assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
-    await assert.rejects(() => agent.approve(investigated.jobId, "fixture"), /delegated media-side work/);
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
+    assert.match(returned.message, /Review or steer the investigation/);
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
     assert.match(details.job.lastError, /delegated media-side work/);
     assert.equal(details.agentRuns.length, 1);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -701,10 +722,13 @@ async function testRepairRunnerInvalidJsonFailsWithoutResolution() {
       description: "Please add subtitles."
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
-    await assert.rejects(() => agent.approve(investigated.jobId, "fixture"), /valid final JSON/);
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /valid final JSON/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -798,10 +822,13 @@ async function testRepairRunnerRecordsMissingMcpItems() {
       description: "Episode has audio desync."
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
-    await assert.rejects(() => agent.approve(investigated.jobId, "fixture"), /does not expose a Sonarr episode replacement tool/);
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /does not expose a Sonarr episode replacement tool/);
     assert.equal(details.agentRuns[0].finalResult.missingMcpItems.length, 2);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
     assert.equal(details.missingMcpItems.length, 2);
     const missingItemText = JSON.stringify({
       runResult: details.agentRuns[0].finalResult.missingMcpItems,
@@ -823,6 +850,56 @@ async function testRepairRunnerRecordsMissingMcpItems() {
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function testMissingMcpCapabilityCheckUsesLiveTools() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const calls = [];
+  try {
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "capability-check-fixture");
+    upsertMissingMcpItems(dbPath, job.id, null, [
+      {
+        title: "Scoped media file delete",
+        description: "Expose stat and delete for exact Plex/Radarr media paths.",
+        suggestedToolName: "media_file_delete",
+        category: "diagnostics"
+      },
+      {
+        title: "Radarr movie file deletion",
+        description: "Delete one exact Radarr movieFileId without queueing a replacement search.",
+        suggestedToolName: "radarr_delete_movie_file",
+        category: "radarr"
+      },
+      {
+        title: "Unavailable fixture capability",
+        description: "This requested capability is intentionally absent.",
+        suggestedToolName: "fixture_missing_tool",
+        category: "fixture"
+      }
+    ]);
+    const agent = new MediaIssueAgent({ dbPath }, {
+      async listTools() {
+        calls.push({ name: "tools/list" });
+        return [
+          { name: "media_file_delete", description: "Scoped media file deletion." },
+          { name: "radarr_delete_movie_file", description: "Delete exact Radarr movie files." }
+        ];
+      }
+    });
+    await agent.init();
+    const result = await agent.checkMissingMcpCapabilities("fixture");
+    assert.equal(calls.filter(call => call.name === "tools/list").length, 1);
+    assert.equal(result.toolCount, 2);
+    assert.equal(result.items.length, 3);
+    const detectedNames = result.results.filter(entry => entry.detected).map(entry => entry.suggestedToolName).sort();
+    assert.deepEqual(detectedNames, ["media_file_delete", "radarr_delete_movie_file"]);
+    const missing = result.results.find(entry => entry.suggestedToolName === "fixture_missing_tool");
+    assert.equal(missing.detected, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
@@ -900,26 +977,32 @@ async function testRepairRunnerNeedsOperatorDecisionCanRetryWithNote() {
       description: "Bad episode copy."
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
-    await agent.approve(investigated.jobId, "fixture").then(
-      () => assert.fail("repair should request an operator decision"),
-      error => assert.match(error.message, /Two risky repairs/)
-    );
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
+    assert.match(returned.message, /Review or steer the investigation/);
     let details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.approvals[0].kind, "action");
+    assert.equal(details.approvals[0].status, "pending");
     assert.equal(details.agentRuns[0].status, "needs_operator_decision");
     assert.deepEqual(details.agentRuns[0].finalResult.proposedChoices, ["Replace episode", "Refresh only"]);
-    setJobState(dbPath, investigated.jobId, "failed_terminal", "Terminal fixture should still allow trusted operator retry.");
 
-    const retried = await agent.retryRepair(investigated.jobId, "Use replacement option and verify before drafting.", "fixture");
-    assert.equal(retried.status, "awaiting_resolution_approval");
-    assert.equal(retried.executionResult.outcome, "fixed");
+    const steered = await agent.retryRepair(investigated.jobId, "Use replacement option and verify before drafting.", "fixture");
+    assert.equal(steered.approvalKind, "action");
+    details = jobDetails(dbPath, investigated.jobId);
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.approvals[0].status, "pending");
+    assert.match(details.investigation.evidence.steering.message, /Use replacement option/);
+    assert.equal(details.investigation.evidence.steeringHistory.length, 1);
+    assert.equal(details.investigation.evidence.steeringHistory[0].message, "Use replacement option and verify before drafting.");
+
+    const approved = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(approved.status, "awaiting_resolution_approval");
+    assert.equal(approved.executionResult.outcome, "fixed");
     details = jobDetails(dbPath, investigated.jobId);
     assert.equal(details.job.state, "awaiting_resolution_approval");
     assert.equal(details.agentRuns.length, 2);
-    assert.match(details.agentRuns[0].prompt, /Trusted retry context/);
     assert.match(details.agentRuns[0].prompt, /Use replacement option/);
-    const retryNotes = await readFile(path.join(repairWorkspaceRoot, `job-${investigated.jobId}`, "operator-retry-notes.jsonl"), "utf8");
-    assert.match(retryNotes, /Use replacement option/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -989,10 +1072,13 @@ async function testRepairRunnerUnverifiedFixedFailsWithoutResolution() {
       description: "Please repair this fixture."
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
-    await assert.rejects(() => agent.approve(investigated.jobId, "fixture"), /passed verification/);
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "failed_retryable");
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /passed verification/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1381,6 +1467,28 @@ async function testCodexSettingsPersist() {
   await rm(dir, { recursive: true, force: true });
 }
 
+async function testJobListPrioritizesActiveWork() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    const active = ensureJob(dbPath, "plex", "active-existing-issue");
+    transitionJob(dbPath, active.id, "detected", "executing");
+    const closed = ensureJob(dbPath, "seerr", "closed-newer-issue");
+    transitionJob(dbPath, closed.id, "detected", "closed");
+    sqliteExec(dbPath, `
+UPDATE jobs SET updated_at = '2026-01-01T00:00:00.000Z' WHERE id = ${active.id};
+UPDATE jobs SET updated_at = '2026-01-02T00:00:00.000Z' WHERE id = ${closed.id};
+`);
+    const jobs = listJobs(dbPath, 10);
+    assert.equal(jobs[0].id, active.id);
+    assert.equal(jobs[0].state, "executing");
+    assert.equal(jobs[1].id, closed.id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function testDiagnosticLogRedactionAndRangeFiltering() {
   const dir = await tempDir();
   const logPath = path.join(dir, "diagnostics", "media-issue-agent.log");
@@ -1671,7 +1779,10 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="continue-button"/);
     assert.match(pageText, /id="reopen-button"/);
     assert.match(pageText, /id="steer-panel"/);
+    assert.match(pageText, /id="steer-input" rows="1"/);
     assert.match(pageText, /id="close-dialog"/);
+    assert.match(pageText, /id="mcp-gaps-check-button"/);
+    assert.match(pageText, /Check MCP Capabilities/);
     assert.match(pageText, /id="runner-settings-backdrop"/);
     assert.match(pageText, /id="activity-drawer-backdrop"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
@@ -1701,6 +1812,9 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.issue-card/);
     assert.match(cssText, /\.issue-card\.issue-processing/);
     assert.match(cssText, /\.drawer-backdrop/);
+    assert.match(cssText, /\.mcp-gap-detected/);
+    assert.match(cssText, /@keyframes mcpDetectedPulse/);
+    assert.match(cssText, /\.steer-panel textarea \{[\s\S]*min-height: 42px;[\s\S]*max-height: 132px;[\s\S]*resize: none;/);
     assert.match(cssText, /@media \(max-width: 700px\)/);
     assert.match(cssText, /\.app-shell\.runner-settings-open \.runner-strip/);
     assert.match(cssText, /\.app-shell\.activity-open \.side-panel/);
@@ -1720,20 +1834,35 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /Executing repair/);
     assert.match(jsText, /Drafting fix/);
     assert.match(jsText, /View repair/);
-    assert.match(jsText, /Retry repair/);
+    assert.match(jsText, /Review repair/);
     assert.match(jsText, /function showEntry/);
     assert.match(jsText, /function showJob/);
     assert.match(jsText, /function continueJob/);
     assert.match(jsText, /function steerInvestigation/);
+    assert.match(jsText, /function autoResizeSteerInput/);
+    assert.match(jsText, /function formatSteeringHistory/);
+    assert.match(jsText, /function formatRepairActivityEvent/);
+    assert.match(jsText, /function formatAgentRunSummary/);
+    assert.match(jsText, /function captureOutputScroll/);
+    assert.match(jsText, /function restoreOutputScroll/);
+    assert.match(jsText, /Steering history:/);
+    assert.match(jsText, /Live repair activity:/);
+    assert.match(jsText, /Calling /);
+    assert.match(jsText, /Result from /);
     assert.match(jsText, /function openCloseDialog/);
     assert.match(jsText, /function showIssueSummary/);
     assert.match(jsText, /function reopenIssue/);
     assert.match(jsText, /function closeDetail/);
     assert.match(jsText, /function setDetailProcessing/);
+    assert.match(jsText, /function sortJobs/);
+    assert.match(jsText, /function jobOperationLabel/);
+    assert.match(jsText, /Issue repair/);
     assert.match(jsText, /function renderCodexSettings/);
     assert.match(jsText, /function saveCodexSettings/);
     assert.match(jsText, /function setActivityDrawerOpen/);
     assert.match(jsText, /function setRunnerSettingsOpen/);
+    assert.match(jsText, /function checkMcpCapabilities/);
+    assert.match(jsText, /\/api\/mcp-missing-items\/check-capabilities/);
     assert.match(jsText, /function issueCardHtml/);
     assert.match(jsText, /function mergeJobDetailState/);
     assert.match(jsText, /PROCESSING_JOB_STATES/);
@@ -1820,6 +1949,7 @@ async function run() {
   await testRepairRunnerRejectsOwnerDelegation();
   await testRepairRunnerInvalidJsonFailsWithoutResolution();
   await testRepairRunnerRecordsMissingMcpItems();
+  await testMissingMcpCapabilityCheckUsesLiveTools();
   await testRepairRunnerNeedsOperatorDecisionCanRetryWithNote();
   await testRepairRunnerUnverifiedFixedFailsWithoutResolution();
   await testRepairResultWithoutCloseRecommendationPostsCommentOnly();
@@ -1831,6 +1961,7 @@ async function run() {
   await testStartupDoesNotRecoverFreshRunningRepairRun();
   await testStartupRecoversStaleInterruptedRepairRun();
   await testCodexSettingsPersist();
+  await testJobListPrioritizesActiveWork();
   await testDiagnosticLogRedactionAndRangeFiltering();
   await testDiagnosticLogWriteFailureIsReported();
   await testAuthConfig();

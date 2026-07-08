@@ -150,8 +150,10 @@ services:
       THREADFIN_PASSWORD: ${THREADFIN_PASSWORD:-}
       THREADFIN_TOKEN: ${THREADFIN_TOKEN:-}
       MEDIA_MCP_PATH_MAPS: ${MEDIA_MCP_PATH_MAPS:-/downloads=/mnt/unraid/downloads}
+      MEDIA_MCP_MEDIA_ROOTS: ${MEDIA_MCP_MEDIA_ROOTS:-/mnt/unraid/media}
     volumes:
       - ${MEDIA_MCP_DOWNLOADS_DIR:-/mnt/user/downloads}:/mnt/unraid/downloads:rw
+      - ${MEDIA_MCP_MEDIA_DIR:-/mnt/user/media}:/mnt/unraid/media:rw
     networks:
       - codex-mgmt
 

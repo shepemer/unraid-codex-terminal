@@ -12,8 +12,10 @@ const port = Number(env.MEDIA_MCP_PORT || 6971);
 const host = env.MEDIA_MCP_HOST || "0.0.0.0";
 const bearerToken = env.MEDIA_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.MEDIA_MCP_REQUEST_TIMEOUT_MS || 30000);
+const mediaProbeCommandTimeoutMs = Number(env.MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS || 30000);
 const allowedHosts = allowedHostnames(env.MEDIA_MCP_ALLOWED_HOSTS, "media-mcp", host);
 const mediaPathMaps = parsePathMaps(env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "/downloads=/mnt/unraid/downloads");
+const mediaDeleteRoots = parsePathList(env.MEDIA_MCP_MEDIA_ROOTS || env.MEDIA_MCP_ALLOWED_MEDIA_ROOTS || "");
 
 if (!bearerToken) {
   console.error("media-mcp: MEDIA_MCP_BEARER_TOKEN is required");
@@ -27,6 +29,11 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 
 if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1000) {
   console.error("media-mcp: MEDIA_MCP_REQUEST_TIMEOUT_MS must be at least 1000");
+  process.exit(1);
+}
+
+if (!Number.isInteger(mediaProbeCommandTimeoutMs) || mediaProbeCommandTimeoutMs < 100) {
+  console.error("media-mcp: MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS must be at least 100");
   process.exit(1);
 }
 
@@ -726,6 +733,13 @@ function parsePathMaps(value) {
     .sort((a, b) => b.source.length - a.source.length);
 }
 
+function parsePathList(value) {
+  return uniqueValues(String(value || "")
+    .split(",")
+    .map(entry => cleanPath(entry.trim()))
+    .filter(Boolean));
+}
+
 function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -753,6 +767,15 @@ function pathInside(parent, candidate) {
     return false;
   }
   return cleanCandidate === cleanParent || cleanCandidate.startsWith(`${cleanParent}/`);
+}
+
+function resolvedPathInside(parent, candidate) {
+  if (!nodePath.isAbsolute(parent) || !nodePath.isAbsolute(candidate)) {
+    return false;
+  }
+  const resolvedParent = nodePath.resolve(parent);
+  const resolvedCandidate = nodePath.resolve(candidate);
+  return resolvedCandidate === resolvedParent || resolvedCandidate.startsWith(`${resolvedParent}${nodePath.sep}`);
 }
 
 function likelyLibraryPath(serviceName, pathValue) {
@@ -1297,6 +1320,703 @@ async function plexMetadataMaintenance(ratingKey, operation, dryRun) {
   };
 }
 
+function plexMetadataOperationEndpoint(input) {
+  const operation = String(input.operation || "delete_metadata").trim();
+  if (operation === "delete_metadata") {
+    const ratingKey = String(input.ratingKey || "").trim();
+    if (!ratingKey) {
+      throw new Error("ratingKey is required for delete_metadata");
+    }
+    return {
+      operation,
+      ratingKey,
+      method: "DELETE",
+      path: `library/metadata/${encodeURIComponent(ratingKey)}`,
+      displayPath: `/library/metadata/${ratingKey}`
+    };
+  }
+  if (operation === "scan_section") {
+    const sectionKey = String(input.sectionKey || "").trim();
+    if (!sectionKey) {
+      throw new Error("sectionKey is required for scan_section");
+    }
+    return {
+      operation,
+      sectionKey,
+      method: "PUT",
+      path: `library/sections/${encodeURIComponent(sectionKey)}/refresh`,
+      displayPath: `/library/sections/${sectionKey}/refresh`,
+      query: compactObject({ path: input.path })
+    };
+  }
+  if (operation === "empty_trash") {
+    const sectionKey = String(input.sectionKey || "").trim();
+    if (!sectionKey) {
+      throw new Error("sectionKey is required for empty_trash");
+    }
+    return {
+      operation,
+      sectionKey,
+      method: "PUT",
+      path: `library/sections/${encodeURIComponent(sectionKey)}/emptyTrash`,
+      displayPath: `/library/sections/${sectionKey}/emptyTrash`
+    };
+  }
+  throw new Error(`Unsupported Plex metadata operation ${operation}`);
+}
+
+async function plexDeleteMetadata(input) {
+  const endpoint = plexMetadataOperationEndpoint(input);
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      operation: endpoint.operation,
+      ratingKey: endpoint.ratingKey,
+      sectionKey: endpoint.sectionKey,
+      path: input.path,
+      endpoint: {
+        method: endpoint.method,
+        path: endpoint.displayPath,
+        query: endpoint.query
+      },
+      note: "Set dryRun to false to run this exact Plex metadata or section operation."
+    };
+  }
+  return {
+    dryRun: false,
+    operation: endpoint.operation,
+    ratingKey: endpoint.ratingKey,
+    sectionKey: endpoint.sectionKey,
+    path: input.path,
+    endpoint: {
+      method: endpoint.method,
+      path: endpoint.displayPath,
+      query: endpoint.query
+    },
+    result: await plexApi(endpoint.path, { method: endpoint.method, query: endpoint.query })
+  };
+}
+
+function summarizeRadarrMovieFile(file) {
+  return redactSensitiveObject(compactObject({
+    id: file?.id,
+    movieId: file?.movieId,
+    path: file?.path,
+    relativePath: file?.relativePath,
+    size: file?.size,
+    dateAdded: file?.dateAdded,
+    quality: file?.quality,
+    languages: file?.languages,
+    mediaInfo: file?.mediaInfo
+  }));
+}
+
+function pathCandidateSet(pathValue) {
+  return new Set(mediaPathCandidates(pathValue).map(candidate => cleanPath(candidate)));
+}
+
+function pathsMatchExactly(left, right) {
+  const leftCandidates = pathCandidateSet(left);
+  const rightCandidates = pathCandidateSet(right);
+  for (const candidate of leftCandidates) {
+    if (rightCandidates.has(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function validateRadarrMovieFile(file, input) {
+  const blockers = [];
+  if (!file?.id) {
+    blockers.push({ type: "missing_movie_file", message: `Radarr movie file ${input.movieFileId} was not found.` });
+  }
+  if (input.movieId && Number(file?.movieId) !== Number(input.movieId)) {
+    blockers.push({
+      type: "movie_id_mismatch",
+      expectedMovieId: Number(input.movieId),
+      actualMovieId: file?.movieId,
+      message: "Refusing to delete because the Radarr movieFileId belongs to a different movieId."
+    });
+  }
+  if (input.expectedPath && !pathsMatchExactly(input.expectedPath, file?.path)) {
+    blockers.push({
+      type: "path_mismatch",
+      expectedPath: input.expectedPath,
+      actualPath: file?.path,
+      message: "Refusing to delete because the Radarr movieFileId path does not match the expected path."
+    });
+  }
+  return blockers;
+}
+
+async function radarrDeleteMovieFile(input) {
+  const movieFileId = Number(input.movieFileId);
+  const file = await arrApi("radarr", "v3", `moviefile/${movieFileId}`);
+  const blockers = validateRadarrMovieFile(file, input);
+  const endpoint = {
+    method: "DELETE",
+    path: `/api/v3/moviefile/${movieFileId}`,
+    query: { deleteFiles: input.deleteFiles !== false }
+  };
+  if (blockers.length) {
+    return {
+      dryRun: input.dryRun,
+      service: "radarr",
+      movieFileId,
+      movieId: input.movieId,
+      expectedPath: input.expectedPath,
+      deleteFiles: input.deleteFiles !== false,
+      noSearch: true,
+      searchQueued: false,
+      movieFile: summarizeRadarrMovieFile(file),
+      endpoint,
+      blockers
+    };
+  }
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      service: "radarr",
+      movieFileId,
+      movieId: input.movieId || file.movieId,
+      expectedPath: input.expectedPath,
+      deleteFiles: input.deleteFiles !== false,
+      noSearch: true,
+      searchQueued: false,
+      movieFile: summarizeRadarrMovieFile(file),
+      endpoint,
+      note: "Set dryRun to false to delete this exact Radarr movie file. This tool does not queue replacement searches."
+    };
+  }
+  const result = await arrApi("radarr", "v3", `moviefile/${movieFileId}`, {
+    method: "DELETE",
+    query: { deleteFiles: input.deleteFiles !== false }
+  });
+  return {
+    dryRun: false,
+    service: "radarr",
+    movieFileId,
+    movieId: input.movieId || file.movieId,
+    expectedPath: input.expectedPath,
+    deleteFiles: input.deleteFiles !== false,
+    noSearch: true,
+    searchQueued: false,
+    movieFile: summarizeRadarrMovieFile(file),
+    endpoint,
+    result
+  };
+}
+
+function summarizeSonarrEpisodeFile(file) {
+  return redactSensitiveObject(compactObject({
+    id: file?.id,
+    seriesId: file?.seriesId,
+    seasonNumber: file?.seasonNumber,
+    relativePath: file?.relativePath,
+    path: file?.path,
+    size: file?.size,
+    dateAdded: file?.dateAdded,
+    quality: file?.quality,
+    languages: file?.languages,
+    mediaInfo: file?.mediaInfo,
+    releaseGroup: file?.releaseGroup,
+    sceneName: file?.sceneName,
+    sourceTitle: file?.sourceTitle,
+    customFormats: file?.customFormats,
+    customFormatScore: file?.customFormatScore
+  }));
+}
+
+function summarizeSonarrHistoryRecord(record) {
+  return redactSensitiveObject(compactObject({
+    id: record?.id,
+    episodeId: record?.episodeId,
+    seriesId: record?.seriesId,
+    eventType: record?.eventType,
+    date: record?.date,
+    sourceTitle: record?.sourceTitle,
+    quality: record?.quality,
+    languages: record?.languages,
+    customFormats: record?.customFormats,
+    customFormatScore: record?.customFormatScore,
+    data: record?.data
+  }));
+}
+
+function summarizeSonarrEpisode(episode, episodeFile, history) {
+  return redactSensitiveObject(compactObject({
+    id: episode?.id,
+    seriesId: episode?.seriesId,
+    seasonNumber: episode?.seasonNumber,
+    episodeNumber: episode?.episodeNumber,
+    absoluteEpisodeNumber: episode?.absoluteEpisodeNumber,
+    title: episode?.title,
+    airDateUtc: episode?.airDateUtc,
+    hasFile: episode?.hasFile,
+    monitored: episode?.monitored,
+    episodeFileId: episode?.episodeFileId,
+    sceneSeasonNumber: episode?.sceneSeasonNumber,
+    sceneEpisodeNumber: episode?.sceneEpisodeNumber,
+    sceneAbsoluteEpisodeNumber: episode?.sceneAbsoluteEpisodeNumber,
+    unverifiedSceneNumbering: episode?.unverifiedSceneNumbering,
+    quality: episodeFile?.quality,
+    languages: episodeFile?.languages,
+    customFormats: episodeFile?.customFormats,
+    customFormatScore: episodeFile?.customFormatScore,
+    episodeFile: episodeFile ? summarizeSonarrEpisodeFile(episodeFile) : undefined,
+    recentHistory: history
+  }));
+}
+
+async function sonarrEpisodeFile(episodeFileId) {
+  return arrApi("sonarr", "v3", `episodefile/${Number(episodeFileId)}`);
+}
+
+async function sonarrEpisodesForSeries(seriesId, seasonNumber) {
+  const query = compactObject({ seriesId, seasonNumber });
+  const episodes = await arrApi("sonarr", "v3", "episode", { query });
+  return Array.isArray(episodes) ? episodes : [];
+}
+
+async function sonarrEpisodeHistory(episodeId, limit) {
+  const body = await arrApi("sonarr", "v3", "history", {
+    query: { episodeId, page: 1, pageSize: limit, sortKey: "date", sortDirection: "descending" }
+  });
+  return arrRecordsPage(body, summarizeSonarrHistoryRecord, limit).records || [];
+}
+
+async function sonarrListEpisodes(input) {
+  const episodes = await sonarrEpisodesForSeries(input.seriesId, input.seasonNumber);
+  const limited = episodes.slice(0, input.limit);
+  const fileIds = uniquePositiveIds(limited.map(episode => episode.episodeFileId).filter(Boolean));
+  const fileEntries = input.includeEpisodeFiles
+    ? await Promise.all(fileIds.map(async id => [id, await sonarrEpisodeFile(id).catch(error => ({ id, error: error.message }))]))
+    : [];
+  const filesById = new Map(fileEntries);
+  const historyEntries = input.includeHistory
+    ? await Promise.all(limited.map(async episode => [episode.id, await sonarrEpisodeHistory(episode.id, input.historyLimit)]))
+    : [];
+  const historyByEpisodeId = new Map(historyEntries);
+  return {
+    service: "sonarr",
+    seriesId: input.seriesId,
+    seasonNumber: input.seasonNumber,
+    total: episodes.length,
+    returned: limited.length,
+    includeEpisodeFiles: input.includeEpisodeFiles,
+    includeHistory: input.includeHistory,
+    episodes: limited.map(episode => summarizeSonarrEpisode(
+      episode,
+      filesById.get(episode.episodeFileId),
+      historyByEpisodeId.get(episode.id)
+    ))
+  };
+}
+
+function validateSonarrEpisodeFile(file, input) {
+  const blockers = [];
+  if (file?.error) {
+    blockers.push({
+      type: "episode_file_lookup_failed",
+      episodeFileId: file.id,
+      message: "Refusing replacement because Sonarr episode file details could not be fetched.",
+      error: redactText(file.error)
+    });
+  }
+  if (!file?.id) {
+    blockers.push({ type: "missing_episode_file", message: "Sonarr episode file was not found." });
+  }
+  if (input.seriesId && Number(file?.seriesId) !== Number(input.seriesId)) {
+    blockers.push({
+      type: "series_id_mismatch",
+      expectedSeriesId: Number(input.seriesId),
+      actualSeriesId: file?.seriesId,
+      message: "Refusing replacement because the episodeFileId belongs to a different seriesId."
+    });
+  }
+  if (input.expectedPaths?.length && !input.expectedPaths.some(expectedPath => pathsMatchExactly(expectedPath, file?.path))) {
+    blockers.push({
+      type: "path_mismatch",
+      expectedPaths: input.expectedPaths,
+      actualPath: file?.path,
+      message: "Refusing replacement because the episodeFileId path does not match any expected path."
+    });
+  }
+  return blockers;
+}
+
+function episodeIdsEmbeddedInSonarrFiles(files) {
+  return uniquePositiveIds(files.flatMap(file => [
+    ...(file?.episodeIds || []),
+    ...(file?.episodes || []).map(episode => episode.id)
+  ].filter(Boolean)));
+}
+
+async function deriveSonarrEpisodeIdsForFiles(files) {
+  const embedded = episodeIdsEmbeddedInSonarrFiles(files);
+  if (embedded.length) {
+    return embedded;
+  }
+  const seriesIds = uniquePositiveIds(files.map(file => file?.seriesId).filter(Boolean));
+  const seasons = uniquePositiveIds(files.map(file => file?.seasonNumber).filter(value => value !== undefined && value !== null));
+  const matched = [];
+  for (const seriesId of seriesIds) {
+    const seasonNumbers = seasons.length ? seasons : [undefined];
+    for (const seasonNumber of seasonNumbers) {
+      const episodes = await sonarrEpisodesForSeries(seriesId, seasonNumber);
+      matched.push(...episodes.filter(episode => files.some(file => Number(file?.id) === Number(episode.episodeFileId))));
+    }
+  }
+  return uniquePositiveIds(matched.map(episode => episode.id).filter(Boolean));
+}
+
+async function sonarrEpisodeIdsForFiles(files, input) {
+  const explicit = uniquePositiveIds(input.episodeIds || []);
+  const derived = await deriveSonarrEpisodeIdsForFiles(files);
+  if (!explicit.length) {
+    return { episodeIds: derived, blockers: [] };
+  }
+  if (!derived.length) {
+    return {
+      episodeIds: explicit,
+      blockers: [{
+        type: "episode_id_unverified",
+        episodeIds: explicit,
+        message: "Refusing replacement because the provided episodeIds could not be verified against the exact episode files."
+      }]
+    };
+  }
+  const unmatched = explicit.filter(id => !derived.includes(id));
+  if (unmatched.length) {
+    return {
+      episodeIds: explicit,
+      blockers: [{
+        type: "episode_id_mismatch",
+        episodeIds: explicit,
+        derivedEpisodeIds: derived,
+        unmatchedEpisodeIds: unmatched,
+        message: "Refusing replacement because the provided episodeIds do not match the exact Sonarr episode files."
+      }]
+    };
+  }
+  return { episodeIds: explicit, blockers: [] };
+}
+
+async function sonarrReplaceEpisodeFiles(input) {
+  const episodeFileIds = uniquePositiveIds(input.episodeFileIds);
+  const files = await Promise.all(episodeFileIds.map(id => sonarrEpisodeFile(id).catch(error => ({ id, error: error.message }))));
+  const blockers = files.flatMap(file => validateSonarrEpisodeFile(file, input));
+  const { episodeIds, blockers: episodeIdBlockers } = await sonarrEpisodeIdsForFiles(files, input);
+  blockers.push(...episodeIdBlockers);
+  if (input.queueSearch && !episodeIds.length) {
+    blockers.push({
+      type: "missing_episode_ids",
+      message: "No episode IDs could be derived for the replacement search. Provide episodeIds or seriesId."
+    });
+  }
+  const deleteEndpoints = episodeFileIds.map(id => ({
+    method: "DELETE",
+    path: `/api/v3/episodefile/${id}`,
+    query: { deleteFiles: input.deleteFiles !== false }
+  }));
+  const searchCommand = input.queueSearch ? arrCommand("EpisodeSearch", { episodeIds }) : null;
+  const base = {
+    dryRun: input.dryRun,
+    service: "sonarr",
+    episodeFileIds,
+    seriesId: input.seriesId,
+    episodeIds,
+    expectedPaths: input.expectedPaths,
+    deleteFiles: input.deleteFiles !== false,
+    queueSearch: input.queueSearch,
+    blocklistExistingSource: input.blocklistExistingSource,
+    blocklistSupported: false,
+    blocklistNote: input.blocklistExistingSource
+      ? "Sonarr does not expose a safe API path here to blocklist an already-imported episode file source; queue item blocklisting remains available through sonarr_remove_queue_items."
+      : undefined,
+    episodeFiles: files.map(summarizeSonarrEpisodeFile),
+    deleteEndpoints,
+    searchCommand,
+    blockers
+  };
+  if (blockers.length) {
+    return { ...base, deleted: false, searchQueued: false };
+  }
+  if (input.dryRun) {
+    return {
+      ...base,
+      deleted: false,
+      searchQueued: false,
+      note: "Set dryRun to false to delete these exact Sonarr episode files and queue exact replacement EpisodeSearch."
+    };
+  }
+  const deleteResults = [];
+  for (const id of episodeFileIds) {
+    try {
+      const result = await arrApi("sonarr", "v3", `episodefile/${id}`, {
+        method: "DELETE",
+        query: { deleteFiles: input.deleteFiles !== false }
+      });
+      deleteResults.push({ episodeFileId: id, ok: true, result });
+    } catch (error) {
+      deleteResults.push({ episodeFileId: id, ok: false, error: error.message });
+    }
+  }
+  const failedDeletes = deleteResults.filter(result => !result.ok);
+  const searchResult = input.queueSearch && !failedDeletes.length
+    ? await queueArrCommand("sonarr", searchCommand)
+    : null;
+  return {
+    ...base,
+    dryRun: false,
+    deleted: failedDeletes.length === 0,
+    searchQueued: Boolean(searchResult),
+    deleteResults,
+    searchResult
+  };
+}
+
+function plexMetadataRecords(body) {
+  const container = body?.MediaContainer || {};
+  return [
+    ...(container.Metadata || []),
+    ...(container.Directory || [])
+  ];
+}
+
+function summarizePlexPart(part) {
+  return compactObject({
+    id: part?.id,
+    key: part?.key,
+    file: part?.file,
+    size: part?.size,
+    container: part?.container,
+    duration: part?.duration,
+    indexes: part?.indexes,
+    streams: (part?.Stream || []).map(stream => compactObject({
+      id: stream.id,
+      streamType: stream.streamType,
+      streamTypeName: stream.streamTypeName,
+      codec: stream.codec,
+      language: stream.language,
+      languageCode: stream.languageCode,
+      title: stream.title,
+      displayTitle: stream.displayTitle,
+      selected: stream.selected,
+      forced: stream.forced,
+      channels: stream.channels,
+      width: stream.width,
+      height: stream.height
+    }))
+  });
+}
+
+function summarizePlexMetadataItem(item) {
+  const parts = (item?.Media || []).flatMap(media => (media.Part || []).map(part => ({
+    mediaId: media.id,
+    videoResolution: media.videoResolution,
+    videoCodec: media.videoCodec,
+    audioCodec: media.audioCodec,
+    ...summarizePlexPart(part)
+  })));
+  return compactObject({
+    ratingKey: item?.ratingKey,
+    key: item?.key,
+    parentRatingKey: item?.parentRatingKey,
+    grandparentRatingKey: item?.grandparentRatingKey,
+    type: item?.type,
+    title: item?.title,
+    grandparentTitle: item?.grandparentTitle,
+    parentTitle: item?.parentTitle,
+    index: item?.index,
+    parentIndex: item?.parentIndex,
+    year: item?.year,
+    originallyAvailableAt: item?.originallyAvailableAt,
+    duration: item?.duration,
+    guid: item?.guid,
+    parts
+  });
+}
+
+async function plexListSeasonChildren(input) {
+  const ratingKey = String(input.ratingKey || "").trim();
+  if (!ratingKey) {
+    throw new Error("ratingKey is required");
+  }
+  const body = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}/children`);
+  const records = plexMetadataRecords(body);
+  const limited = records.slice(0, input.limit);
+  return {
+    ratingKey,
+    total: records.length,
+    returned: limited.length,
+    children: limited.map(summarizePlexMetadataItem)
+  };
+}
+
+function plexPartsFromMetadata(body) {
+  return plexMetadataRecords(body).flatMap(item => summarizePlexMetadataItem(item).parts || []);
+}
+
+function embeddedTitlesFromProbe(probe) {
+  const titles = [];
+  const formatTitle = probe?.format?.tags?.title || probe?.format?.tags?.TITLE;
+  if (formatTitle) {
+    titles.push({ scope: "format", title: formatTitle });
+  }
+  for (const stream of probe?.streams || []) {
+    const title = stream?.tags?.title || stream?.tags?.TITLE;
+    if (title) {
+      titles.push({ scope: "stream", index: stream.index, streamType: stream.codec_type, title });
+    }
+  }
+  return titles;
+}
+
+function hexAverageHash(buffer) {
+  const bytes = [...buffer.subarray(0, 64)];
+  const average = bytes.reduce((sum, value) => sum + value, 0) / bytes.length;
+  let bits = "";
+  for (const value of bytes) {
+    bits += value >= average ? "1" : "0";
+  }
+  let hex = "";
+  for (let index = 0; index < bits.length; index += 4) {
+    hex += Number.parseInt(bits.slice(index, index + 4), 2).toString(16);
+  }
+  return hex;
+}
+
+function hammingHex(left, right) {
+  const max = Math.max(left.length, right.length);
+  let distance = 0;
+  for (let index = 0; index < max; index += 1) {
+    const leftNibble = Number.parseInt(left[index] || "0", 16);
+    const rightNibble = Number.parseInt(right[index] || "0", 16);
+    distance += (leftNibble ^ rightNibble).toString(2).replaceAll("0", "").length;
+  }
+  return distance;
+}
+
+async function frameAverageHash(ffmpeg, pathValue, timestampSeconds) {
+  const result = await runCommandBufferResult(ffmpeg, [
+    "-v", "error",
+    "-ss", String(timestampSeconds),
+    "-i", pathValue,
+    "-frames:v", "1",
+    "-vf", "scale=8:8,format=gray",
+    "-f", "rawvideo",
+    "-"
+  ], undefined, 1024 * 1024, { timeoutMs: mediaProbeCommandTimeoutMs });
+  if (result.code !== 0 || result.stdout.length < 64) {
+    return {
+      timestampSeconds,
+      ok: false,
+      code: result.code,
+      error: result.error || result.stderr || "ffmpeg did not return one 8x8 grayscale frame"
+    };
+  }
+  return {
+    timestampSeconds,
+    ok: true,
+    algorithm: "average_hash_8x8",
+    hash: hexAverageHash(result.stdout)
+  };
+}
+
+async function mediaProbeVideoContent(input) {
+  let plexParts = [];
+  if (input.ratingKey) {
+    const plexMetadata = await plexApi(`library/metadata/${encodeURIComponent(String(input.ratingKey))}`);
+    plexParts = plexPartsFromMetadata(plexMetadata);
+  }
+  const selectedPart = input.partFile
+    ? { file: input.partFile }
+    : plexParts[input.partIndex || 0];
+  const requestedPath = input.path || selectedPart?.file;
+  if (!requestedPath) {
+    throw new Error("path, partFile, or ratingKey with a Plex media part is required");
+  }
+  const resolution = await resolveMediaReadTarget(requestedPath);
+  const base = {
+    ratingKey: input.ratingKey ? String(input.ratingKey) : undefined,
+    requestedPath,
+    resolvedPath: resolution.path,
+    candidates: resolution.candidates,
+    allowedRoots: resolution.allowedRoots,
+    checked: resolution.checked,
+    plexParts
+  };
+  if (!resolution.path) {
+    return { ...base, blockers: resolution.blockers };
+  }
+  const ffprobe = await findExecutable(["ffprobe"]);
+  if (!ffprobe) {
+    return {
+      ...base,
+      file: resolution.info,
+      blockers: [{ type: "ffprobe_missing", message: "ffprobe is not available in media-mcp." }]
+    };
+  }
+  const probeResult = await runCommandResult(ffprobe, [
+    "-v", "error",
+    "-print_format", "json",
+    "-show_format",
+    "-show_streams",
+    resolution.path
+  ], undefined, { timeoutMs: mediaProbeCommandTimeoutMs });
+  let metadata = null;
+  let metadataError = null;
+  if (probeResult.code === 0) {
+    try {
+      metadata = JSON.parse(probeResult.stdout || "{}");
+    } catch (error) {
+      metadataError = error.message;
+    }
+  } else {
+    metadataError = probeResult.error || probeResult.stderr || `ffprobe exited ${probeResult.code}`;
+  }
+  const timestamps = (input.hashTimestampsSeconds || []).slice(0, 5);
+  let frameHashes = [];
+  let comparison = null;
+  if (input.includeFrameHashes || input.comparePath) {
+    const ffmpeg = await findExecutable(["ffmpeg"]);
+    if (ffmpeg) {
+      frameHashes = await Promise.all((timestamps.length ? timestamps : [10]).map(timestamp => frameAverageHash(ffmpeg, resolution.path, timestamp)));
+      if (input.comparePath) {
+        const compareResolution = await resolveMediaReadTarget(input.comparePath);
+        const compareHashes = compareResolution.path
+          ? await Promise.all((timestamps.length ? timestamps : [10]).map(timestamp => frameAverageHash(ffmpeg, compareResolution.path, timestamp)))
+          : [];
+        comparison = {
+          requestedPath: input.comparePath,
+          resolvedPath: compareResolution.path,
+          blockers: compareResolution.blockers,
+          frameHashes: compareHashes,
+          hammingDistances: frameHashes
+            .map((hash, index) => hash.ok && compareHashes[index]?.ok ? {
+              timestampSeconds: hash.timestampSeconds,
+              distance: hammingHex(hash.hash, compareHashes[index].hash)
+            } : null)
+            .filter(Boolean)
+        };
+      }
+    } else {
+      frameHashes = [{ ok: false, error: "ffmpeg is not available in media-mcp." }];
+    }
+  }
+  return compactObject({
+    ...base,
+    file: resolution.info,
+    ffprobe: { command: ffprobe, code: probeResult.code, error: metadataError },
+    embeddedTitles: metadata ? embeddedTitlesFromProbe(metadata) : [],
+    metadata,
+    frameHashes,
+    comparison
+  });
+}
+
 function issueMediaTitle(issue) {
   return firstString(
     issue?.mediaTitle,
@@ -1691,6 +2411,227 @@ async function pathInfo(pathValue) {
   }
 }
 
+function mediaDeleteRootSummary() {
+  return mediaDeleteRoots.map(root => nodePath.resolve(root));
+}
+
+async function mediaFileInfo(pathValue) {
+  const info = await pathInfo(pathValue);
+  if (!info.exists) {
+    return info;
+  }
+  const details = await stat(pathValue);
+  return {
+    ...info,
+    file: details.isFile(),
+    size: details.size,
+    mtime: details.mtime.toISOString(),
+    ctime: details.ctime.toISOString(),
+    parentWritable: await access(nodePath.dirname(pathValue), fsConstants.W_OK).then(() => true, () => false)
+  };
+}
+
+async function resolveMediaDeleteTarget(pathValue) {
+  const candidates = mediaPathCandidates(pathValue)
+    .filter(candidate => nodePath.isAbsolute(candidate))
+    .map(candidate => nodePath.resolve(candidate));
+  const allowedRoots = mediaDeleteRootSummary();
+  const checked = [];
+  const blockers = [];
+  if (!allowedRoots.length) {
+    return {
+      path: null,
+      candidates,
+      allowedRoots,
+      checked,
+      blockers: [{
+        type: "no_allowed_media_roots",
+        message: "MEDIA_MCP_MEDIA_ROOTS must include one or more mounted media roots before media_file_delete can delete files."
+      }]
+    };
+  }
+  const allowedCandidates = candidates.filter(candidate => allowedRoots.some(root => resolvedPathInside(root, candidate)));
+  if (!allowedCandidates.length) {
+    return {
+      path: null,
+      candidates,
+      allowedRoots,
+      checked,
+      blockers: [{
+        type: "path_outside_allowed_roots",
+        message: "Refusing file delete because no resolved candidate is inside MEDIA_MCP_MEDIA_ROOTS.",
+        requestedPath: pathValue
+      }]
+    };
+  }
+  for (const candidate of allowedCandidates) {
+    const info = await mediaFileInfo(candidate);
+    checked.push(info);
+    if (!info.exists) {
+      continue;
+    }
+    if (info.directory) {
+      blockers.push({
+        type: "refusing_directory",
+        path: candidate,
+        message: "media_file_delete deletes exact files only, not directories."
+      });
+      continue;
+    }
+    if (!info.file) {
+      blockers.push({
+        type: "not_regular_file",
+        path: candidate,
+        message: "media_file_delete deletes regular files only."
+      });
+      continue;
+    }
+    return { path: candidate, candidates, allowedRoots, checked, info, blockers: [] };
+  }
+  return {
+    path: null,
+    candidates,
+    allowedRoots,
+    checked,
+    blockers: blockers.length ? blockers : [{
+      type: "path_not_visible",
+      message: "No resolved candidate path exists as a regular file inside the configured media roots."
+    }]
+  };
+}
+
+async function resolveMediaReadTarget(pathValue) {
+  const candidates = mediaPathCandidates(pathValue)
+    .filter(candidate => nodePath.isAbsolute(candidate))
+    .map(candidate => nodePath.resolve(candidate));
+  const allowedRoots = mediaDeleteRootSummary();
+  const checked = [];
+  if (!allowedRoots.length) {
+    return {
+      path: null,
+      candidates,
+      allowedRoots,
+      checked,
+      blockers: [{
+        type: "no_allowed_media_roots",
+        message: "MEDIA_MCP_MEDIA_ROOTS must include one or more mounted media roots before media files can be probed."
+      }]
+    };
+  }
+  const allowedCandidates = candidates.filter(candidate => allowedRoots.some(root => resolvedPathInside(root, candidate)));
+  if (!allowedCandidates.length) {
+    return {
+      path: null,
+      candidates,
+      allowedRoots,
+      checked,
+      blockers: [{
+        type: "path_outside_allowed_roots",
+        message: "Refusing media probe because no resolved candidate is inside MEDIA_MCP_MEDIA_ROOTS.",
+        requestedPath: pathValue
+      }]
+    };
+  }
+  for (const candidate of allowedCandidates) {
+    const info = await mediaFileInfo(candidate);
+    checked.push(info);
+    if (!info.exists) {
+      continue;
+    }
+    if (!info.file) {
+      continue;
+    }
+    if (!info.readable) {
+      return {
+        path: null,
+        candidates,
+        allowedRoots,
+        checked,
+        blockers: [{
+          type: "file_not_readable",
+          path: candidate,
+          message: "The resolved media file is not readable inside media-mcp."
+        }]
+      };
+    }
+    return { path: candidate, candidates, allowedRoots, checked, info, blockers: [] };
+  }
+  return {
+    path: null,
+    candidates,
+    allowedRoots,
+    checked,
+    blockers: [{
+      type: "path_not_visible",
+      message: "No resolved candidate path exists as a readable regular file inside the configured media roots."
+    }]
+  };
+}
+
+async function mediaFileDelete(input) {
+  const requestedPath = String(input.path || "").trim();
+  if (!requestedPath) {
+    throw new Error("path is required");
+  }
+  const resolution = await resolveMediaDeleteTarget(requestedPath);
+  const base = {
+    dryRun: input.dryRun,
+    requestedPath,
+    resolvedPath: resolution.path,
+    candidates: resolution.candidates,
+    allowedRoots: resolution.allowedRoots,
+    checked: resolution.checked
+  };
+  if (!resolution.path) {
+    return {
+      ...base,
+      deleted: false,
+      blockers: resolution.blockers
+    };
+  }
+  if (input.expectedSize !== undefined && Number(input.expectedSize) !== Number(resolution.info.size)) {
+    return {
+      ...base,
+      file: resolution.info,
+      deleted: false,
+      blockers: [{
+        type: "size_mismatch",
+        expectedSize: Number(input.expectedSize),
+        actualSize: resolution.info.size,
+        message: "Refusing file delete because the file size does not match expectedSize."
+      }]
+    };
+  }
+  if (!resolution.info.parentWritable) {
+    return {
+      ...base,
+      file: resolution.info,
+      deleted: false,
+      blockers: [{
+        type: "parent_not_writable",
+        path: nodePath.dirname(resolution.path),
+        message: "The containing directory is not writable inside media-mcp."
+      }]
+    };
+  }
+  if (input.dryRun) {
+    return {
+      ...base,
+      file: resolution.info,
+      deleted: false,
+      note: "Set dryRun to false to delete this exact file."
+    };
+  }
+  await rm(resolution.path, { force: false, recursive: false });
+  const after = await pathInfo(resolution.path);
+  return {
+    ...base,
+    file: resolution.info,
+    deleted: !after.exists,
+    after
+  };
+}
+
 async function resolveReadableDirectory(pathValue) {
   const candidates = mediaPathCandidates(pathValue);
   const checked = [];
@@ -1936,11 +2877,34 @@ async function downloadClientArchiveDiagnosis(input) {
   };
 }
 
-async function runCommandResult(command, args, cwd) {
+async function runCommandResult(command, args, cwd, options = {}) {
   return new Promise(resolve => {
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = result => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      resolve(result);
+    };
+    if (options.timeoutMs) {
+      timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish({
+          code: null,
+          stdout: redactText(stdout),
+          stderr: redactText(stderr),
+          error: `Command timed out after ${options.timeoutMs}ms`
+        });
+      }, options.timeoutMs);
+    }
     child.stdout.on("data", chunk => {
       stdout += chunk;
     });
@@ -1948,10 +2912,68 @@ async function runCommandResult(command, args, cwd) {
       stderr += chunk;
     });
     child.on("error", error => {
-      resolve({ code: null, stdout: redactText(stdout), stderr: redactText(stderr), error: error.message });
+      finish({ code: null, stdout: redactText(stdout), stderr: redactText(stderr), error: error.message });
     });
     child.on("close", code => {
-      resolve({ code, stdout: redactText(stdout), stderr: redactText(stderr) });
+      finish({ code, stdout: redactText(stdout), stderr: redactText(stderr) });
+    });
+  });
+}
+
+async function runCommandBufferResult(command, args, cwd, maxBytes = 1024 * 1024, options = {}) {
+  return new Promise(resolve => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    let stdoutLength = 0;
+    let stderr = "";
+    let killed = false;
+    let settled = false;
+    let timer = null;
+    const finish = result => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      resolve(result);
+    };
+    if (options.timeoutMs) {
+      timer = setTimeout(() => {
+        killed = true;
+        child.kill("SIGTERM");
+        finish({
+          code: null,
+          stdout: Buffer.concat(stdout),
+          stderr: redactText(stderr),
+          error: `Command timed out after ${options.timeoutMs}ms`
+        });
+      }, options.timeoutMs);
+    }
+    child.stdout.on("data", chunk => {
+      stdoutLength += chunk.length;
+      if (stdoutLength > maxBytes && !killed) {
+        killed = true;
+        child.kill("SIGTERM");
+      }
+      if (!killed) {
+        stdout.push(chunk);
+      }
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk;
+    });
+    child.on("error", error => {
+      finish({ code: null, stdout: Buffer.concat(stdout), stderr: redactText(stderr), error: error.message });
+    });
+    child.on("close", code => {
+      finish({
+        code,
+        stdout: Buffer.concat(stdout),
+        stderr: redactText(stderr),
+        error: killed ? `Command output exceeded ${maxBytes} bytes` : undefined
+      });
     });
   });
 }
@@ -7335,6 +8357,32 @@ function createServer() {
     }
   }, async (input) => jsonText(await archiveEnvironmentCheck(input)));
 
+  server.registerTool("media_file_delete", {
+    title: "Scoped Media File Delete",
+    description: "Stat or delete one exact media file path after resolving MEDIA_MCP_PATH_MAPS, constrained to MEDIA_MCP_MEDIA_ROOTS. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      path: z.string().min(1),
+      expectedSize: z.number().int().nonnegative().optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await mediaFileDelete(input)));
+
+  server.registerTool("media_probe_video_content", {
+    title: "Video Content Probe",
+    description: "Probe one exact media file or Plex media part with ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      path: z.string().min(1).optional(),
+      ratingKey: z.union([z.string(), z.number()]).optional(),
+      partIndex: z.number().int().min(0).default(0),
+      partFile: z.string().min(1).optional(),
+      includeFrameHashes: z.boolean().default(false),
+      hashTimestampsSeconds: z.array(z.number().min(0)).max(5).optional(),
+      comparePath: z.string().min(1).optional()
+    }
+  }, async (input) => jsonText(await mediaProbeVideoContent(input)));
+
   server.registerTool("media_admin_overview", {
     title: "Media Admin Overview",
     description: "Return compact actionable counts for queues, download clients, Plex streams, and Seerr issues/requests."
@@ -7445,6 +8493,16 @@ function createServer() {
     }
   }, async ({ ratingKey }) => jsonText(await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}`)));
 
+  server.registerTool("plex_list_season_children", {
+    title: "Plex Season Children Listing",
+    description: "List all child episodes for one Plex season rating key, including episode rating keys, part paths, media streams, and file identifiers.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]),
+      limit: z.number().int().min(1).max(250).default(100)
+    }
+  }, async (input) => jsonText(await plexListSeasonChildren(input)));
+
   server.registerTool("plex_refresh_metadata", {
     title: "Plex Refresh Metadata",
     description: "Refresh Plex metadata for one exact rating key. Dry-run is enabled by default.",
@@ -7474,6 +8532,19 @@ function createServer() {
       language: z.string().min(1)
     }
   }, async (input) => jsonText(await verifyPlexSubtitleTrack(input)));
+
+  server.registerTool("plex_delete_metadata", {
+    title: "Plex Item Deletion And Scan",
+    description: "Run exact Plex metadata deletion, library section scan, or empty-trash operation. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      operation: z.enum(["delete_metadata", "scan_section", "empty_trash"]).default("delete_metadata"),
+      ratingKey: z.union([z.string(), z.number()]).optional(),
+      sectionKey: z.union([z.string(), z.number()]).optional(),
+      path: z.string().min(1).optional(),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await plexDeleteMetadata(input)));
 
   server.registerTool("plex_active_sessions", {
     title: "Plex Active Sessions",
@@ -7825,6 +8896,36 @@ function createServer() {
       limit: z.number().int().min(1).max(250).default(50)
     }
   }, async ({ queueId, limit }) => jsonText(await arrQueueItemFiles("sonarr", queueId, limit)));
+
+  server.registerTool("sonarr_list_episodes", {
+    title: "Sonarr Episode Inventory",
+    description: "List Sonarr episodes for one series/season with episode IDs, episodeFileIds, scene mapping fields, quality, custom format scores, and optional recent history.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      seriesId: z.number().int().positive(),
+      seasonNumber: z.number().int().min(0).optional(),
+      includeEpisodeFiles: z.boolean().default(true),
+      includeHistory: z.boolean().default(false),
+      historyLimit: z.number().int().min(1).max(20).default(5),
+      limit: z.number().int().min(1).max(250).default(100)
+    }
+  }, async (input) => jsonText(await sonarrListEpisodes(input)));
+
+  server.registerTool("sonarr_replace_episode_files", {
+    title: "Safe Sonarr File Replacement",
+    description: "Guarded workflow to delete exact Sonarr episodeFileIds and queue exact EpisodeSearch replacement searches. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      episodeFileIds: z.array(z.number().int().positive()).min(1).max(20),
+      seriesId: z.number().int().positive().optional(),
+      episodeIds: z.array(z.number().int().positive()).max(100).optional(),
+      expectedPaths: z.array(z.string().min(1)).max(20).optional(),
+      deleteFiles: z.boolean().default(true),
+      queueSearch: z.boolean().default(true),
+      blocklistExistingSource: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await sonarrReplaceEpisodeFiles(input)));
 
   server.registerTool("sonarr_import_queue_item", {
     title: "Sonarr Import Queue Item",
@@ -8333,6 +9434,19 @@ function createServer() {
   }, async ({ movieId, files, dryRun }) => {
     return jsonText(await arrCommandAction("radarr", arrCommand("RenameFiles", { movieId, files }), dryRun));
   });
+
+  server.registerTool("radarr_delete_movie_file", {
+    title: "Radarr Movie File Deletion",
+    description: "Delete one exact Radarr movieFileId without queueing a replacement search. Dry-run is enabled by default and optional movieId/path guards prevent deleting the wrong file.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      movieFileId: z.number().int().positive(),
+      movieId: z.number().int().positive().optional(),
+      expectedPath: z.string().min(1).optional(),
+      deleteFiles: z.boolean().default(true),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await radarrDeleteMovieFile(input)));
 
   server.registerTool("radarr_interactive_search_movie", {
     title: "Radarr Interactive Search Movie",
