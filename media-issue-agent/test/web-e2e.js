@@ -335,7 +335,15 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gaps-list")).toContainText("sonarr_replace_fixture_episode");
     await page.locator("#mcp-gaps-check-button").click();
     await expect(page.locator(".mcp-gap-detected")).toHaveText("DETECTED");
+    await expect(page.locator(".mcp-gap-detected")).toHaveAttribute("type", "button");
     await expect(page.locator("[data-remove-mcp-gap]")).toHaveClass(/detected/);
+    await page.locator(".mcp-gap-detected").click();
+    await expect(page.locator("#mcp-gap-detection-dialog")).toBeVisible();
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Replace a fixture episode");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("sonarr_replace_fixture_episode");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Live media-mcp tool");
+    await page.locator("#mcp-gap-detection-close-button").click();
+    await expect(page.locator("#mcp-gap-detection-dialog")).toBeHidden();
     await page.locator("#mcp-gaps-close-button").click();
     await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
     await page.locator("#mcp-gaps-button").click();
@@ -448,6 +456,23 @@ async function testJobListRowsDoNotOverlap(browser) {
       type: "item.completed",
       item: { type: "mcp_tool_call", name: "media.plex_refresh_metadata", status: "completed" }
     });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "item.completed", {
+      type: "item.completed",
+      item: {
+        type: "agent_message",
+        text: "Sonarr history shows the root of the confusion is season numbering drift."
+      }
+    });
+    recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "item.completed", {
+      type: "item.completed",
+      item: {
+        type: "agent_message",
+        text: JSON.stringify({
+          status: "fixed",
+          summary: "Season history shows the repair completed and verification passed."
+        })
+      }
+    });
     for (let index = 0; index < 16; index += 1) {
       const issueId = index % 3 === 0
         ? `e293935c-859c-49e5-a782-a5bfce703950-${index}`
@@ -471,6 +496,11 @@ async function testJobListRowsDoNotOverlap(browser) {
     await expect(page.locator("#investigation-output")).toContainText("Result from sonarr_replace_episode: HTTP 200");
     await expect(page.locator("#investigation-output")).toContainText("accepted by Sonarr");
     await expect(page.locator("#investigation-output")).toContainText("Codex completed plex_refresh_metadata");
+    await expect(page.locator("#investigation-output")).toContainText("Codex reported Sonarr history shows the root of the confusion");
+    await expect(page.locator("#investigation-output")).toContainText("Codex reported fixed: Season history shows the repair completed");
+    await expect(page.locator("#investigation-output")).not.toContainText("hi tory");
+    await expect(page.locator("#investigation-output")).not.toContainText("confu ion");
+    await expect(page.locator("#investigation-output")).not.toContainText("reque t accepted");
     await expect(page.locator("#investigation-output")).not.toContainText('"toolName"');
     await page.locator("#investigation-output").evaluate(element => {
       element.scrollTop = element.scrollHeight;

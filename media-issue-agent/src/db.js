@@ -44,6 +44,8 @@ export async function initDb(dbPath) {
   await ensureDbDir(dbPath);
   sqliteExec(dbPath, `
 PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 10000;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS issue_snapshots (
