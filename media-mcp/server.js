@@ -760,6 +760,34 @@ function mediaPathCandidates(pathValue) {
   return uniqueValues(candidates);
 }
 
+function mediaReadPathCandidates(pathValue) {
+  const candidates = mediaPathCandidates(pathValue);
+  const clean = cleanPath(pathValue);
+  if (!clean || !nodePath.isAbsolute(clean)) {
+    return candidates;
+  }
+  const parts = clean.split("/").filter(Boolean);
+  const libraryMarkers = new Set(["tv", "shows", "series", "movies", "movie", "films", "anime"]);
+  const roots = mediaDeleteRootSummary();
+  for (const root of roots) {
+    const cleanRoot = cleanPath(root);
+    if (!cleanRoot) {
+      continue;
+    }
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      if (!libraryMarkers.has(parts[index].toLowerCase())) {
+        continue;
+      }
+      const suffix = parts.slice(index).join("/");
+      candidates.push(`${cleanRoot}/${suffix}`);
+      if (cleanRoot.toLowerCase().endsWith(`/${parts[index].toLowerCase()}`)) {
+        candidates.push(`${cleanRoot}/${parts.slice(index + 1).join("/")}`);
+      }
+    }
+  }
+  return uniqueValues(candidates);
+}
+
 function pathInside(parent, candidate) {
   const cleanParent = cleanPath(parent);
   const cleanCandidate = cleanPath(candidate);
@@ -1397,6 +1425,125 @@ async function plexDeleteMetadata(input) {
   };
 }
 
+function plexMetadataPartFiles(body) {
+  return plexMetadataRecords(body).flatMap(item => {
+    return (item?.Media || []).flatMap(media => {
+      return (media?.Part || []).map(part => part?.file).filter(Boolean);
+    });
+  });
+}
+
+function parentDirectories(paths) {
+  return uniqueValues(paths
+    .map(pathValue => cleanPath(pathValue))
+    .filter(Boolean)
+    .map(pathValue => nodePath.posix.dirname(pathValue)));
+}
+
+async function plexScanLibraryPath(input) {
+  const ratingKey = input.ratingKey !== undefined && input.ratingKey !== null ? String(input.ratingKey).trim() : "";
+  let metadata;
+  if (ratingKey) {
+    metadata = await plexMetadataForRatingKey(ratingKey);
+    if (metadata.error) {
+      throw new Error(`Plex metadata lookup failed for rating key ${ratingKey}: ${metadata.error}`);
+    }
+  }
+  const sectionKey = String(input.sectionKey ?? metadata?.summary?.librarySectionID ?? "").trim();
+  const explicitPaths = [
+    ...(input.path ? [input.path] : []),
+    ...(input.paths || [])
+  ];
+  const inferredPaths = metadata?.body ? parentDirectories(plexMetadataPartFiles(metadata.body)) : [];
+  const paths = uniqueValues([...explicitPaths.map(cleanPath), ...inferredPaths]);
+  const scanPaths = input.scanPaths !== false;
+  const refreshMetadata = input.refreshMetadata !== false && Boolean(ratingKey);
+  const analyzeMetadata = Boolean(input.analyzeMetadata && ratingKey);
+  const emptyTrash = Boolean(input.emptyTrash && sectionKey);
+  const actions = [];
+
+  if (scanPaths && paths.length && sectionKey) {
+    for (const scanPath of paths) {
+      actions.push({
+        type: "scan_path",
+        method: "PUT",
+        path: `/library/sections/${sectionKey}/refresh`,
+        query: { path: scanPath }
+      });
+    }
+  }
+  if (refreshMetadata) {
+    actions.push({
+      type: "refresh_metadata",
+      method: "PUT",
+      path: `/library/metadata/${ratingKey}/refresh`
+    });
+  }
+  if (analyzeMetadata) {
+    actions.push({
+      type: "analyze_metadata",
+      method: "PUT",
+      path: `/library/metadata/${ratingKey}/analyze`
+    });
+  }
+  if (emptyTrash) {
+    actions.push({
+      type: "empty_trash",
+      method: "PUT",
+      path: `/library/sections/${sectionKey}/emptyTrash`
+    });
+  }
+
+  const blockers = [];
+  if (scanPaths && !sectionKey) {
+    blockers.push({ type: "missing_section_key", message: "sectionKey is required for path scans when it cannot be inferred from ratingKey metadata." });
+  }
+  if (scanPaths && !paths.length) {
+    blockers.push({ type: "missing_scan_path", message: "Provide path/paths or a ratingKey whose Plex metadata contains media part paths." });
+  }
+  if (!actions.length) {
+    blockers.push({ type: "no_actions", message: "No Plex scan, refresh, analyze, or trash-empty operation was requested." });
+  }
+
+  const base = compactObject({
+    dryRun: input.dryRun,
+    ratingKey: ratingKey || undefined,
+    sectionKey: sectionKey || undefined,
+    paths,
+    metadata: metadata?.summary,
+    actions,
+    blockers: blockers.length ? blockers : undefined
+  });
+  if (blockers.length) {
+    return base;
+  }
+  if (input.dryRun) {
+    return {
+      ...base,
+      note: "Set dryRun to false to run these Plex scan/refresh operations."
+    };
+  }
+  const results = [];
+  for (const action of actions) {
+    const apiPath = action.path.replace(/^\/+/, "");
+    try {
+      results.push({
+        action: action.type,
+        ok: true,
+        result: await plexApi(apiPath, { method: action.method, query: action.query })
+      });
+    } catch (error) {
+      results.push({ action: action.type, ok: false, error: redactText(error.message) });
+    }
+  }
+  return {
+    ...base,
+    dryRun: false,
+    results,
+    ok: results.every(result => result.ok)
+  };
+}
+
 function summarizeRadarrMovieFile(file) {
   return redactSensitiveObject(compactObject({
     id: file?.id,
@@ -1777,6 +1924,114 @@ async function sonarrReplaceEpisodeFiles(input) {
   };
 }
 
+function importLikeHistoryRecord(record) {
+  const eventType = String(record?.eventType || "").toLowerCase();
+  return /import|downloadfolderimported|episodefile/.test(eventType) && typeof record?.sourceTitle === "string" && record.sourceTitle.trim();
+}
+
+function sonarrBlocklistBody(record, input, fallback = {}) {
+  return compactObject({
+    seriesId: Number(input.seriesId ?? record?.seriesId ?? fallback.seriesId) || undefined,
+    episodeIds: uniquePositiveIds(input.episodeIds?.length ? input.episodeIds : fallback.episodeIds || (record?.episodeId ? [record.episodeId] : [])),
+    sourceTitle: input.sourceTitle || record?.sourceTitle,
+    quality: input.quality || record?.quality || fallback.quality,
+    languages: input.languages || record?.languages || fallback.languages,
+    protocol: input.protocol || record?.protocol || record?.data?.protocol,
+    indexer: input.indexer || record?.indexer || record?.data?.indexer,
+    message: input.message || "Blocklisting imported source for replacement after a verified bad episode file."
+  });
+}
+
+async function sonarrBlocklistEpisodeFileSource(input) {
+  const episodeFileIds = uniquePositiveIds(input.episodeFileIds || []);
+  const explicitEpisodeIds = uniquePositiveIds(input.episodeIds || []);
+  if (!episodeFileIds.length && !explicitEpisodeIds.length && !input.sourceTitle) {
+    throw new Error("provide episodeFileIds, episodeIds, or sourceTitle");
+  }
+  const files = episodeFileIds.length
+    ? await Promise.all(episodeFileIds.map(id => sonarrEpisodeFile(id).catch(error => ({ id, error: error.message }))))
+    : [];
+  const blockers = files.flatMap(file => validateSonarrEpisodeFile(file, input));
+  const { episodeIds: derivedEpisodeIds, blockers: episodeIdBlockers } = files.length
+    ? await sonarrEpisodeIdsForFiles(files, { ...input, episodeIds: explicitEpisodeIds })
+    : { episodeIds: explicitEpisodeIds, blockers: [] };
+  blockers.push(...episodeIdBlockers);
+  const episodeIds = uniquePositiveIds([...explicitEpisodeIds, ...derivedEpisodeIds]);
+  const historyEntries = episodeIds.length
+    ? await Promise.all(episodeIds.map(async episodeId => [episodeId, await sonarrEpisodeHistory(episodeId, input.historyLimit)]))
+    : [];
+  const history = historyEntries.flatMap(([, records]) => records || []);
+  const sourceTitle = String(input.sourceTitle || "").trim();
+  const matchedHistory = sourceTitle
+    ? history.find(record => record.sourceTitle === sourceTitle)
+    : history.find(importLikeHistoryRecord);
+  const fallbackFile = files.find(file => !file.error);
+  const fallback = {
+    seriesId: input.seriesId ?? fallbackFile?.seriesId,
+    episodeIds,
+    quality: fallbackFile?.quality,
+    languages: fallbackFile?.languages
+  };
+  const body = sonarrBlocklistBody(matchedHistory, input, fallback);
+  if (!body.sourceTitle) {
+    blockers.push({
+      type: "missing_source_title",
+      message: "Could not determine an imported sourceTitle from Sonarr history; provide sourceTitle explicitly."
+    });
+  }
+  if (!body.seriesId) {
+    blockers.push({
+      type: "missing_series_id",
+      message: "Could not determine seriesId from the episode file, history, or input."
+    });
+  }
+  if (!body.episodeIds?.length) {
+    blockers.push({
+      type: "missing_episode_ids",
+      message: "Could not determine exact episode IDs to associate with the blocklist entry."
+    });
+  }
+  if (!matchedHistory?.id) {
+    blockers.push({
+      type: "missing_history_record",
+      message: "Could not match an exact Sonarr history record to mark failed for blocklisting."
+    });
+  }
+  const endpoint = {
+    method: "POST",
+    path: matchedHistory?.id ? `/api/v3/history/failed/${matchedHistory.id}` : "/api/v3/history/failed/{historyId}"
+  };
+  const base = {
+    dryRun: input.dryRun,
+    service: "sonarr",
+    episodeFileIds,
+    episodeIds,
+    sourceTitle: body.sourceTitle,
+    blocklistEntry: body,
+    endpoint,
+    episodeFiles: files.map(summarizeSonarrEpisodeFile),
+    matchedHistory: matchedHistory ? summarizeSonarrHistoryRecord(matchedHistory) : undefined,
+    history: history.map(summarizeSonarrHistoryRecord),
+    blockers
+  };
+  if (blockers.length) {
+    return { ...base, blocklisted: false };
+  }
+  if (input.dryRun) {
+    return {
+      ...base,
+      blocklisted: false,
+      note: "Set dryRun to false to POST this exact imported source to Sonarr's blocklist."
+    };
+  }
+  return {
+    ...base,
+    dryRun: false,
+    blocklisted: true,
+    result: redactSensitiveObject(await arrApi("sonarr", "v3", `history/failed/${matchedHistory.id}`, { method: "POST" }))
+  };
+}
+
 function plexMetadataRecords(body) {
   const container = body?.MediaContainer || {};
   return [
@@ -1829,6 +2084,8 @@ function summarizePlexMetadataItem(item) {
     title: item?.title,
     grandparentTitle: item?.grandparentTitle,
     parentTitle: item?.parentTitle,
+    librarySectionID: item?.librarySectionID,
+    librarySectionTitle: item?.librarySectionTitle,
     index: item?.index,
     parentIndex: item?.parentIndex,
     year: item?.year,
@@ -1852,6 +2109,45 @@ async function plexListSeasonChildren(input) {
     total: records.length,
     returned: limited.length,
     children: limited.map(summarizePlexMetadataItem)
+  };
+}
+
+function summarizePlexSeasonItem(item) {
+  return compactObject({
+    ratingKey: item?.ratingKey,
+    key: item?.key,
+    type: item?.type,
+    title: item?.title,
+    parentTitle: item?.parentTitle,
+    parentRatingKey: item?.parentRatingKey,
+    grandparentTitle: item?.grandparentTitle,
+    grandparentRatingKey: item?.grandparentRatingKey,
+    index: item?.index,
+    librarySectionID: item?.librarySectionID,
+    librarySectionTitle: item?.librarySectionTitle,
+    childCount: item?.childCount ?? item?.leafCount,
+    leafCount: item?.leafCount,
+    viewedLeafCount: item?.viewedLeafCount,
+    duration: item?.duration,
+    originallyAvailableAt: item?.originallyAvailableAt
+  });
+}
+
+async function plexListShowSeasons(input) {
+  const ratingKey = String(input.ratingKey || "").trim();
+  if (!ratingKey) {
+    throw new Error("ratingKey is required");
+  }
+  const body = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}/children`);
+  const records = plexMetadataRecords(body);
+  const seasons = records
+    .filter(record => !record.type || record.type === "season" || record.leafCount !== undefined || record.childCount !== undefined)
+    .slice(0, input.limit);
+  return {
+    ratingKey,
+    total: records.length,
+    returned: seasons.length,
+    seasons: seasons.map(summarizePlexSeasonItem)
   };
 }
 
@@ -2501,7 +2797,7 @@ async function resolveMediaDeleteTarget(pathValue) {
 }
 
 async function resolveMediaReadTarget(pathValue) {
-  const candidates = mediaPathCandidates(pathValue)
+  const candidates = mediaReadPathCandidates(pathValue)
     .filter(candidate => nodePath.isAbsolute(candidate))
     .map(candidate => nodePath.resolve(candidate));
   const allowedRoots = mediaDeleteRootSummary();
@@ -7260,6 +7556,7 @@ function summarizeArrReleaseCandidate(record) {
     customFormatScore: record.customFormatScore,
     indexerFlags: record.indexerFlags,
     releaseWeight: record.releaseWeight,
+    releaseType: record.releaseType,
     downloadAllowed: record.downloadAllowed,
     rejected: record.rejected,
     rejections,
@@ -7282,6 +7579,26 @@ async function arrInteractiveSearch(serviceName, query, limit) {
     returned: Math.min(records.length, limit),
     records: records.slice(0, limit).map(summarizeArrReleaseCandidate),
     note: "Use the exact guid and indexerId from a candidate with the matching grab object when calling the grab tool. Full release objects are accepted when needed, but raw download URLs are not returned here."
+  };
+}
+
+async function sonarrInteractiveSearchSeason(input) {
+  const result = await arrInteractiveSearch("sonarr", {
+    seriesId: input.seriesId,
+    seasonNumber: input.seasonNumber
+  }, input.limit);
+  if (!input.seasonPackOnly) {
+    return result;
+  }
+  const hasReleaseTypes = result.records.some(record => record.releaseType);
+  const records = hasReleaseTypes
+    ? result.records.filter(record => String(record.releaseType || "").toLowerCase().includes("season"))
+    : result.records;
+  return {
+    ...result,
+    returned: Math.min(records.length, input.limit),
+    records: records.slice(0, input.limit),
+    note: `${result.note} seasonPackOnly only filters when Sonarr returns releaseType metadata.`
   };
 }
 
@@ -8503,6 +8820,16 @@ function createServer() {
     }
   }, async (input) => jsonText(await plexListSeasonChildren(input)));
 
+  server.registerTool("plex_list_show_seasons", {
+    title: "Plex Show Season Listing",
+    description: "List seasons for one Plex show rating key, including season indexes, rating keys, library section, and child counts.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]),
+      limit: z.number().int().min(1).max(250).default(100)
+    }
+  }, async (input) => jsonText(await plexListShowSeasons(input)));
+
   server.registerTool("plex_refresh_metadata", {
     title: "Plex Refresh Metadata",
     description: "Refresh Plex metadata for one exact rating key. Dry-run is enabled by default.",
@@ -8545,6 +8872,23 @@ function createServer() {
       dryRun: z.boolean().default(true)
     }
   }, async (input) => jsonText(await plexDeleteMetadata(input)));
+
+  server.registerTool("plex_scan_library_path", {
+    title: "Working Plex Path Scan And Metadata Refresh",
+    description: "Run a Plex library section path scan plus optional rating-key refresh/analyze after media files are replaced. Can infer section and part paths from a rating key. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      ratingKey: z.union([z.string(), z.number()]).optional(),
+      sectionKey: z.union([z.string(), z.number()]).optional(),
+      path: z.string().min(1).optional(),
+      paths: z.array(z.string().min(1)).max(20).optional(),
+      scanPaths: z.boolean().default(true),
+      refreshMetadata: z.boolean().default(true),
+      analyzeMetadata: z.boolean().default(false),
+      emptyTrash: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await plexScanLibraryPath(input)));
 
   server.registerTool("plex_active_sessions", {
     title: "Plex Active Sessions",
@@ -8927,6 +9271,25 @@ function createServer() {
     }
   }, async (input) => jsonText(await sonarrReplaceEpisodeFiles(input)));
 
+  server.registerTool("sonarr_blocklist_episode_file_source", {
+    title: "Sonarr Imported-Source Blocklisting",
+    description: "Derive the imported source associated with exact Sonarr episode files or episode IDs and mark the matching Sonarr history record failed so Sonarr blocklists that source. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      episodeFileIds: z.array(z.number().int().positive()).max(20).optional(),
+      episodeIds: z.array(z.number().int().positive()).max(100).optional(),
+      seriesId: z.number().int().positive().optional(),
+      sourceTitle: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      protocol: z.string().min(1).optional(),
+      quality: z.any().optional(),
+      languages: z.array(z.any()).optional(),
+      message: z.string().min(1).optional(),
+      historyLimit: z.number().int().min(1).max(50).default(10),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await sonarrBlocklistEpisodeFileSource(input)));
+
   server.registerTool("sonarr_import_queue_item", {
     title: "Sonarr Import Queue Item",
     description: "Discover safe manual import candidates for one Sonarr queue item and queue ManualImport for the safe rows. Dry-run is enabled by default.",
@@ -9120,6 +9483,18 @@ function createServer() {
       limit: z.number().int().min(1).max(250).default(50)
     }
   }, async ({ episodeId, limit }) => jsonText(await arrInteractiveSearch("sonarr", { episodeId }, limit)));
+
+  server.registerTool("sonarr_interactive_search_season", {
+    title: "Sonarr Season-Pack Interactive Search And Grab",
+    description: "List Sonarr season-level interactive search candidates for one exact series/season. Use the returned grab object with sonarr_grab_release to grab an exact season-pack release from Sonarr's release cache.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      seriesId: z.number().int().positive(),
+      seasonNumber: z.number().int().min(0),
+      seasonPackOnly: z.boolean().default(true),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async (input) => jsonText(await sonarrInteractiveSearchSeason(input)));
 
   server.registerTool("sonarr_grab_release", {
     title: "Sonarr Grab Release",
