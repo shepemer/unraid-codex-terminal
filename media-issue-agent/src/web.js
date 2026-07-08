@@ -1114,10 +1114,12 @@ pre {
 }
 
 .mcp-gap-remove {
-  min-width: 82px;
+  width: var(--mcp-gap-action-width);
+  min-width: var(--mcp-gap-action-width);
 }
 
 .mcp-gap-actions {
+  --mcp-gap-action-width: 124px;
   display: grid;
   gap: 8px;
   justify-items: center;
@@ -1130,12 +1132,30 @@ pre {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent);
 }
 
-.mcp-gap-detected {
+.mcp-gap-status-button {
   position: relative;
   isolation: isolate;
-  min-width: 82px;
+  width: var(--mcp-gap-action-width);
+  min-width: var(--mcp-gap-action-width);
   min-height: 36px;
   padding: 0 14px;
+  text-align: center;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.mcp-gap-status-button::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  z-index: -1;
+  background: linear-gradient(115deg, transparent 0%, color-mix(in srgb, currentColor 42%, transparent) 48%, transparent 62%);
+  transform: translateX(-125%);
+  opacity: 0.42;
+  animation: mcpGapStatusSheen 2.4s ease-in-out infinite;
+}
+
+.mcp-gap-detected {
   border-color: color-mix(in srgb, var(--success) 55%, var(--line));
   background:
     linear-gradient(105deg,
@@ -1144,11 +1164,25 @@ pre {
       color-mix(in srgb, var(--success) 24%, var(--panel)));
   background-size: 220% 100%;
   color: color-mix(in srgb, var(--success) 72%, var(--text));
-  text-align: center;
-  overflow: hidden;
-  cursor: pointer;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent);
-  animation: mcpDetectedButtonBg 1.8s ease-in-out infinite;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent),
+    0 0 18px color-mix(in srgb, var(--success) 18%, transparent);
+  animation: mcpDetectedButtonBg 1.8s ease-in-out infinite, mcpDetectedButtonGlow 2.6s ease-in-out infinite;
+}
+
+.mcp-gap-not-detected {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--danger) 20%, var(--panel)),
+      color-mix(in srgb, var(--danger) 32%, var(--panel)),
+      color-mix(in srgb, var(--danger) 20%, var(--panel)));
+  background-size: 220% 100%;
+  color: color-mix(in srgb, var(--danger) 72%, var(--text));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--danger) 18%, transparent),
+    0 0 18px color-mix(in srgb, var(--danger) 16%, transparent);
+  animation: mcpNotDetectedButtonBg 1.8s ease-in-out infinite, mcpNotDetectedButtonGlow 2.6s ease-in-out infinite;
 }
 
 .mcp-gap-detected:hover,
@@ -1163,6 +1197,18 @@ pre {
   background-size: 220% 100%;
 }
 
+.mcp-gap-not-detected:hover,
+.mcp-gap-not-detected:focus-visible {
+  color: color-mix(in srgb, var(--danger) 78%, var(--text));
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--danger) 24%, var(--panel)),
+      color-mix(in srgb, var(--danger) 38%, var(--panel)),
+      color-mix(in srgb, var(--danger) 24%, var(--panel)));
+  background-size: 220% 100%;
+}
+
 @keyframes mcpDetectedButtonBg {
   0%, 100% {
     background-position: 0% 50%;
@@ -1172,8 +1218,59 @@ pre {
   }
 }
 
+@keyframes mcpNotDetectedButtonBg {
+  0%, 100% {
+    background-position: 100% 50%;
+  }
+  50% {
+    background-position: 0% 50%;
+  }
+}
+
+@keyframes mcpGapStatusSheen {
+  0%, 34% {
+    transform: translateX(-125%);
+  }
+  64%, 100% {
+    transform: translateX(125%);
+  }
+}
+
+@keyframes mcpDetectedButtonGlow {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--success) 18%, transparent),
+      0 0 12px color-mix(in srgb, var(--success) 10%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--success) 26%, transparent),
+      0 0 24px color-mix(in srgb, var(--success) 26%, transparent);
+  }
+}
+
+@keyframes mcpNotDetectedButtonGlow {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--danger) 18%, transparent),
+      0 0 12px color-mix(in srgb, var(--danger) 10%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--danger) 26%, transparent),
+      0 0 24px color-mix(in srgb, var(--danger) 24%, transparent);
+  }
+}
+
 .mcp-gap-detection-panel {
   max-width: min(620px, calc(100vw - 28px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-height: min(82vh, 780px);
+}
+
+#mcp-gap-detection-body {
+  overflow: auto;
 }
 
 .mcp-detection-summary {
@@ -1219,6 +1316,43 @@ pre {
   color: var(--text);
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.mcp-detection-section {
+  display: grid;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.mcp-detection-section h3 {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 11px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  font-weight: 850;
+}
+
+.mcp-detection-section p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.mcp-detection-section ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.mcp-detection-section li + li {
+  margin-top: 3px;
 }
 
 .mcp-detection-note {
@@ -1650,15 +1784,18 @@ pre {
   }
 
   .mcp-gap-actions {
+    --mcp-gap-action-width: 100%;
     justify-items: stretch;
   }
 
   .mcp-gap-remove {
     width: 100%;
+    min-width: 0;
   }
 
-  .mcp-gap-detected {
+  .mcp-gap-status-button {
     width: 100%;
+    min-width: 0;
   }
 
   #toast {
@@ -2388,24 +2525,75 @@ function humanizeMcpValue(value) {
     .trim() || "Not specified";
 }
 
+function mcpDetectionRowsHtml(rows) {
+  const presentRows = rows.filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "");
+  if (!presentRows.length) {
+    return "";
+  }
+  return \`
+    <dl class="mcp-detection-fields">
+      \${presentRows.map(([label, value]) => \`<dt>\${escapeHtml(label)}</dt><dd>\${escapeHtml(value)}</dd>\`).join("")}
+    </dl>
+  \`;
+}
+
+function mcpDetectionListHtml(title, values, emptyText = "None") {
+  const list = Array.isArray(values) ? values : values ? [values] : [];
+  const entries = list.map(value => String(value || "").trim()).filter(Boolean);
+  return \`
+    <section class="mcp-detection-section">
+      <h3>\${escapeHtml(title)}</h3>
+      \${entries.length
+        ? \`<ul>\${entries.map(value => \`<li>\${escapeHtml(value)}</li>\`).join("")}</ul>\`
+        : \`<p>\${escapeHtml(emptyText)}</p>\`}
+    </section>
+  \`;
+}
+
 function mcpGapDetectionReasonHtml(item, detection) {
+  const isDetected = detection.detected === true;
+  const details = detection.rationaleDetails || {};
+  const request = details.request || {};
+  const candidate = details.candidate || {};
   const fields = [
-    ["Detected tool", detection.toolName || detection.suggestedToolName || item.suggestedToolName || "Not specified"],
+    [isDetected ? "Detected tool" : "Closest tool", detection.toolName || detection.suggestedToolName || item.suggestedToolName || "Not specified"],
     ["Match type", humanizeMcpValue(detection.matchType)],
     ["Confidence", humanizeMcpValue(detection.confidence)],
-    ["Policy", humanizeMcpValue(detection.decisionPolicy || "deterministic metadata policy")]
+    ["Policy", humanizeMcpValue(detection.decisionPolicy || "deterministic metadata policy")],
+    ["Score", details.score !== undefined ? \`\${details.score} / \${details.threshold || 35}\` : ""],
+    ["Exact suggested tool match", details.exactSuggestedToolMatch === true ? "Yes" : details.exactSuggestedToolMatch === false ? "No" : ""],
+    ["Category matched", details.categoryMatched === true ? "Yes" : details.categoryMatched === false ? "No" : ""]
   ];
   const agent = detection.agentDecision;
   const agentLine = agent
-    ? \`Agent advisory: \${agent.detected ? "detected" : "not detected"}\${agent.toolName ? \` via \${agent.toolName}\` : ""}\${agent.matchType ? \` (\${humanizeMcpValue(agent.matchType)})\` : ""}.\`
+    ? \`Agent advisory: \${agent.detected ? "detected" : "not detected"}\${agent.toolName ? \` via \${agent.toolName}\` : ""}\${agent.matchType ? \` (\${humanizeMcpValue(agent.matchType)})\` : ""}.\${agent.reason ? \` \${agent.reason}\` : ""}\`
     : "Agent advisory was not available for this item.";
   return \`
     <div class="mcp-detection-summary">
-      <p class="mcp-detection-title">\${escapeHtml(item?.title || "Detected MCP capability")}</p>
-      <p class="mcp-detection-reason">\${escapeHtml(detection.reason || "The live MCP tool metadata satisfied this requested capability.")}</p>
-      <dl class="mcp-detection-fields">
-        \${fields.map(([label, value]) => \`<dt>\${escapeHtml(label)}</dt><dd>\${escapeHtml(value)}</dd>\`).join("")}
-      </dl>
+      <p class="mcp-detection-title">\${escapeHtml(item?.title || (isDetected ? "Detected MCP capability" : "MCP capability not detected"))}</p>
+      <p class="mcp-detection-reason">\${escapeHtml(detection.reason || (isDetected ? "The live MCP tool metadata satisfied this requested capability." : "The live MCP tool metadata did not satisfy this requested capability."))}</p>
+      \${mcpDetectionRowsHtml(fields)}
+      <section class="mcp-detection-section">
+        <h3>Requested capability</h3>
+        \${mcpDetectionRowsHtml([
+          ["Title", request.title || item?.title],
+          ["Description", request.description || item?.description],
+          ["Suggested tool", request.suggestedToolName || item?.suggestedToolName],
+          ["Category", request.category || item?.category]
+        ])}
+      </section>
+      <section class="mcp-detection-section">
+        <h3>Compared live tool</h3>
+        \${candidate.name ? mcpDetectionRowsHtml([
+          ["Tool name", candidate.name],
+          ["Title", candidate.title],
+          ["Description", candidate.description],
+          ["Input fields", Array.isArray(candidate.inputFields) && candidate.inputFields.length ? candidate.inputFields.join(", ") : ""]
+        ]) : "<p>No live tool passed the matching threshold.</p>"}
+      </section>
+      \${mcpDetectionListHtml("Decision factors", details.decisionFactors, "No additional decision factors were returned.")}
+      \${mcpDetectionListHtml("Matched request tokens", details.matchedTokens, "No request tokens matched the closest live tool.")}
+      \${mcpDetectionListHtml("Missing requirements", details.missingRequirements, isDetected ? "No missing requirements." : "No explicit missing requirements were returned.")}
       <p class="mcp-detection-note">\${escapeHtml(agentLine)}</p>
     </div>
   \`;
@@ -2435,8 +2623,12 @@ function mcpGapHtml(item) {
   const meta = [tool, category, job, item.updatedAt ? \`Updated: \${item.updatedAt}\` : ""].filter(Boolean).join(" · ");
   const detection = state.mcpGapDetections[String(item.id)] || null;
   const detected = Boolean(detection?.detected);
+  const checkedNotDetected = Boolean(detection) && !detected;
+  const statusButton = detection
+    ? \`<button class="secondary mcp-gap-status-button \${detected ? "mcp-gap-detected" : "mcp-gap-not-detected"}" type="button" data-mcp-gap-detection="\${item.id}" aria-label="Show \${detected ? "detection" : "not detected"} reasoning for \${escapeHtml(item.title)}" title="Show \${detected ? "detection" : "not detected"} reasoning">\${detected ? "DETECTED" : "NOT DETECTED"}</button>\`
+    : "";
   return \`
-    <article class="mcp-gap-item\${detected ? " detected" : ""}" data-mcp-gap-id="\${item.id}">
+    <article class="mcp-gap-item\${detected ? " detected" : ""}\${checkedNotDetected ? " not-detected" : ""}" data-mcp-gap-id="\${item.id}">
       <div>
         <h3 class="mcp-gap-title">\${escapeHtml(item.title)}</h3>
         <p class="mcp-gap-description">\${escapeHtml(item.description)}</p>
@@ -2444,7 +2636,7 @@ function mcpGapHtml(item) {
       </div>
       <div class="mcp-gap-actions">
         <button class="secondary mcp-gap-remove\${detected ? " detected" : ""}" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
-        \${detected ? \`<button class="secondary mcp-gap-detected" type="button" data-mcp-gap-detection="\${item.id}" aria-label="Show detection reasoning for \${escapeHtml(item.title)}" title="Show detection reasoning">DETECTED</button>\` : ""}
+        \${statusButton}
       </div>
     </article>
   \`;
@@ -2503,16 +2695,18 @@ async function checkMcpCapabilities() {
     const result = await api("/api/mcp-missing-items/check-capabilities", { method: "POST", body: "{}" });
     const detections = {};
     for (const entry of result.results || []) {
-      if (entry.detected) {
+      if (entry.itemId !== undefined && entry.itemId !== null) {
         detections[String(entry.itemId)] = entry;
       }
     }
     state.mcpGapDetections = detections;
     renderMcpGaps(result.items || state.mcpGapItems || []);
-    const detectedCount = Object.keys(detections).length;
-    toast(detectedCount
-      ? \`Detected \${detectedCount} MCP \${detectedCount === 1 ? "capability" : "capabilities"}\`
-      : "No requested MCP capabilities detected yet");
+    const entries = Object.values(detections);
+    const detectedCount = entries.filter(entry => entry.detected).length;
+    const notDetectedCount = entries.length - detectedCount;
+    toast(entries.length
+      ? \`Detected \${detectedCount}; not detected \${notDetectedCount}\`
+      : "No requested MCP capabilities were checked");
   } catch (error) {
     toast(error.message);
   } finally {

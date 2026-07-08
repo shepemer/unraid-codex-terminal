@@ -831,6 +831,29 @@ function mcpCapabilityToolText(tool) {
   ].filter(Boolean).join(" "));
 }
 
+function mcpCapabilityRequestDetails(item) {
+  return {
+    title: item?.title || null,
+    description: item?.description || null,
+    suggestedToolName: item?.suggestedToolName || null,
+    category: item?.category || null
+  };
+}
+
+function mcpCapabilityToolDetails(tool) {
+  if (!tool) {
+    return null;
+  }
+  const schema = tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : {};
+  const properties = schema.properties && typeof schema.properties === "object" ? Object.keys(schema.properties) : [];
+  return {
+    name: tool.name || null,
+    title: tool.title || tool.name || null,
+    description: tool.description || null,
+    inputFields: properties.slice(0, 40)
+  };
+}
+
 function hasMcpStem(text, stems) {
   return stems.some(stem => text.includes(stem));
 }
@@ -884,11 +907,24 @@ function mcpToolRequirementFailures(item, tool) {
 }
 
 function scoreMcpCapabilityTool(item, tool) {
+  return mcpCapabilityScoreDetails(item, tool).score;
+}
+
+function mcpCapabilityScoreDetails(item, tool) {
   const suggested = normalizeMcpToolNameForLookup(item?.suggestedToolName);
   const toolName = normalizeMcpToolNameForLookup(tool?.name);
   const toolText = mcpCapabilityToolText(tool);
   if (suggested && toolName === suggested) {
-    return 1000;
+    return {
+      score: 1000,
+      threshold: 35,
+      exactSuggestedToolMatch: true,
+      suggestedNameInToolText: true,
+      categoryMatched: Boolean(item?.category),
+      requestTokens: [],
+      matchedTokens: [],
+      candidateTool: mcpCapabilityToolDetails(tool)
+    };
   }
   const requestTokens = new Set(mcpCapabilityTokens([
     item?.title,
@@ -896,37 +932,60 @@ function scoreMcpCapabilityTool(item, tool) {
     item?.suggestedToolName,
     item?.category
   ].filter(Boolean).join(" ")));
+  const matchedTokens = [...requestTokens].filter(token => toolText.includes(token));
   let score = 0;
+  const suggestedNameInToolText = suggested && toolText.includes(normalizeMcpCapabilityText(suggested));
   if (suggested && toolText.includes(normalizeMcpCapabilityText(suggested))) {
     score += 150;
   }
-  for (const token of requestTokens) {
-    if (toolText.includes(token)) {
-      score += 8;
-    }
-  }
+  score += matchedTokens.length * 8;
   const category = normalizeMcpCapabilityText(item?.category);
+  const categoryMatched = Boolean(category && toolText.includes(category));
   if (category && toolText.includes(category)) {
     score += 20;
   }
-  return score;
+  return {
+    score,
+    threshold: 35,
+    exactSuggestedToolMatch: false,
+    suggestedNameInToolText: Boolean(suggestedNameInToolText),
+    categoryMatched,
+    requestTokens: [...requestTokens].slice(0, 40),
+    matchedTokens: matchedTokens.slice(0, 40),
+    candidateTool: mcpCapabilityToolDetails(tool)
+  };
 }
 
 function chooseMcpCapabilityTool(item, tools) {
   let best = null;
+  let bestDetails = null;
   let bestScore = 0;
   for (const tool of tools) {
-    const score = scoreMcpCapabilityTool(item, tool);
+    const details = mcpCapabilityScoreDetails(item, tool);
+    const score = details.score;
     if (score > bestScore || (score === bestScore && best && String(tool.name).localeCompare(String(best.name)) < 0)) {
       best = tool;
+      bestDetails = details;
       bestScore = score;
     }
   }
-  return bestScore >= 35 ? { tool: best, score: bestScore } : { tool: null, score: bestScore };
+  return bestScore >= 35 ? { tool: best, score: bestScore, details: bestDetails } : { tool: null, score: bestScore, details: bestDetails };
 }
 
 function deterministicMcpCapabilityDecision(item, tools) {
-  const { tool, score } = chooseMcpCapabilityTool(item, tools);
+  const { tool, score, details } = chooseMcpCapabilityTool(item, tools);
+  const baseDetails = {
+    request: mcpCapabilityRequestDetails(item),
+    candidate: details?.candidateTool || null,
+    score,
+    threshold: details?.threshold || 35,
+    exactSuggestedToolMatch: Boolean(details?.exactSuggestedToolMatch),
+    suggestedNameInToolText: Boolean(details?.suggestedNameInToolText),
+    categoryMatched: Boolean(details?.categoryMatched),
+    requestTokens: details?.requestTokens || [],
+    matchedTokens: details?.matchedTokens || [],
+    missingRequirements: []
+  };
   if (!tool) {
     return {
       detected: false,
@@ -934,7 +993,14 @@ function deterministicMcpCapabilityDecision(item, tools) {
       toolTitle: null,
       matchType: "not_detected",
       confidence: "high",
-      reason: "No live media-mcp tool matched this requested capability strongly enough for deterministic detection."
+      reason: "No live media-mcp tool matched this requested capability strongly enough for deterministic detection.",
+      rationaleDetails: {
+        ...baseDetails,
+        decisionFactors: [
+          `Best candidate score ${score} was below the detection threshold ${baseDetails.threshold}.`,
+          "The checker requires a live tool to match the request intent, not just a similar name."
+        ]
+      }
     };
   }
 
@@ -946,7 +1012,16 @@ function deterministicMcpCapabilityDecision(item, tools) {
       toolTitle: tool.title || tool.name,
       matchType: "partial",
       confidence: "high",
-      reason: `Live media-mcp tool ${tool.name} is related, but it does not explicitly cover: ${failures.join(", ")}.`
+      reason: `Live media-mcp tool ${tool.name} is related, but it does not explicitly cover: ${failures.join(", ")}.`,
+      rationaleDetails: {
+        ...baseDetails,
+        missingRequirements: failures,
+        decisionFactors: [
+          `The closest live tool was ${tool.name} with score ${score}.`,
+          "The tool was treated as related but insufficient because required capability terms were missing from its metadata.",
+          `Missing requirements: ${failures.join(", ")}.`
+        ]
+      }
     };
   }
 
@@ -958,7 +1033,17 @@ function deterministicMcpCapabilityDecision(item, tools) {
     toolTitle: tool.title || tool.name,
     matchType: suggested && suggested === toolName ? "exact_live_tool" : "deterministic_metadata_match",
     confidence: score >= 1000 ? "high" : "medium",
-    reason: `Live media-mcp tool ${tool.name} has name, description, and schema coverage for the requested capability.`
+    reason: `Live media-mcp tool ${tool.name} has name, description, and schema coverage for the requested capability.`,
+    rationaleDetails: {
+      ...baseDetails,
+      decisionFactors: [
+        suggested && suggested === toolName
+          ? `The suggested tool name exactly matched live tool ${tool.name}.`
+          : `Live tool ${tool.name} matched enough request tokens and metadata to satisfy the deterministic policy.`,
+        details?.categoryMatched ? "The requested category matched the live tool metadata." : null,
+        details?.matchedTokens?.length ? `Matched request tokens: ${details.matchedTokens.join(", ")}.` : null
+      ].filter(Boolean)
+    }
   };
 }
 
@@ -979,7 +1064,8 @@ function parseMcpCapabilityCheckResult(output, items, tools) {
       detected: raw?.detected === true && Boolean(availableTool),
       toolName: availableTool?.name || requestedToolName || null,
       matchType: String(raw?.matchType || "").trim() || null,
-      confidence: String(raw?.confidence || "").trim() || null
+      confidence: String(raw?.confidence || "").trim() || null,
+      reason: String(raw?.reason || "").trim() || null
     });
   }
   const results = items.map(item => {

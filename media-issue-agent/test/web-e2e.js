@@ -45,7 +45,8 @@ async function createFakeCodexBin(root, logPath) {
     "appendFileSync(process.env.WEB_E2E_CODEX_LOG, `${JSON.stringify({ kind })}\\n`);",
     "if (kind === 'mcp-capability-check') {",
     "  const itemIds = [...prompt.matchAll(/\\\"id\\\":\\s*(\\d+)/g)].map(match => Number(match[1]));",
-    "  const result = { summary: 'Fixture capability check completed.', results: itemIds.map(itemId => ({ itemId, detected: true, toolName: 'sonarr_replace_fixture_episode', matchType: 'agent_reasoned', confidence: 'high', reason: 'The available fixture replacement tool satisfies this request.' })) };",
+    "  const negativeItemId = prompt.includes('fixture_archive_probe') ? Math.max(...itemIds) : null;",
+    "  const result = { summary: 'Fixture capability check completed.', results: itemIds.map(itemId => itemId === negativeItemId ? ({ itemId, detected: false, toolName: 'media_diagnose_issue', matchType: 'partial', confidence: 'high', reason: 'The available fixture diagnostics tool is related but does not satisfy the requested archive probe.' }) : ({ itemId, detected: true, toolName: 'sonarr_replace_fixture_episode', matchType: 'agent_reasoned', confidence: 'high', reason: 'The available fixture replacement tool satisfies this request.' })) };",
     "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
     "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
     "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
@@ -322,6 +323,11 @@ async function testIssueStateActionMatrix(browser) {
       description: "Expose a test MCP tool for replacing fixture episodes from the Web UI test.",
       suggestedToolName: "sonarr_replace_fixture_episode",
       category: "sonarr"
+    }, {
+      title: "Inspect unavailable fixture archive",
+      description: "Expose a test MCP tool that is intentionally not available in the fake media MCP server.",
+      suggestedToolName: "fixture_archive_probe",
+      category: "diagnostics"
     }]);
 
     ensureJob(dbPath, "seerr", "207");
@@ -333,15 +339,36 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
     await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
     await expect(page.locator("#mcp-gaps-list")).toContainText("sonarr_replace_fixture_episode");
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Inspect unavailable fixture archive");
     await page.locator("#mcp-gaps-check-button").click();
     await expect(page.locator(".mcp-gap-detected")).toHaveText("DETECTED");
     await expect(page.locator(".mcp-gap-detected")).toHaveAttribute("type", "button");
-    await expect(page.locator("[data-remove-mcp-gap]")).toHaveClass(/detected/);
+    await expect(page.locator(".mcp-gap-not-detected")).toHaveText("NOT DETECTED");
+    await expect(page.locator(".mcp-gap-not-detected")).toHaveAttribute("type", "button");
+    await expect(page.locator(".mcp-gap-item.detected [data-remove-mcp-gap]")).toHaveClass(/detected/);
+    for (const selector of [".mcp-gap-item.detected .mcp-gap-actions", ".mcp-gap-item.not-detected .mcp-gap-actions"]) {
+      await expect(page.locator(selector).locator("button")).toHaveCount(2);
+      const actionWidths = await page.locator(selector).locator("button").evaluateAll(buttons => buttons.map(button => Math.round(button.getBoundingClientRect().width)));
+      assert.equal(actionWidths[0], actionWidths[1]);
+    }
     await page.locator(".mcp-gap-detected").click();
     await expect(page.locator("#mcp-gap-detection-dialog")).toBeVisible();
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("Replace a fixture episode");
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("sonarr_replace_fixture_episode");
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("Live media-mcp tool");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Requested capability");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Compared live tool");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Decision factors");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Score");
+    await page.locator("#mcp-gap-detection-close-button").click();
+    await expect(page.locator("#mcp-gap-detection-dialog")).toBeHidden();
+    await page.locator(".mcp-gap-not-detected").click();
+    await expect(page.locator("#mcp-gap-detection-dialog")).toBeVisible();
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Inspect unavailable fixture archive");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("does not explicitly cover");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Missing requirements");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("content probe support");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Agent advisory: not detected");
     await page.locator("#mcp-gap-detection-close-button").click();
     await expect(page.locator("#mcp-gap-detection-dialog")).toBeHidden();
     await page.locator("#mcp-gaps-close-button").click();
@@ -349,7 +376,14 @@ async function testIssueStateActionMatrix(browser) {
     await page.locator("#mcp-gaps-button").click();
     await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
     await expect(page.locator(".mcp-gap-detected")).toHaveCount(0);
-    await page.locator("[data-remove-mcp-gap]").click();
+    await expect(page.locator(".mcp-gap-not-detected")).toHaveCount(0);
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
+    await expect(page.locator("[data-remove-mcp-gap]")).toHaveCount(2);
+    while (await page.locator("[data-remove-mcp-gap]").count()) {
+      const beforeRemove = await page.locator("[data-remove-mcp-gap]").count();
+      await page.locator("[data-remove-mcp-gap]").first().click();
+      await expect(page.locator("[data-remove-mcp-gap]")).toHaveCount(beforeRemove - 1);
+    }
     await expect(page.locator("#mcp-gaps-list")).toContainText("No active missing MCP items");
     await page.locator("#mcp-gaps-close-button").click();
     await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
