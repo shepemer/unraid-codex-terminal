@@ -249,9 +249,7 @@ function datetimeLocalValue(date) {
     "T",
     pad(date.getHours()),
     ":",
-    pad(date.getMinutes()),
-    ":",
-    pad(date.getSeconds())
+    pad(date.getMinutes())
   ].join("");
 }
 
@@ -731,8 +729,8 @@ async function testDiagnosticLogDownloadDialog(browser) {
 
     await page.locator("#logs-button").click();
     await expect(page.locator("#logs-dialog")).toBeVisible();
-    await page.locator("#logs-from").fill(datetimeLocalValue(new Date(inside.getTime() - 5_000)));
-    await page.locator("#logs-to").fill(datetimeLocalValue(new Date(inside.getTime() + 5_000)));
+    await page.locator("#logs-from").fill(datetimeLocalValue(new Date(inside.getTime() - 120_000)));
+    await page.locator("#logs-to").fill(datetimeLocalValue(new Date(inside.getTime() + 120_000)));
     const downloadPromise = page.waitForEvent("download");
     await page.locator("#logs-download-button").click();
     const download = await downloadPromise;
