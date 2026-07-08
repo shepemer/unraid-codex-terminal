@@ -48,6 +48,15 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function isInterruptedPollError(error) {
+  const text = `${error?.name || ""} ${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+  return text.includes("terminated")
+    || text.includes("aborted")
+    || text.includes("abort_err")
+    || text.includes("econnreset")
+    || text.includes("socket hang up");
+}
+
 function textSuggestsClientSide(...values) {
   const text = values.join(" ").toLowerCase();
   return /\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
@@ -760,11 +769,204 @@ function normalizeMcpToolNameForLookup(value) {
   return name.startsWith("media.") ? name.slice("media.".length) : name;
 }
 
+const MCP_CAPABILITY_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "be",
+  "by",
+  "can",
+  "for",
+  "from",
+  "if",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "one",
+  "that",
+  "the",
+  "their",
+  "this",
+  "to",
+  "tool",
+  "with"
+]);
+
+function normalizeMcpCapabilityText(value) {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_./-]+/g, " ")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function mcpCapabilityTokens(value) {
+  return normalizeMcpCapabilityText(value)
+    .split(" ")
+    .filter(token => token.length >= 3 && !MCP_CAPABILITY_STOP_WORDS.has(token));
+}
+
+function mcpCapabilityItemText(item) {
+  return normalizeMcpCapabilityText([
+    item?.title,
+    item?.description,
+    item?.suggestedToolName,
+    item?.category
+  ].filter(Boolean).join(" "));
+}
+
+function mcpCapabilityToolText(tool) {
+  return normalizeMcpCapabilityText([
+    tool?.name,
+    tool?.title,
+    tool?.description,
+    tool?.inputSchema ? JSON.stringify(tool.inputSchema) : ""
+  ].filter(Boolean).join(" "));
+}
+
+function hasMcpStem(text, stems) {
+  return stems.some(stem => text.includes(stem));
+}
+
+function removeNegatedMcpCapabilityTerms(text) {
+  return String(text || "")
+    .replace(/\bno\s+(?:replace|replacement|search|import|queue|grab|download|delete|remove|removal|scan|refresh|blocklist|blacklist)\b/g, " ")
+    .replace(/\bwithout\s+(?:replace|replacement|search|import|queue|grab|download|delete|remove|removal|scan|refresh|blocklist|blacklist)(?:ing)?\b/g, " ")
+    .replace(/\b(?:do\s+not|dont|don't)\s+(?:replace|search|import|queue|grab|download|delete|remove|scan|refresh|blocklist|blacklist)\b/g, " ")
+    .replace(/\b(?:non|not)\s+(?:replacing|searching|importing|queueing|queuing|grabbing|downloading|deleting|removing|scanning|refreshing|blocklisting|blacklisting)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function mcpToolRequirementFailures(item, tool) {
+  const requestText = removeNegatedMcpCapabilityTerms(mcpCapabilityItemText(item));
+  const titleText = normalizeMcpCapabilityText(item?.title);
+  const categoryText = normalizeMcpCapabilityText(item?.category);
+  const toolText = mcpCapabilityToolText(tool);
+  const failures = [];
+  const requireIf = (condition, label, stems) => {
+    if (condition && !hasMcpStem(toolText, stems)) {
+      failures.push(label);
+    }
+  };
+
+  for (const service of ["sonarr", "radarr", "plex", "bazarr", "seerr"]) {
+    requireIf(categoryText === service || titleText.includes(service), `${service} capability`, [service]);
+  }
+  requireIf(hasMcpStem(requestText, ["delete", "delet", "remove", "removal"]), "delete/remove operation", ["delete", "delet", "remove", "removal"]);
+  requireIf(hasMcpStem(requestText, ["stat"]), "stat or inspection operation", ["stat", "metadata", "probe", "inspect"]);
+  requireIf(hasMcpStem(requestText, ["blocklist", "blacklist"]), "blocklist/blacklist support", ["blocklist", "blacklist"]);
+  requireIf(hasMcpStem(requestText, ["interactive"]), "interactive search support", ["interactive"]);
+  requireIf(hasMcpStem(requestText, ["season"]), "season-level support", ["season"]);
+  requireIf(hasMcpStem(requestText, ["show"]), "show/series-level support", ["show", "series", "parent"]);
+  requireIf(hasMcpStem(requestText, ["scan"]), "library scan support", ["scan"]);
+  requireIf(hasMcpStem(requestText, ["refresh"]), "metadata refresh support", ["refresh"]);
+  requireIf(hasMcpStem(requestText, ["search"]), "search support", ["search", "grab", "import"]);
+  requireIf(hasMcpStem(requestText, ["import"]), "import support", ["import", "queue", "grab"]);
+  requireIf(hasMcpStem(requestText, ["queue"]), "queue support", ["queue"]);
+  requireIf(hasMcpStem(requestText, ["replace", "replacement"]), "replacement support", ["replace", "replacement", "search", "import", "grab", "download"]);
+  requireIf(hasMcpStem(requestText, ["path"]), "path/rating-key targeting", ["path", "rating key", "ratingkey", "part file", "partfile"]);
+  requireIf(
+    hasMcpStem(requestText, ["path"]) && hasMcpStem(requestText, ["map", "mapping", "root", "roots"]),
+    "path-map/root resolution",
+    ["media mcp path maps", "media mcp media roots", "path maps", "media roots", "plex media part", "rating key", "ratingkey", "part file", "partfile"]
+  );
+  requireIf(hasMcpStem(requestText, ["probe", "ffprobe", "frame", "hash", "content"]), "content probe support", ["probe", "ffprobe", "frame", "hash", "metadata"]);
+  requireIf(hasMcpStem(requestText, ["subtitle", "subtitles"]), "subtitle support", ["subtitle", "subtitles", "bazarr"]);
+  return failures;
+}
+
+function scoreMcpCapabilityTool(item, tool) {
+  const suggested = normalizeMcpToolNameForLookup(item?.suggestedToolName);
+  const toolName = normalizeMcpToolNameForLookup(tool?.name);
+  const toolText = mcpCapabilityToolText(tool);
+  if (suggested && toolName === suggested) {
+    return 1000;
+  }
+  const requestTokens = new Set(mcpCapabilityTokens([
+    item?.title,
+    item?.description,
+    item?.suggestedToolName,
+    item?.category
+  ].filter(Boolean).join(" ")));
+  let score = 0;
+  if (suggested && toolText.includes(normalizeMcpCapabilityText(suggested))) {
+    score += 150;
+  }
+  for (const token of requestTokens) {
+    if (toolText.includes(token)) {
+      score += 8;
+    }
+  }
+  const category = normalizeMcpCapabilityText(item?.category);
+  if (category && toolText.includes(category)) {
+    score += 20;
+  }
+  return score;
+}
+
+function chooseMcpCapabilityTool(item, tools) {
+  let best = null;
+  let bestScore = 0;
+  for (const tool of tools) {
+    const score = scoreMcpCapabilityTool(item, tool);
+    if (score > bestScore || (score === bestScore && best && String(tool.name).localeCompare(String(best.name)) < 0)) {
+      best = tool;
+      bestScore = score;
+    }
+  }
+  return bestScore >= 35 ? { tool: best, score: bestScore } : { tool: null, score: bestScore };
+}
+
+function deterministicMcpCapabilityDecision(item, tools) {
+  const { tool, score } = chooseMcpCapabilityTool(item, tools);
+  if (!tool) {
+    return {
+      detected: false,
+      toolName: null,
+      toolTitle: null,
+      matchType: "not_detected",
+      confidence: "high",
+      reason: "No live media-mcp tool matched this requested capability strongly enough for deterministic detection."
+    };
+  }
+
+  const failures = mcpToolRequirementFailures(item, tool);
+  if (failures.length) {
+    return {
+      detected: false,
+      toolName: tool.name,
+      toolTitle: tool.title || tool.name,
+      matchType: "partial",
+      confidence: "high",
+      reason: `Live media-mcp tool ${tool.name} is related, but it does not explicitly cover: ${failures.join(", ")}.`
+    };
+  }
+
+  const suggested = normalizeMcpToolNameForLookup(item?.suggestedToolName);
+  const toolName = normalizeMcpToolNameForLookup(tool.name);
+  return {
+    detected: true,
+    toolName: tool.name,
+    toolTitle: tool.title || tool.name,
+    matchType: suggested && suggested === toolName ? "exact_live_tool" : "deterministic_metadata_match",
+    confidence: score >= 1000 ? "high" : "medium",
+    reason: `Live media-mcp tool ${tool.name} has name, description, and schema coverage for the requested capability.`
+  };
+}
+
 function parseMcpCapabilityCheckResult(output, items, tools) {
   const parsed = parseJsonObjectFromModel(output, "MCP capability check agent");
   const rawResults = Array.isArray(parsed.results) ? parsed.results : [];
   const toolsByName = new Map(tools.map(tool => [normalizeMcpToolNameForLookup(tool.name), tool]).filter(([name]) => name));
-  const resultsByItemId = new Map();
+  const agentResultsByItemId = new Map();
   for (const raw of rawResults) {
     const itemId = Number(raw?.itemId);
     if (!Number.isInteger(itemId)) {
@@ -773,46 +975,29 @@ function parseMcpCapabilityCheckResult(output, items, tools) {
     const requestedToolName = String(raw?.toolName || "").trim();
     const requestedLookupName = normalizeMcpToolNameForLookup(requestedToolName);
     const availableTool = requestedLookupName ? toolsByName.get(requestedLookupName) : null;
-    let detected = raw?.detected === true;
-    let matchType = String(raw?.matchType || (detected ? "agent_reasoned" : "not_detected")).trim() || "not_detected";
-    let reason = String(raw?.reason || "").trim();
-    if (detected && !availableTool) {
-      detected = false;
-      matchType = "not_detected";
-      reason = requestedToolName
-        ? `Capability check agent cited ${requestedToolName}, but that tool is not present in live media-mcp tools/list.`
-        : "Capability check agent marked this detected without naming an available tool.";
-    }
-    resultsByItemId.set(itemId, {
-      detected,
-      toolName: detected ? availableTool.name : (requestedToolName || null),
-      toolTitle: detected ? availableTool.title || availableTool.name : null,
-      matchType,
-      confidence: String(raw?.confidence || "").trim() || null,
-      reason: reason || (detected
-        ? `Capability check agent determined ${availableTool.name} satisfies this request.`
-        : "Capability check agent did not find an available MCP tool that satisfies this request.")
+    agentResultsByItemId.set(itemId, {
+      detected: raw?.detected === true && Boolean(availableTool),
+      toolName: availableTool?.name || requestedToolName || null,
+      matchType: String(raw?.matchType || "").trim() || null,
+      confidence: String(raw?.confidence || "").trim() || null
     });
   }
+  const results = items.map(item => {
+    const decision = deterministicMcpCapabilityDecision(item, tools);
+    return {
+      itemId: item.id,
+      title: item.title,
+      suggestedToolName: item.suggestedToolName || null,
+      category: item.category || null,
+      ...decision,
+      agentDecision: agentResultsByItemId.get(Number(item.id)) || null
+    };
+  });
+  const detectedCount = results.filter(result => result.detected).length;
   return {
-    summary: String(parsed.summary || "").trim(),
-    results: items.map(item => {
-      const detection = resultsByItemId.get(Number(item.id)) || {
-        detected: false,
-        toolName: null,
-        toolTitle: null,
-        matchType: "not_detected",
-        confidence: null,
-        reason: "Capability check agent did not return a decision for this request."
-      };
-      return {
-        itemId: item.id,
-        title: item.title,
-        suggestedToolName: item.suggestedToolName || null,
-        category: item.category || null,
-        ...detection
-      };
-    })
+    summary: `Checked ${items.length} requested MCP capabilities against ${tools.length} live media-mcp tools; ${detectedCount} detected by deterministic metadata policy.`,
+    agentSummary: String(parsed.summary || "").trim(),
+    results
   };
 }
 
@@ -1009,7 +1194,16 @@ export class MediaIssueAgent {
       verbose: false
     });
     const records = Array.isArray(listed?.records) ? listed.records : [];
-    const issues = await issueQueue(records, this.client);
+    const detailFailures = [];
+    const issues = await issueQueue(records, this.client, {
+      onDetailError: failure => detailFailures.push(failure)
+    });
+    if (detailFailures.length) {
+      this.diagnostic("warn", "poll_issue_detail_failures", {
+        count: detailFailures.length,
+        failures: detailFailures.slice(0, 20)
+      });
+    }
     const markdown = issueTableMarkdown(issues);
     const snapshot = insertSnapshot(this.config.dbPath, markdown, issues);
     pruneSnapshots(this.config.dbPath, this.config.issueSnapshotRetention);
@@ -1026,13 +1220,15 @@ export class MediaIssueAgent {
       snapshotId: snapshot.id,
       issueCount: issues.length,
       openIssueCount: issues.filter(issue => !issue.isClosed).length,
-      closedIssueCount: issues.filter(issue => issue.isClosed).length
+      closedIssueCount: issues.filter(issue => issue.isClosed).length,
+      detailFailureCount: detailFailures.length
     });
     return {
       snapshotId: snapshot.id,
       issueCount: issues.length,
       openIssueCount: issues.filter(issue => !issue.isClosed).length,
       closedIssueCount: issues.filter(issue => issue.isClosed).length,
+      detailFailureCount: detailFailures.length,
       markdown
     };
   }
@@ -1112,6 +1308,8 @@ export class MediaIssueAgent {
       reasoningEffort: output.settings?.reasoningEffort,
       fastMode: output.settings?.fastMode,
       summary: parsed.summary,
+      agentSummary: parsed.agentSummary,
+      decisionPolicy: "deterministic_metadata_policy",
       detected: detected.map(result => ({
         itemId: result.itemId,
         toolName: result.toolName,
@@ -1125,6 +1323,8 @@ export class MediaIssueAgent {
       results,
       detectedItemIds: detected.map(result => result.itemId),
       summary: parsed.summary,
+      agentSummary: parsed.agentSummary,
+      decisionPolicy: "deterministic_metadata_policy",
       mode: "codex_agent"
     };
   }
@@ -2115,8 +2315,18 @@ export class MediaIssueAgent {
         const result = await this.pollOnce();
         log(`${new Date().toISOString()} media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.openIssueCount} open and ${result.closedIssueCount} closed issues`);
       } catch (error) {
-        this.diagnostic("error", "poll_failed", { error: error.message });
-        log(`${new Date().toISOString()} media-issue-agent: poll failed: ${redactText(error.message)}`);
+        if (isInterruptedPollError(error)) {
+          this.diagnostic("warn", "poll_interrupted", {
+            error: error.message,
+            name: error.name,
+            code: error.code,
+            pollIntervalSeconds: this.config.pollIntervalSeconds
+          });
+          log(`${new Date().toISOString()} media-issue-agent: poll interrupted; retrying next interval: ${redactText(error.message)}`);
+        } else {
+          this.diagnostic("error", "poll_failed", { error: error.message });
+          log(`${new Date().toISOString()} media-issue-agent: poll failed: ${redactText(error.message)}`);
+        }
       }
       await sleep(this.config.pollIntervalSeconds * 1000);
     }

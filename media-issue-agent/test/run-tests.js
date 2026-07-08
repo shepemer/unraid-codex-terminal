@@ -120,6 +120,70 @@ async function testPlexClosedFilter() {
   assert.deepEqual(open.map(issue => issue.issueId), ["plex-reopened", "22"]);
   assert.equal(calls.length, 4);
   assert.equal(calls[0].name, "plex_issue_details");
+
+  const detailFailures = [];
+  const detailCalls = [];
+  const degraded = await issueQueue([
+    { source: "plex", id: "plex-transient", status: "open", commentCount: 1, message: "Maybe closed", updatedAt: "2026-01-08T00:00:00Z" },
+    { source: "seerr", id: 33, status: "open", commentCount: 1, message: "Maybe resolved", updatedAt: "2026-01-07T00:00:00Z" }
+  ], {
+    async callTool(name, args) {
+      detailCalls.push({ name, args });
+      throw new Error("media-mcp 502: https://internal.example.invalid/issues?token=fixture-secret /data/TV Shows/Fixture Show/Episode.mkv");
+    }
+  }, {
+    onDetailError: failure => detailFailures.push(failure)
+  });
+  assert.deepEqual(detailCalls.map(call => call.name).sort(), ["plex_issue_details", "seerr_issue_details"]);
+  assert.deepEqual(degraded.map(issue => [issue.issueId, issue.isClosed, issue.detailUnavailable]), [
+    ["plex-transient", false, true],
+    ["33", false, true]
+  ]);
+  assert.equal(detailFailures.length, 2);
+  assert.doesNotMatch(detailFailures[0].error, /internal\.example|fixture-secret|TV Shows/);
+}
+
+async function testPollOnceRecordsPartialIssueDetailFailures() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const logPath = path.join(dir, "agent.log");
+  const calls = [];
+  const agent = new MediaIssueAgent({
+    dbPath,
+    logPath,
+    suppressInitLog: true,
+    recoverStaleRunSeconds: 300,
+    issueSnapshotRetention: 10
+  }, {
+    async callTool(name, args) {
+      calls.push({ name, args });
+      if (name === "plex_reported_issues") {
+        return {
+          records: [
+            { source: "plex", id: "plex-transient", status: "open", commentCount: 1, message: "Maybe already handled", updatedAt: "2026-01-02T00:00:00Z" },
+            { source: "plex", id: "plex-open", status: "open", commentCount: 0, message: "Needs triage", updatedAt: "2026-01-01T00:00:00Z" }
+          ]
+        };
+      }
+      if (name === "plex_issue_details") {
+        throw new Error("media-mcp 502: /mnt/user/Media/Fixture Movie/File.mkv token=fixture-secret");
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  });
+  const result = await agent.pollOnce();
+  assert.equal(result.issueCount, 2);
+  assert.equal(result.openIssueCount, 2);
+  assert.equal(result.detailFailureCount, 2);
+  assert.equal(calls.filter(call => call.name === "plex_issue_details").length, 2);
+  const latest = agent.latestWithEntries();
+  assert.equal(latest.entries.length, 2);
+  const degradedEntry = latest.entries.find(entry => entry.issueId === "plex-transient");
+  assert.equal(degradedEntry.raw.detailUnavailable, true);
+  assert.doesNotMatch(degradedEntry.raw.detailError, /mnt\/user|fixture-secret/);
+  const diagnosticLines = (await readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(diagnosticLines.some(line => line.event === "poll_issue_detail_failures" && line.level === "warn"), true);
+  await rm(dir, { recursive: true, force: true });
 }
 
 async function testTableAndSnapshotMapping() {
@@ -926,7 +990,7 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
       async listTools() {
         calls.push({ name: "tools/list" });
         return [
-          { name: "media_file_delete", description: "Scoped media file deletion." },
+          { name: "media_file_delete", description: "Scoped stat/delete for exact media paths." },
           { name: "radarr_delete_movie_file", description: "Delete exact Radarr movie files." }
         ];
       }
@@ -937,11 +1001,15 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
     assert.equal(result.toolCount, 2);
     assert.equal(result.items.length, 3);
     assert.equal(result.mode, "codex_agent");
-    assert.match(result.summary, /Compared requested MCP gaps/);
+    assert.equal(result.decisionPolicy, "deterministic_metadata_policy");
+    assert.match(result.summary, /deterministic metadata policy/);
+    assert.match(result.agentSummary, /Compared requested MCP gaps/);
     const detectedNames = result.results.filter(entry => entry.detected).map(entry => entry.suggestedToolName).sort();
     assert.deepEqual(detectedNames, ["media_file_delete"]);
     const detected = result.results.find(entry => entry.suggestedToolName === "media_file_delete");
     assert.equal(detected.toolName, "media_file_delete");
+    assert.equal(detected.matchType, "exact_live_tool");
+    assert.equal(detected.agentDecision.detected, true);
     const partial = result.results.find(entry => entry.suggestedToolName === "radarr_delete_movie_file");
     assert.equal(partial.detected, false);
     assert.equal(partial.matchType, "partial");
@@ -949,11 +1017,168 @@ async function testMissingMcpCapabilityCheckUsesLiveTools() {
     assert.equal(missing.detected, false);
     const prompt = await readFile(promptPath, "utf8");
     assert.match(prompt, /suggestedToolName field is only a historical hint/);
+    assert.match(prompt, /advisory comparison evidence/);
     assert.match(prompt, /Radarr movie file deletion/);
     assert.match(prompt, /Delete exact Radarr movie files/);
     const args = JSON.parse(await readFile(argsPath, "utf8"));
     assert.ok(args.includes("--dangerously-bypass-approvals-and-sandbox"));
     assert.ok(args.includes('mcp_servers.media.default_tools_approval_mode="approve"'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+function stableMcpCapabilityRows(result) {
+  return result.results.map(entry => ({
+    itemId: entry.itemId,
+    detected: entry.detected,
+    toolName: entry.toolName,
+    matchType: entry.matchType,
+    reason: entry.reason
+  }));
+}
+
+async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-capability-check-flaky-fixture");
+  const counterPath = path.join(dir, "capability-check-count.txt");
+  try {
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "let input = '';",
+      "process.stdin.on('data', chunk => { input += chunk; });",
+      "process.stdin.on('end', () => {",
+      "  let count = 0;",
+      `  try { count = Number(fs.readFileSync(${JSON.stringify(counterPath)}, 'utf8')) || 0; } catch {}`,
+      `  fs.writeFileSync(${JSON.stringify(counterPath)}, String(count + 1));`,
+      "  const variants = [",
+      "    {",
+      "      summary: 'First inconsistent advisory pass.',",
+      "      results: [",
+      "        { itemId: 1, detected: false, toolName: 'sonarr_replace_episode_files', matchType: 'partial', confidence: 'high', reason: 'First pass says replacement is partial.' },",
+      "        { itemId: 2, detected: true, toolName: 'plex_get_metadata', matchType: 'agent_reasoned', confidence: 'medium', reason: 'First pass incorrectly guesses metadata can list seasons.' },",
+      "        { itemId: 3, detected: false, toolName: 'media_probe_video_content', matchType: 'partial', confidence: 'high', reason: 'First pass says probe is partial.' }",
+      "      ]",
+      "    },",
+      "    {",
+      "      summary: 'Second inconsistent advisory pass.',",
+      "      results: [",
+      "        { itemId: 1, detected: true, toolName: 'sonarr_replace_episode_files', matchType: 'agent_reasoned', confidence: 'medium', reason: 'Second pass says replacement is present.' },",
+      "        { itemId: 2, detected: false, toolName: 'plex_list_season_children', matchType: 'partial', confidence: 'high', reason: 'Second pass says show season listing is absent.' },",
+      "        { itemId: 3, detected: true, toolName: 'media_probe_video_content', matchType: 'agent_reasoned', confidence: 'medium', reason: 'Second pass says probe is present.' }",
+      "      ]",
+      "    }",
+      "  ];",
+      "  const result = variants[count % variants.length];",
+      "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+      "  if (outputPathIndex >= 0) fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
+      "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+      "});"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "capability-determinism-fixture");
+    upsertMissingMcpItems(dbPath, job.id, null, [
+      {
+        title: "Safe Sonarr file replacement",
+        description: "Expose a guarded workflow to delete or mark exact existing episode files as bad, blocklist their source if appropriate, and queue exact replacement searches/imports.",
+        suggestedToolName: "sonarr_replace_episode_files",
+        category: "sonarr"
+      },
+      {
+        title: "Plex show season listing",
+        description: "Expose a Plex tool that lists seasons for a show rating key, including season indexes, rating keys, and child counts.",
+        suggestedToolName: "plex_list_show_seasons",
+        category: "plex"
+      },
+      {
+        title: "Video content probe",
+        description: "Probe exact media content using Plex rating keys, media paths, frame hashes, and ffprobe metadata.",
+        suggestedToolName: "media_probe_video_content",
+        category: "diagnostics"
+      },
+      {
+        title: "Radarr movie file deletion",
+        description: "Expose a safe exact-delete operation for a Radarr movieFileId, optionally with a no-replace/no-search guard.",
+        suggestedToolName: "radarr_delete_movie_file",
+        category: "radarr"
+      }
+    ]);
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 10000,
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: true,
+      codexServiceTier: "fast",
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000,
+      logPath: path.join(dir, "agent.log"),
+      recoverStaleRunSeconds: 120
+    }, {
+      async listTools() {
+        return [
+          {
+            name: "sonarr_replace_episode_files",
+            title: "Safe Sonarr File Replacement",
+            description: "Guarded workflow to delete exact Sonarr episodeFileIds and queue exact EpisodeSearch replacement searches. Dry-run is enabled by default.",
+            inputSchema: {
+              episodeFileIds: [],
+              blocklistExistingSource: true,
+              queueSearch: true,
+              dryRun: true
+            }
+          },
+          {
+            name: "plex_get_metadata",
+            title: "Plex Metadata",
+            description: "Get Plex metadata for one exact rating key."
+          },
+          {
+            name: "media_probe_video_content",
+            title: "Video Content Probe",
+            description: "Probe one exact media file or Plex media part with ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+            inputSchema: {
+              path: "",
+              ratingKey: "",
+              partFile: "",
+              includeFrameHashes: true
+            }
+          },
+          {
+            name: "radarr_delete_movie_file",
+            title: "Radarr Movie File Deletion",
+            description: "Delete one exact Radarr movieFileId with dry-run safety.",
+            inputSchema: {
+              movieFileId: 1,
+              dryRun: true
+            }
+          }
+        ];
+      }
+    });
+    await agent.init();
+    const first = await agent.checkMissingMcpCapabilities("fixture");
+    const second = await agent.checkMissingMcpCapabilities("fixture");
+    assert.notEqual(first.agentSummary, second.agentSummary);
+    assert.deepEqual(stableMcpCapabilityRows(first), stableMcpCapabilityRows(second));
+    assert.deepEqual(first.detectedItemIds.sort(), second.detectedItemIds.sort());
+    assert.deepEqual(first.detectedItemIds.sort(), [1, 3, 4]);
+    const seasonListing = first.results.find(entry => entry.itemId === 2);
+    assert.equal(seasonListing.detected, false);
+    assert.match(seasonListing.reason, /season-level support/);
+    const noSearchDelete = first.results.find(entry => entry.itemId === 4);
+    assert.equal(noSearchDelete.detected, true);
+    assert.equal(noSearchDelete.toolName, "radarr_delete_movie_file");
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -2007,6 +2232,14 @@ function testRedaction() {
   assert.doesNotMatch(redacted, /internal\.example/);
   assert.doesNotMatch(redacted, /mnt\/user/);
   assert.doesNotMatch(redacted, new RegExp(fakeOpenAiToken));
+  const mediaPathRedacted = redactText([
+    "Calling file_delete (path=/data/TV Shows/American Dad! (2005) [imdb-tt0397306]/Season 22/Episode 06.mkv, expectedSize=451023191).",
+    "Source path: \"/downloads/Complete/Backrooms (2026)/Backrooms final.mkv\".",
+    "Library path: /tv/Fixture Show/Season 01/Episode 01.mkv"
+  ].join("\n"));
+  assert.doesNotMatch(mediaPathRedacted, /\/data|\/downloads|\/tv/);
+  assert.doesNotMatch(mediaPathRedacted, /American Dad|Backrooms|Fixture Show/);
+  assert.match(mediaPathRedacted, /\[REDACTED_PATH\]/);
   assert.deepEqual(sanitizeValue({ apiKey: "secret", nested: { password: "pw" } }), {
     apiKey: "[REDACTED]",
     nested: { password: "[REDACTED]" }
@@ -2127,6 +2360,8 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="steer-input" rows="1"/);
     assert.match(pageText, /id="close-dialog"/);
     assert.match(pageText, /id="mcp-gaps-check-button"/);
+    assert.match(pageText, /id="mcp-gap-detection-dialog"/);
+    assert.match(pageText, /id="mcp-gap-detection-close-button"/);
     assert.match(pageText, /Check MCP Capabilities/);
     assert.match(pageText, /id="runner-settings-backdrop"/);
     assert.match(pageText, /id="activity-drawer-backdrop"/);
@@ -2290,6 +2525,7 @@ async function testWebAuthAndApi() {
 
 async function run() {
   await testPlexClosedFilter();
+  await testPollOnceRecordsPartialIssueDetailFailures();
   await testTableAndSnapshotMapping();
   testCommentValidation();
   await testInvestigationCacheAndStaleApprovalSuperseding();
@@ -2300,6 +2536,7 @@ async function run() {
   await testRepairRunnerInvalidJsonFailsWithoutResolution();
   await testRepairRunnerRecordsMissingMcpItems();
   await testMissingMcpCapabilityCheckUsesLiveTools();
+  await testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries();
   await testRepairRunnerNeedsOperatorDecisionCanRetryWithNote();
   await testRepairPromptCompactsOversizedEvidence();
   await testRetryRepairWithoutNoteRerunsSameInvestigation();

@@ -1,4 +1,5 @@
 import { CLOSED_MARKER, REOPENED_MARKER } from "./comments.js";
+import { redactText } from "./redact.js";
 
 function firstString(...values) {
   return values.find(value => typeof value === "string" && value.trim())?.trim() || "";
@@ -94,6 +95,9 @@ export function normalizeIssue(issue) {
     description: firstString(issue.description, issue.message, issue.subject),
     createdAt: issue.createdAt || issue.date || "",
     updatedAt: issue.updatedAt || "",
+    detailError: issue.detailError || "",
+    detailToolName: issue.detailToolName || "",
+    detailUnavailable: Boolean(issue.detailUnavailable),
     raw: issue
   };
 }
@@ -123,17 +127,59 @@ async function mapWithConcurrency(values, concurrency, mapper) {
   return results;
 }
 
+function issueSource(record) {
+  return String(record?.source || "").toLowerCase();
+}
+
+function issueId(record) {
+  return String(record?.id ?? record?.issueId);
+}
+
+function detailToolName(record) {
+  if (issueSource(record) === "seerr") {
+    return "seerr_issue_details";
+  }
+  return "plex_issue_details";
+}
+
+function detailToolArgs(record, toolName) {
+  if (toolName === "seerr_issue_details") {
+    return {
+      issueId: Number(issueId(record)),
+      verbose: false
+    };
+  }
+  return {
+    source: record.source,
+    issueId: issueId(record),
+    verbose: false
+  };
+}
+
 export async function issueQueue(records, client, options = {}) {
   const detailConcurrency = Math.max(1, Math.min(Number(options.detailConcurrency || 4), 16));
   const queued = await mapWithConcurrency(records, detailConcurrency, async record => {
     let issue = record;
     if (needsCommentDetails(record)) {
-      const details = await client.callTool("plex_issue_details", {
-        source: record.source,
-        issueId: String(record.id ?? record.issueId),
-        verbose: false
-      });
-      issue = { ...record, ...(details.issue || details) };
+      const toolName = detailToolName(record);
+      try {
+        const details = await client.callTool(toolName, detailToolArgs(record, toolName));
+        issue = { ...record, ...(details.issue || details) };
+      } catch (error) {
+        const detailError = redactText(error.message);
+        options.onDetailError?.({
+          source: record.source,
+          issueId: issueId(record),
+          toolName,
+          error: detailError
+        });
+        issue = {
+          ...record,
+          detailError,
+          detailToolName: toolName,
+          detailUnavailable: true
+        };
+      }
     }
     return normalizeIssue(issue);
   });

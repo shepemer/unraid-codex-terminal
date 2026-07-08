@@ -1,4 +1,6 @@
 const SECRET_KEY_PATTERN = /(authorization|bearer|token|api[_-]?key|password|passwd|secret|cookie|session)/i;
+const PATH_ROOT_PATTERN = String.raw`(?:\/Users|\/home|\/mnt\/user|\/mnt\/unraid|\/config|\/codex-home|\/boot|\/var\/run|\/data|\/tv|\/movies|\/movie|\/downloads|\/download|\/music|\/photos|\/media)`;
+const MEDIA_PATH_PATTERN = new RegExp(`${PATH_ROOT_PATTERN}\\/.+?(?=(?:,\\s*[A-Za-z][A-Za-z0-9_-]*=)|["'<>\\r\\n]|$)`, "g");
 
 const TEXT_PATTERNS = [
   [/\bBearer\s+[A-Za-z0-9._~+/\-=]+/gi, "Bearer [REDACTED]"],
@@ -6,7 +8,7 @@ const TEXT_PATTERNS = [
   [/\b[A-Za-z0-9_]*API[_-]?KEY[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "API_KEY=[REDACTED]"],
   [/\b[A-Za-z0-9_]*TOKEN[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "TOKEN=[REDACTED]"],
   [/https?:\/\/[^\s"'<>),]+/gi, "[REDACTED_URL]"],
-  [/(?:\/Users|\/home|\/mnt\/user|\/mnt\/unraid|\/config|\/boot|\/var\/run)\/[^\s"'<>),]+/g, "[REDACTED_PATH]"]
+  [MEDIA_PATH_PATTERN, "[REDACTED_PATH]"]
 ];
 
 export function redactText(value) {
