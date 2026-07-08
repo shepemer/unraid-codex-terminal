@@ -204,9 +204,9 @@ const HTML = `<!doctype html>
       <div class="modal-body">
         <p class="modal-help">Download a redacted .log file. Leave times blank to download the full log.</p>
         <label for="logs-from">From</label>
-        <input id="logs-from" type="datetime-local" step="1">
+        <input id="logs-from" type="datetime-local">
         <label for="logs-to">To</label>
-        <input id="logs-to" type="datetime-local" step="1">
+        <input id="logs-to" type="datetime-local">
       </div>
       <div class="modal-actions">
         <button id="logs-cancel-button" type="button" class="secondary">Close</button>
