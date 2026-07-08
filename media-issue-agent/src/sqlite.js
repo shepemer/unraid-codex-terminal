@@ -3,6 +3,22 @@ import { access, mkdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
+const SQLITE_BUSY_PATTERNS = [
+  /database is locked/i,
+  /database is busy/i,
+  /database table is locked/i,
+  /SQLITE_BUSY/i,
+  /SQLITE_LOCKED/i
+];
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function isBusyErrorText(text) {
+  return SQLITE_BUSY_PATTERNS.some(pattern => pattern.test(text || ""));
+}
+
 function sqlValue(value) {
   if (value === null || value === undefined) {
     return "NULL";
@@ -39,21 +55,31 @@ export async function ensureDbDir(dbPath) {
 }
 
 export function sqliteExec(dbPath, statement, options = {}) {
-  const args = options.json ? ["-json", dbPath] : [dbPath];
-  const result = spawnSync("sqlite3", args, {
-    input: statement,
-    encoding: "utf8",
-    maxBuffer: 10 * 1024 * 1024
-  });
-  if (result.error) {
-    throw result.error;
+  const maxAttempts = Math.max(1, Number(options.attempts || 5));
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || 10000));
+  const args = options.json ? ["-cmd", `.timeout ${timeoutMs}`, "-json", dbPath] : ["-cmd", `.timeout ${timeoutMs}`, dbPath];
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const result = spawnSync("sqlite3", args, {
+      input: statement,
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024
+    });
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.status === 0) {
+      if (!options.json) {
+        return result.stdout;
+      }
+      const text = result.stdout.trim();
+      return text ? JSON.parse(text) : [];
+    }
+    lastFailure = result.stderr.trim() || result.stdout.trim();
+    if (!isBusyErrorText(lastFailure) || attempt === maxAttempts) {
+      break;
+    }
+    sleepSync(Math.min(250 * attempt, 1000));
   }
-  if (result.status !== 0) {
-    throw new Error(`sqlite3 failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  }
-  if (!options.json) {
-    return result.stdout;
-  }
-  const text = result.stdout.trim();
-  return text ? JSON.parse(text) : [];
+  throw new Error(`sqlite3 failed: ${lastFailure}`);
 }

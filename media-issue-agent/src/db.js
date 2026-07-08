@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import { ensureDbDir, sql, sqliteExec } from "./sqlite.js";
 
 export const JOB_STATES = new Set([
@@ -20,6 +21,24 @@ export const JOB_STATES = new Set([
   "failed_retryable",
   "failed_terminal"
 ]);
+
+function processStartTicks(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return null;
+  }
+  try {
+    const stat = readFileSync(`/proc/${numericPid}/stat`, "utf8");
+    const afterCommand = stat.slice(stat.lastIndexOf(")") + 1).trim();
+    const fieldsFromState = afterCommand.split(/\s+/);
+    return fieldsFromState[19] || null;
+  } catch {
+    return null;
+  }
+}
+
+const CURRENT_OWNER_PID = process.pid;
+const CURRENT_OWNER_STARTED_AT = processStartTicks(process.pid);
 
 export async function initDb(dbPath) {
   await ensureDbDir(dbPath);
@@ -131,6 +150,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   config_json TEXT NOT NULL,
   final_result_json TEXT,
   error TEXT,
+  owner_pid INTEGER,
+  owner_started_at TEXT,
   started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   completed_at TEXT
@@ -161,6 +182,8 @@ CREATE TABLE IF NOT EXISTS missing_mcp_items (
 );
 `);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
+  ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
+  ensureColumn(dbPath, "agent_runs", "owner_started_at", "TEXT");
   sqliteExec(dbPath, `
 UPDATE agent_runs
 SET heartbeat_at = COALESCE(heartbeat_at, started_at)
@@ -500,11 +523,11 @@ LIMIT 1;
 
 export function createAgentRun(dbPath, jobId, kind, prompt, config) {
   const [{ id }] = sqliteExec(dbPath, sql`
-INSERT INTO agent_runs (job_id, kind, status, prompt, config_json, heartbeat_at)
-VALUES (${jobId}, ${kind}, 'running', ${prompt}, ${JSON.stringify(config || {})}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+INSERT INTO agent_runs (job_id, kind, status, prompt, config_json, heartbeat_at, owner_pid, owner_started_at)
+VALUES (${jobId}, ${kind}, 'running', ${prompt}, ${JSON.stringify(config || {})}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ${CURRENT_OWNER_PID}, ${CURRENT_OWNER_STARTED_AT})
 RETURNING id;
 `, { json: true });
-  return { id, jobId, kind, status: "running", prompt, config: config || {} };
+  return { id, jobId, kind, status: "running", prompt, config: config || {}, ownerPid: CURRENT_OWNER_PID, ownerStartedAt: CURRENT_OWNER_STARTED_AT };
 }
 
 export function touchAgentRun(dbPath, runId) {
@@ -534,6 +557,8 @@ SELECT
 	  config_json AS configJson,
 	  final_result_json AS finalResultJson,
 	  error,
+  owner_pid AS ownerPid,
+  owner_started_at AS ownerStartedAt,
   started_at AS startedAt,
   heartbeat_at AS heartbeatAt,
   completed_at AS completedAt
@@ -547,16 +572,41 @@ LIMIT 1;
   }))[0] || null;
 }
 
+function processExists(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function processMatchesOwner(pid, ownerStartedAt) {
+  if (!processExists(pid)) {
+    return false;
+  }
+  if (!ownerStartedAt) {
+    return true;
+  }
+  return processStartTicks(pid) === String(ownerStartedAt);
+}
+
 export function recoverInterruptedAgentRuns(dbPath, options = {}) {
   const staleSeconds = Math.max(1, Number(options.staleSeconds || 120));
+  const ignoreLiveOwnerPids = options.ignoreLiveOwnerPids !== false;
   const message = options.message || "Media issue agent restarted while repair was running. Retry the repair from the job detail pane.";
   const runs = sqliteExec(dbPath, sql`
-SELECT id, job_id AS jobId, started_at AS startedAt, heartbeat_at AS heartbeatAt
+SELECT id, job_id AS jobId, owner_pid AS ownerPid, owner_started_at AS ownerStartedAt, started_at AS startedAt, heartbeat_at AS heartbeatAt
 FROM agent_runs
 WHERE status = 'running'
   AND julianday(COALESCE(heartbeat_at, started_at)) <= julianday('now') - (${staleSeconds} / 86400.0);
 `, { json: true });
-  for (const run of runs) {
+  const recoverable = runs.filter(run => !ignoreLiveOwnerPids || !processMatchesOwner(run.ownerPid, run.ownerStartedAt));
+  for (const run of recoverable) {
     completeAgentRun(dbPath, run.id, "failed_retryable", null, message);
     recordAgentRunEvent(dbPath, run.id, run.jobId, "repair_recovered_after_restart", {
       error: message,
@@ -578,15 +628,19 @@ WHERE id = ${run.jobId}
   AND state IN ('approved_for_execution', 'executing', 'waiting_for_plex_verification', 'drafting_comment');
 `);
   }
-  return runs.length;
+  return recoverable.length;
 }
 
 export function recordAgentRunEvent(dbPath, runId, jobId, eventType, payload) {
   sqliteExec(dbPath, sql`
+BEGIN;
 INSERT INTO agent_run_events (run_id, job_id, event_type, payload_json)
 VALUES (${runId}, ${jobId}, ${eventType}, ${JSON.stringify(payload || {})});
+UPDATE agent_runs
+SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${runId} AND status = 'running';
+COMMIT;
 `);
-  touchAgentRun(dbPath, runId);
 }
 
 function normalizeMissingMcpDbItem(item) {
@@ -860,6 +914,8 @@ SELECT
   config_json AS configJson,
   final_result_json AS finalResultJson,
   error,
+  owner_pid AS ownerPid,
+  owner_started_at AS ownerStartedAt,
   started_at AS startedAt,
   heartbeat_at AS heartbeatAt,
   completed_at AS completedAt

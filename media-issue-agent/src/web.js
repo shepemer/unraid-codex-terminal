@@ -149,6 +149,7 @@ const HTML = `<!doctype html>
         <div id="steer-panel" class="steer-panel hidden">
           <textarea id="steer-input" rows="1" placeholder="Steer the investigation or repair plan"></textarea>
           <button id="steer-button" type="button" class="secondary">Update investigation</button>
+          <button id="retry-same-repair-button" type="button" class="secondary hidden">Retry same repair</button>
         </div>
         <div id="repair-retry-panel" class="steer-panel hidden">
           <textarea id="repair-retry-input" rows="3" placeholder="Retry repair with trusted guidance"></textarea>
@@ -1702,6 +1703,7 @@ const el = {
   steerPanel: document.getElementById("steer-panel"),
   steerInput: document.getElementById("steer-input"),
   steerButton: document.getElementById("steer-button"),
+  retrySameRepairButton: document.getElementById("retry-same-repair-button"),
   repairRetryPanel: document.getElementById("repair-retry-panel"),
   repairRetryInput: document.getElementById("repair-retry-input"),
   repairRetryButton: document.getElementById("repair-retry-button"),
@@ -1798,6 +1800,7 @@ function closeDetail() {
   el.continueButton.classList.add("hidden");
   el.approvalActions.classList.add("hidden");
   setSteerVisible(false);
+  setRetrySameRepairVisible(false);
   setActivityDrawerOpen(false);
   setRunnerSettingsOpen(false);
   renderJobs(state.jobs);
@@ -2074,7 +2077,18 @@ function canReinvestigate(entry) {
     && ["detected", "queued_for_investigation", "awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState);
 }
 
+function isLiveOpenEntry(entry) {
+  const liveStatus = String(entry?.liveStatus || "").toLowerCase();
+  if (liveStatus === "open" || liveStatus === "reopened") {
+    return true;
+  }
+  return entry?.jobState === "detected";
+}
+
 function isClosedEntry(entry) {
+  if (isLiveOpenEntry(entry)) {
+    return false;
+  }
   const lifecycle = String(entry?.lifecycle || entry?.raw?.lifecycle || "").toLowerCase();
   if (lifecycle === "closed") {
     return true;
@@ -2094,6 +2108,19 @@ function isClosedEntry(entry) {
     return true;
   }
   return entry?.jobState === "closed";
+}
+
+function displayIssueStatus(entry) {
+  if (entry?.liveStatus) {
+    return entry.liveStatus;
+  }
+  if (entry?.jobState === "closed") {
+    return "closed";
+  }
+  if (isLiveOpenEntry(entry)) {
+    return "open";
+  }
+  return entry?.status || entry?.raw?.status || entry?.raw?.rawStatus || "unknown";
 }
 
 function canInvestigate(entry) {
@@ -2140,6 +2167,7 @@ function issueActionButton(entry) {
 }
 
 function issueCardHtml(entry) {
+  const displayStatus = displayIssueStatus(entry);
   const cardClasses = [
     "issue-card",
     isClosedEntry(entry) ? "issue-closed" : "",
@@ -2151,7 +2179,7 @@ function issueCardHtml(entry) {
       <div class="issue-card-header">
         <div class="issue-card-meta">
           <span class="source-pill">\${escapeHtml(entry.source)}</span>
-          <span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span>
+          <span class="\${statusBadgeClass(displayStatus)}">\${escapeHtml(displayStatus)}</span>
         </div>
         <span class="badge muted">#\${escapeHtml(entry.idx)}</span>
       </div>
@@ -2173,7 +2201,7 @@ function formatEntryMetadata(entry) {
     \`Reporter: \${entry.reporter || "Unknown"}\`,
     \`Media/title: \${entry.mediaTitle || "Untitled media"}\`,
     \`Date: \${entry.date || "Unknown date"}\`,
-    \`Status: \${entry.status || "Unknown"}\`
+    \`Status: \${displayIssueStatus(entry)}\`
   ].join("\\n");
 }
 
@@ -2183,6 +2211,11 @@ function setSteerVisible(visible) {
   if (visible) {
     autoResizeSteerInput();
   }
+}
+
+function setRetrySameRepairVisible(visible) {
+  el.retrySameRepairButton.classList.toggle("hidden", !visible);
+  el.retrySameRepairButton.disabled = !visible || state.busy || !state.authOk;
 }
 
 function setRepairRetryVisible(visible) {
@@ -2392,7 +2425,9 @@ function renderIssueLists() {
     el.issueCards.innerHTML = '<div class="empty">No issues.</div>';
     return;
   }
-  el.issueRows.innerHTML = state.entries.map(entry => \`
+  el.issueRows.innerHTML = state.entries.map(entry => {
+    const displayStatus = displayIssueStatus(entry);
+    return \`
     <tr data-entry-index="\${entry.idx}" class="\${[isClosedEntry(entry) ? "issue-closed" : "", Number(state.activeEntryIndex) === Number(entry.idx) ? "issue-active" : "", isProcessingState(entry.jobState) ? "issue-processing" : ""].filter(Boolean).join(" ")}">
       <td>\${entry.idx}</td>
       <td><span class="source-pill">\${escapeHtml(entry.source)}</span></td>
@@ -2400,11 +2435,12 @@ function renderIssueLists() {
       <td>\${escapeHtml(entry.date)}</td>
       <td>\${escapeHtml(entry.reporter)}</td>
       <td>\${escapeHtml(entry.mediaTitle)}</td>
-      <td><span class="\${statusBadgeClass(entry.status)}">\${escapeHtml(entry.status)}</span></td>
+      <td><span class="\${statusBadgeClass(displayStatus)}">\${escapeHtml(displayStatus)}</span></td>
       <td>\${escapeHtml(entry.description)}</td>
       <td>\${issueActionButton(entry)}</td>
     </tr>
-  \`).join("");
+  \`;
+  }).join("");
   el.issueCards.innerHTML = state.entries.map(issueCardHtml).join("");
 }
 
@@ -2450,6 +2486,61 @@ function mergeJobDetailState(detail) {
   });
 }
 
+function applyIssueMutation(index, result) {
+  const liveStatus = String(result?.status || "").trim();
+  if (!liveStatus) {
+    return;
+  }
+  const normalized = liveStatus.toLowerCase();
+  const isClosed = normalized === "closed" || normalized === "resolved";
+  const jobState = isClosed ? "closed" : "detected";
+  let entryForJob = null;
+  state.entries = state.entries.map(entry => {
+    if (Number(entry.idx) !== Number(index)) {
+      return entry;
+    }
+    const updated = {
+      ...entry,
+      jobId: result.jobId || entry.jobId,
+      jobState,
+      liveStatus: isClosed ? "closed" : "open",
+      status: isClosed ? "closed" : "open",
+      lifecycle: isClosed ? "closed" : "open",
+      isClosed,
+      raw: {
+        ...(entry.raw || {}),
+        status: isClosed ? "closed" : "open",
+        lifecycle: isClosed ? "closed" : "open",
+        isClosed
+      }
+    };
+    entryForJob = updated;
+    return updated;
+  });
+  if (result.jobId && entryForJob) {
+    let matched = false;
+    state.jobs = state.jobs.map(job => {
+      if (Number(job.id) !== Number(result.jobId)) {
+        return job;
+      }
+      matched = true;
+      return { ...job, state: jobState, updatedAt: new Date().toISOString() };
+    });
+    if (!matched) {
+      state.jobs = [{
+        id: result.jobId,
+        source: entryForJob.source,
+        issueId: entryForJob.issueId,
+        state: jobState,
+        updatedAt: new Date().toISOString()
+      }, ...state.jobs];
+    }
+  }
+  renderIssueLists();
+  renderJobs(state.jobs);
+  updateIssueRowHighlights();
+}
+
 function showEntry(index) {
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   if (!entry) return;
@@ -2470,6 +2561,7 @@ function showEntry(index) {
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   setRepairRetryVisible(false);
+  setRetrySameRepairVisible(false);
   renderJobs(state.jobs);
   setSteerVisible(Boolean(entry.jobId) && ["awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState));
   if (entry.investigationSummary) {
@@ -2598,7 +2690,7 @@ function formatRepairActivityEvent(event) {
     if (item.type === "mcp_tool_call") {
       const status = item.status ? " (" + String(item.status).replaceAll("_", " ") + ")" : "";
       const error = item.error ? ": " + compactActivityText(item.error, 160) : ".";
-      return prefix + "Codex completed " + activityToolName(item.name) + status + error;
+      return prefix + "Codex completed " + activityToolName(item.name || item.tool) + status + error;
     }
     if (item.type === "agent_message" || item.type === "message") {
       return prefix + "Codex reported " + summarizeAgentMessage(item.text || item.message || item.content) + ".";
@@ -2650,6 +2742,22 @@ function pendingApproval(detail) {
   return (detail.approvals || []).find(approval => approval.status === "pending") || null;
 }
 
+function canRetrySameRepair(detail) {
+  const pending = pendingApproval(detail);
+  const hasPriorRepairRun = (detail.agentRuns || []).some(run => run.kind === "repair"
+    && ["failed_retryable", "failed_terminal", "needs_operator_decision"].includes(run.status));
+  const hasFailureContext = hasPriorRepairRun || Boolean(detail.job.lastError);
+  const hasApprovedRepair = (detail.approvals || []).some(approval => approval.kind === "action"
+    && approval.status === "approved"
+    && approval.payload?.plan?.executionMode === "approved_repair_agent");
+  const hasPendingRepair = pending?.kind === "action"
+    && pending.payload?.plan?.executionMode === "approved_repair_agent";
+  return hasFailureContext && (
+    (detail.job.state === "awaiting_action_approval" && hasPendingRepair)
+    || (["failed_retryable", "failed_terminal"].includes(detail.job.state) && hasApprovedRepair)
+  );
+}
+
 function formatActionSummary(summary) {
   if (!summary) {
     return "";
@@ -2671,6 +2779,107 @@ function formatActionSummary(summary) {
     }
   }
   return lines.join("\\n");
+}
+
+function formatPlanDetails(plan) {
+  if (!plan) {
+    return "";
+  }
+  const lines = [];
+  if (plan.classification) {
+    lines.push("Classification: " + String(plan.classification).replaceAll("_", " "));
+  }
+  if (plan.executionMode) {
+    lines.push("Execution: " + String(plan.executionMode).replaceAll("_", " "));
+  }
+  if (plan.requiresServerAction !== undefined) {
+    lines.push("Server action: " + (plan.requiresServerAction ? "yes" : "no"));
+  }
+  if (plan.note) {
+    lines.push("Note: " + compactActivityText(plan.note, 260));
+  }
+  if (plan.repairPrompt) {
+    lines.push("", "Repair prompt preview:", compactActivityText(plan.repairPrompt, 700));
+  }
+  return lines.join("\\n");
+}
+
+function formatExecutionResult(result) {
+  if (!result) {
+    return "";
+  }
+  const lines = [];
+  const outcome = result.outcome || result.status;
+  if (outcome) {
+    lines.push("Outcome: " + String(outcome).replaceAll("_", " "));
+  }
+  if (result.summary) {
+    lines.push("Summary: " + result.summary);
+  }
+  if (result.verification) {
+    const verificationStatus = result.verification.status ? String(result.verification.status).replaceAll("_", " ") : "unknown";
+    lines.push("Verification: " + verificationStatus + (result.verification.details ? " - " + result.verification.details : ""));
+  }
+  const actions = result.actionsTaken || result.actions || [];
+  if (actions.length) {
+    lines.push("Actions:");
+    for (const action of actions) {
+      if (typeof action === "string") {
+        lines.push("- " + action);
+      } else {
+        const tool = action.toolName || action.tool || "media action";
+        const status = action.status || action.result?.status || "";
+        lines.push("- " + tool + (status ? " · " + status : ""));
+      }
+    }
+  }
+  if (result.missingMcpItems?.length) {
+    lines.push("MCP gaps reported: " + result.missingMcpItems.length);
+  }
+  return lines.join("\\n");
+}
+
+function formatPlannedAction(action) {
+  const lines = [
+    "- " + (action.toolName || "media action") + (action.riskLevel ? " · risk " + action.riskLevel : "")
+  ];
+  if (action.result?.summary || action.dryRunResult?.summary) {
+    lines.push("  " + (action.result?.summary || action.dryRunResult?.summary));
+  } else if (action.result?.status || action.dryRunResult?.status) {
+    lines.push("  Status: " + (action.result?.status || action.dryRunResult?.status));
+  }
+  return lines.join("\\n");
+}
+
+function formatVerificationCheck(check) {
+  const lines = [
+    "- " + (check.checkType || "verification") + " · " + (check.status || "unknown")
+  ];
+  if (check.criteria?.summary || check.criteria?.description) {
+    lines.push("  " + (check.criteria.summary || check.criteria.description));
+  }
+  if (check.completedAt) {
+    lines.push("  Completed: " + check.completedAt);
+  }
+  return lines.join("\\n");
+}
+
+function formatMissingMcpItem(item) {
+  const parts = [];
+  if (item.suggestedToolName) {
+    parts.push("tool " + item.suggestedToolName);
+  }
+  if (item.category) {
+    parts.push("category " + item.category);
+  }
+  if (item.updatedAt) {
+    parts.push("updated " + item.updatedAt);
+  }
+  return [
+    "- " + item.title,
+    item.description ? "  " + item.description : "",
+    parts.length ? "  " + parts.join(" · ") : ""
+  ].filter(Boolean).join("\\n");
 }
 
 function steeringHistoryFromInvestigation(investigation) {
@@ -2726,15 +2935,13 @@ function formatJobDetail(detail) {
       if (actionSummary) {
         lines.push("", "Action summary:", actionSummary);
       }
-      if (pending.payload.plan.repairPrompt) {
-        lines.push("", "Full repair context:", pending.payload.plan.repairPrompt);
-      } else {
-        const { actionSummary: _actionSummary, ...planDetails } = pending.payload.plan;
-        lines.push("", "Plan details:", formatJson(planDetails));
+      const planDetails = formatPlanDetails(pending.payload.plan);
+      if (planDetails) {
+        lines.push("", "Plan details:", planDetails);
       }
     }
     if (pending.payload?.executionResult) {
-      lines.push("", "Fix result:", formatJson(pending.payload.executionResult));
+      lines.push("", "Fix result:", formatExecutionResult(pending.payload.executionResult));
     }
     if (pending.payload?.message) {
       lines.push("", "Draft resolution comment:", pending.payload.message);
@@ -2750,25 +2957,13 @@ function formatJobDetail(detail) {
   if (detail.plannedActions?.length) {
     lines.push("", "Planned/executed actions:");
     for (const action of detail.plannedActions) {
-      lines.push(formatJson({
-        tool: action.toolName,
-        risk: action.riskLevel,
-        args: action.args,
-        dryRunResult: action.dryRunResult,
-        result: action.result
-      }));
+      lines.push(formatPlannedAction(action));
     }
   }
   if (detail.verificationChecks?.length) {
     lines.push("", "Verification checks:");
     for (const check of detail.verificationChecks) {
-      lines.push(formatJson({
-        type: check.checkType,
-        status: check.status,
-        criteria: check.criteria,
-        startedAt: check.startedAt,
-        completedAt: check.completedAt
-      }));
+      lines.push(formatVerificationCheck(check));
     }
   }
   if (detail.agentRuns?.length) {
@@ -2780,14 +2975,7 @@ function formatJobDetail(detail) {
   if (detail.missingMcpItems?.length) {
     lines.push("", "Missing MCP items reported by repair runs:");
     for (const item of detail.missingMcpItems) {
-      lines.push(formatJson({
-        id: item.id,
-        title: item.title,
-        description: item.description,
-        suggestedToolName: item.suggestedToolName,
-        category: item.category,
-        updatedAt: item.updatedAt
-      }));
+      lines.push(formatMissingMcpItem(item));
     }
   }
   if (detail.agentRunEvents?.length) {
@@ -2821,6 +3009,7 @@ function updateJobControls(detail) {
   setRepairRetryVisible(false);
   setSteerVisible(stateName === "awaiting_action_approval"
     || (["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution));
+  setRetrySameRepairVisible(canRetrySameRepair(detail));
 }
 
 function shouldPollJob(detail) {
@@ -2953,6 +3142,7 @@ async function showIssueSummary(index) {
   el.continueButton.classList.add("hidden");
   setSteerVisible(false);
   setRepairRetryVisible(false);
+  setRetrySameRepairVisible(false);
   el.reopenButton.classList.toggle("hidden", !entry || !isClosedEntry(entry));
   el.output.textContent = "Loading issue summary...";
   renderJobs(state.jobs);
@@ -3028,6 +3218,7 @@ async function closeIssueFromDialog() {
       method: "POST",
       body: JSON.stringify({ comment })
     });
+    applyIssueMutation(index, result.result);
     closeCloseDialog();
     toast("Issue closed");
     await refresh();
@@ -3052,6 +3243,7 @@ async function reopenIssue() {
       method: "POST",
       body: "{}"
     });
+    applyIssueMutation(index, result.result);
     toast("Issue re-opened");
     await refresh();
     el.output.textContent = formatJson(result.result);
@@ -3075,6 +3267,7 @@ async function investigate(index, force = false) {
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");
   setRepairRetryVisible(false);
+  setRetrySameRepairVisible(false);
   try {
     const result = await api("/api/investigate", {
       method: "POST",
@@ -3166,6 +3359,35 @@ async function retryRepair() {
       body: JSON.stringify({ note })
     });
     el.repairRetryInput.value = "";
+    toast(\`Job \${state.activeJobId} repair retried\`);
+    el.output.textContent = result.result?.message || formatJson(result.result);
+    await refresh();
+    await showJob(state.activeJobId);
+  } catch (error) {
+    setDetailProcessing(false);
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    clearInterval(polling);
+    setBusy(false);
+  }
+}
+
+async function retrySameRepair() {
+  if (!state.activeJobId) return;
+  setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Retrying repair");
+  const polling = setInterval(() => {
+    if (state.activeJobId) {
+      showJob(state.activeJobId, { quiet: true }).catch(() => {});
+    }
+  }, 1500);
+  try {
+    const result = await api(\`/api/jobs/\${state.activeJobId}/retry-repair\`, {
+      method: "POST",
+      body: JSON.stringify({ note: "" })
+    });
     toast(\`Job \${state.activeJobId} repair retried\`);
     el.output.textContent = result.result?.message || formatJson(result.result);
     await refresh();
@@ -3286,6 +3508,7 @@ el.detailCloseButton.addEventListener("click", closeDetail);
 el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
 el.repairRetryButton.addEventListener("click", retryRepair);
+el.retrySameRepairButton.addEventListener("click", retrySameRepair);
 el.steerButton.addEventListener("click", steerInvestigation);
 el.steerInput.addEventListener("input", autoResizeSteerInput);
 el.repairRetryInput.addEventListener("keydown", event => {
