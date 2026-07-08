@@ -5,6 +5,7 @@ import http from "node:http";
 import { inspectCodexAuth } from "./config.js";
 import { buildCodexSubprocessEnv } from "./codex.js";
 import { redactText, sanitizeValue } from "./redact.js";
+import { normalizeDiagnosticLogRange, streamDiagnosticLog } from "./diagnostic-log.js";
 
 const HTML = `<!doctype html>
 <html lang="en" data-theme="dark">
@@ -59,6 +60,7 @@ const HTML = `<!doctype html>
         </div>
         <button id="runner-settings-button" class="secondary mobile-only" type="button" aria-expanded="false">Runner</button>
         <button id="activity-drawer-button" class="secondary mobile-only" type="button" aria-expanded="false">Activity</button>
+        <button id="logs-button" class="secondary" type="button">Logs</button>
         <div class="theme-toggle" aria-label="Theme">
           <button type="button" data-theme-choice="light">Light</button>
           <button type="button" data-theme-choice="dark">Dark</button>
@@ -118,6 +120,7 @@ const HTML = `<!doctype html>
               <h2 id="activity-heading">Activity</h2>
             </div>
             <span id="approval-mode" class="badge warning">approval-gated</span>
+            <button id="mcp-gaps-button" class="secondary" type="button">MCP Gaps</button>
             <button id="activity-close-button" class="secondary mobile-only" type="button">Close</button>
           </div>
           <div class="stats-grid" id="stats-grid"></div>
@@ -187,6 +190,44 @@ const HTML = `<!doctype html>
       <div class="modal-actions">
         <button id="repair-context-cancel-button" type="button" class="secondary">Cancel</button>
         <button id="repair-context-save-button" type="button">Save Context</button>
+      </div>
+    </div>
+  </div>
+  <div id="logs-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="logs-dialog-title">
+    <div class="modal-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Diagnostics</span>
+          <h2 id="logs-dialog-title">Download Logs</h2>
+        </div>
+      </div>
+      <div class="modal-body">
+        <p class="modal-help">Download a redacted .log file. Leave times blank to download the full log.</p>
+        <label for="logs-from">From</label>
+        <input id="logs-from" type="datetime-local" step="1">
+        <label for="logs-to">To</label>
+        <input id="logs-to" type="datetime-local" step="1">
+      </div>
+      <div class="modal-actions">
+        <button id="logs-cancel-button" type="button" class="secondary">Close</button>
+        <button id="logs-download-button" type="button">Download .log</button>
+      </div>
+    </div>
+  </div>
+  <div id="mcp-gaps-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="mcp-gaps-dialog-title">
+    <div class="modal-panel mcp-gaps-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Media MCP</span>
+          <h2 id="mcp-gaps-dialog-title">Missing MCP Items</h2>
+        </div>
+      </div>
+      <div class="modal-body">
+        <p class="modal-help">Active capabilities the repair runner reported would help unblock future repairs.</p>
+        <div id="mcp-gaps-list" class="mcp-gaps-list">Loading...</div>
+      </div>
+      <div class="modal-actions">
+        <button id="mcp-gaps-close-button" type="button" class="secondary">Close</button>
       </div>
     </div>
   </div>
@@ -413,9 +454,9 @@ p { color: var(--muted); margin-top: 2px; }
   white-space: nowrap;
 }
 
-.compact-model { width: 170px; }
-.compact-reasoning { width: 158px; }
-.compact-tier { width: 116px; }
+.compact-model { width: 132px; }
+.compact-reasoning { width: 132px; }
+.compact-tier { width: 82px; }
 
 .runner-strip input[type="text"],
 .runner-strip select {
@@ -570,6 +611,16 @@ p { color: var(--muted); margin-top: 2px; }
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
   background: linear-gradient(180deg, color-mix(in srgb, var(--panel-2) 82%, transparent), color-mix(in srgb, var(--panel) 92%, transparent));
+}
+
+.side-panel .section-header {
+  flex-wrap: wrap;
+}
+
+#mcp-gaps-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .badge {
@@ -951,6 +1002,10 @@ pre {
   box-shadow: var(--shadow);
 }
 
+.modal-panel.mcp-gaps-panel {
+  width: min(760px, 100%);
+}
+
 .modal-body {
   display: grid;
   gap: 8px;
@@ -963,16 +1018,26 @@ pre {
   font-weight: 760;
 }
 
-.modal-body textarea {
+.modal-help {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.modal-body textarea,
+.modal-body input[type="datetime-local"] {
   width: 100%;
-  min-height: 116px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  resize: vertical;
   padding: 10px;
   background: var(--panel-2);
   color: var(--text);
   font: inherit;
+}
+
+.modal-body textarea {
+  min-height: 116px;
+  resize: vertical;
 }
 
 .modal-actions {
@@ -981,6 +1046,46 @@ pre {
   gap: 8px;
   padding: 12px 14px;
   border-top: 1px solid var(--line);
+}
+
+.mcp-gaps-list {
+  display: grid;
+  gap: 10px;
+  max-height: min(58vh, 520px);
+  overflow: auto;
+}
+
+.mcp-gap-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 11px;
+  background: var(--panel-2);
+}
+
+.mcp-gap-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.25;
+  font-weight: 780;
+  overflow-wrap: anywhere;
+}
+
+.mcp-gap-description,
+.mcp-gap-meta {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.mcp-gap-remove {
+  min-width: 82px;
 }
 
 .modal-backdrop.hidden {
@@ -1123,7 +1228,7 @@ pre {
 
   .topbar .toolbar {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     width: 100%;
     gap: 8px;
   }
@@ -1139,6 +1244,7 @@ pre {
 
   .app-shell.runner-settings-open .topbar {
     z-index: 45;
+    backdrop-filter: none;
   }
 
   .runner-strip {
@@ -1147,13 +1253,18 @@ pre {
 
   .app-shell.runner-settings-open .runner-strip {
     position: fixed;
-    inset: auto 12px 12px;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    right: 12px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+    left: 12px;
     z-index: 46;
     display: grid;
     grid-template-columns: 1fr;
     width: auto;
-    max-height: calc(100dvh - 24px);
+    height: auto;
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 24px);
     overflow: auto;
+    overscroll-behavior: contain;
     gap: 10px;
     padding: 12px;
     background: var(--panel);
@@ -1394,6 +1505,14 @@ pre {
     overflow: auto;
   }
 
+  .mcp-gap-item {
+    grid-template-columns: 1fr;
+  }
+
+  .mcp-gap-remove {
+    width: 100%;
+  }
+
   #toast {
     right: 10px;
     bottom: 10px;
@@ -1468,6 +1587,16 @@ const el = {
   repairContextDialog: document.getElementById("repair-context-dialog"),
   repairContextCancelButton: document.getElementById("repair-context-cancel-button"),
   repairContextSaveButton: document.getElementById("repair-context-save-button"),
+  logsButton: document.getElementById("logs-button"),
+  logsDialog: document.getElementById("logs-dialog"),
+  logsFrom: document.getElementById("logs-from"),
+  logsTo: document.getElementById("logs-to"),
+  logsCancelButton: document.getElementById("logs-cancel-button"),
+  logsDownloadButton: document.getElementById("logs-download-button"),
+  mcpGapsButton: document.getElementById("mcp-gaps-button"),
+  mcpGapsDialog: document.getElementById("mcp-gaps-dialog"),
+  mcpGapsList: document.getElementById("mcp-gaps-list"),
+  mcpGapsCloseButton: document.getElementById("mcp-gaps-close-button"),
   runnerSettingsButton: document.getElementById("runner-settings-button"),
   runnerSettingsCloseButton: document.getElementById("runner-settings-close-button"),
   runnerSettingsBackdrop: document.getElementById("runner-settings-backdrop"),
@@ -1744,7 +1873,7 @@ function issueOpensJob(entry) {
   if (isProcessingState(stateName)) {
     return true;
   }
-  return stateName === "failed_retryable" && entryHasApprovedRepair(entry);
+  return ["failed_retryable", "failed_terminal"].includes(stateName) && entryHasApprovedRepair(entry);
 }
 
 function issueOpenJobLabel(entry) {
@@ -1752,7 +1881,7 @@ function issueOpenJobLabel(entry) {
   if (stateName === "awaiting_resolution_approval") {
     return "Approve fix";
   }
-  if (stateName === "failed_retryable" && entryHasApprovedRepair(entry)) {
+  if (["failed_retryable", "failed_terminal"].includes(stateName) && entryHasApprovedRepair(entry)) {
     return "Retry repair";
   }
   if (isProcessingState(stateName)) {
@@ -1923,6 +2052,98 @@ function closeRepairContextDialog({ revert = true } = {}) {
     el.codexRepairContext.value = currentSavedRepairContext();
   }
   el.repairContextDialog.classList.add("hidden");
+}
+
+function openLogsDialog() {
+  el.logsDialog.classList.remove("hidden");
+  el.logsFrom.focus();
+}
+
+function closeLogsDialog() {
+  el.logsDialog.classList.add("hidden");
+}
+
+function datetimeLocalToIso(value) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    throw new Error("Log time range contains an invalid timestamp");
+  }
+  return date.toISOString();
+}
+
+function downloadLogs() {
+  try {
+    const params = new URLSearchParams();
+    const from = datetimeLocalToIso(el.logsFrom.value);
+    const to = datetimeLocalToIso(el.logsTo.value);
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    const query = params.toString();
+    window.location.href = \`/api/logs/download\${query ? \`?\${query}\` : ""}\`;
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function mcpGapHtml(item) {
+  const tool = item.suggestedToolName ? \`Tool: \${item.suggestedToolName}\` : "Tool: unspecified";
+  const job = item.jobId ? \`Job \${item.jobId}\${item.jobSource ? \` · \${item.jobSource} \${item.jobIssueId || ""}\` : ""}\` : "No linked job";
+  const category = item.category ? \`Category: \${item.category}\` : "";
+  const meta = [tool, category, job, item.updatedAt ? \`Updated: \${item.updatedAt}\` : ""].filter(Boolean).join(" · ");
+  return \`
+    <article class="mcp-gap-item" data-mcp-gap-id="\${item.id}">
+      <div>
+        <h3 class="mcp-gap-title">\${escapeHtml(item.title)}</h3>
+        <p class="mcp-gap-description">\${escapeHtml(item.description)}</p>
+        <p class="mcp-gap-meta">\${escapeHtml(meta)}</p>
+      </div>
+      <button class="secondary mcp-gap-remove" type="button" data-remove-mcp-gap="\${item.id}">Remove</button>
+    </article>
+  \`;
+}
+
+function renderMcpGaps(items) {
+  if (!items.length) {
+    el.mcpGapsList.innerHTML = '<div class="empty">No active missing MCP items.</div>';
+    return;
+  }
+  el.mcpGapsList.innerHTML = items.map(mcpGapHtml).join("");
+}
+
+async function loadMcpGaps() {
+  el.mcpGapsList.textContent = "Loading...";
+  const result = await api("/api/mcp-missing-items");
+  renderMcpGaps(result.items || []);
+}
+
+async function openMcpGapsDialog() {
+  el.mcpGapsDialog.classList.remove("hidden");
+  try {
+    await loadMcpGaps();
+  } catch (error) {
+    el.mcpGapsList.textContent = error.message;
+    toast(error.message);
+  }
+}
+
+function closeMcpGapsDialog() {
+  el.mcpGapsDialog.classList.add("hidden");
+}
+
+async function removeMcpGap(itemId) {
+  setBusy(true);
+  try {
+    await api(\`/api/mcp-missing-items/\${itemId}\`, { method: "DELETE" });
+    toast("Missing MCP item removed");
+    await loadMcpGaps();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 function renderSnapshot(snapshot) {
@@ -2151,6 +2372,19 @@ function formatJobDetail(detail) {
       }));
     }
   }
+  if (detail.missingMcpItems?.length) {
+    lines.push("", "Missing MCP items reported by repair runs:");
+    for (const item of detail.missingMcpItems) {
+      lines.push(formatJson({
+        id: item.id,
+        title: item.title,
+        description: item.description,
+        suggestedToolName: item.suggestedToolName,
+        category: item.category,
+        updatedAt: item.updatedAt
+      }));
+    }
+  }
   if (detail.agentRunEvents?.length) {
     lines.push("", "Live repair activity:");
     for (const event of detail.agentRunEvents.slice(0, 12).reverse()) {
@@ -2179,7 +2413,7 @@ function updateJobControls(detail) {
   const hasPendingResolution = pending?.kind === "resolution";
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
-  setRepairRetryVisible(stateName === "failed_retryable" && hasApprovedRepair && !hasPendingResolution);
+  setRepairRetryVisible(["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution);
   setSteerVisible(stateName === "awaiting_action_approval");
 }
 
@@ -2564,6 +2798,27 @@ el.repairContextDialog.addEventListener("click", event => {
     closeRepairContextDialog();
   }
 });
+el.logsButton.addEventListener("click", openLogsDialog);
+el.logsCancelButton.addEventListener("click", closeLogsDialog);
+el.logsDownloadButton.addEventListener("click", downloadLogs);
+el.logsDialog.addEventListener("click", event => {
+  if (event.target === el.logsDialog) {
+    closeLogsDialog();
+  }
+});
+el.mcpGapsButton.addEventListener("click", openMcpGapsDialog);
+el.mcpGapsCloseButton.addEventListener("click", closeMcpGapsDialog);
+el.mcpGapsDialog.addEventListener("click", event => {
+  if (event.target === el.mcpGapsDialog) {
+    closeMcpGapsDialog();
+  }
+});
+el.mcpGapsList.addEventListener("click", event => {
+  const button = event.target.closest("[data-remove-mcp-gap]");
+  if (button) {
+    removeMcpGap(Number(button.dataset.removeMcpGap));
+  }
+});
 for (const button of el.themeButtons) {
   button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
 }
@@ -2671,6 +2926,15 @@ function send(res, status, body, contentType = "text/plain; charset=utf-8") {
 
 function sendJson(res, status, value) {
   send(res, status, safeJson(value), "application/json; charset=utf-8");
+}
+
+function beginLogDownload(res, filename) {
+  res.writeHead(200, {
+    "content-type": "text/plain; charset=utf-8",
+    "content-disposition": `attachment; filename="${filename}"`,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff"
+  });
 }
 
 function sendPublicJson(res, status, value) {
@@ -2808,6 +3072,30 @@ export function createWebHandler(agent, config) {
         sendJson(res, 200, { ok: true, settings: agent.codexSettings() });
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/logs/download") {
+        const from = url.searchParams.get("from") || "";
+        const to = url.searchParams.get("to") || "";
+        normalizeDiagnosticLogRange({ from, to });
+        agent.diagnostic?.("info", "diagnostic_log_download_requested", { from, to });
+        beginLogDownload(res, "media-issue-agent.log");
+        try {
+          await streamDiagnosticLog(config.logPath, { from, to }, res);
+        } catch (error) {
+          agent.diagnostic?.("error", "diagnostic_log_download_failed", { error: error.message });
+          res.write(`\nDiagnostic log download failed: ${redactText(error.message)}\n`);
+        }
+        res.end();
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/mcp-missing-items") {
+        sendJson(res, 200, { ok: true, items: agent.missingMcpItems() });
+        return;
+      }
+      const missingMcpItemMatch = url.pathname.match(/^\/api\/mcp-missing-items\/(\d+)$/);
+      if (req.method === "DELETE" && missingMcpItemMatch) {
+        sendJson(res, 200, { ok: true, item: agent.removeMissingMcpItem(Number(missingMcpItemMatch[1]), "web") });
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/settings/codex") {
         const body = await readJson(req);
         sendJson(res, 200, { ok: true, settings: agent.updateCodexSettings(body) });
@@ -2894,6 +3182,11 @@ export function createWebHandler(agent, config) {
       }
       sendJson(res, 404, { ok: false, error: "Not found" });
     } catch (error) {
+      agent.diagnostic?.("error", "web_request_failed", {
+        method: req.method,
+        url: req.url,
+        error: error.message
+      });
       sendJson(res, 500, { ok: false, error: redactText(error.message) });
     }
   };
@@ -2908,6 +3201,10 @@ export async function startWebServer(agent, config, log = console.error) {
     server.once("error", reject);
     server.listen(config.webPort, config.webHost, resolve);
   });
-  log(`media-issue-agent: Web UI listening on ${config.webHost}:${config.webPort}`);
+  agent.diagnostic?.("info", "web_server_listening", {
+    host: config.webHost,
+    port: config.webPort
+  });
+  log(`${new Date().toISOString()} media-issue-agent: Web UI listening on ${config.webHost}:${config.webPort}`);
   return server;
 }

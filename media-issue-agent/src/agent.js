@@ -31,13 +31,18 @@ import {
   snapshotEntry,
   statusSummary,
   supersedePendingApprovals,
+  touchAgentRun,
   transitionJob,
+  upsertMissingMcpItems,
+  listMissingMcpItems,
+  dismissMissingMcpItem,
   upsertInvestigation
 } from "./db.js";
 import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, runCodexRepair, steeredInvestigationPrompt } from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
+import { createDiagnosticLogger } from "./diagnostic-log.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -297,6 +302,36 @@ function parseActionsTaken(value) {
   return value.map(action => String(action).trim()).filter(Boolean);
 }
 
+function parseMissingMcpItems(value) {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("final repair result field missingMcpItems must be an array when provided");
+  }
+  return value.map(item => {
+    if (typeof item === "string") {
+      const text = String(sanitizeValue(item)).trim();
+      return text ? { title: text, description: text } : null;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return null;
+    }
+    const title = String(item.title || item.capability || item.suggestedToolName || "").trim();
+    const description = String(item.description || item.reason || title || "").trim();
+    if (!title && !description) {
+      return null;
+    }
+    return sanitizeValue({
+      title: title || description.slice(0, 120),
+      description: description || title,
+      suggestedToolName: String(item.suggestedToolName || item.toolName || "").trim(),
+      category: String(item.category || item.type || "").trim(),
+      reason: String(item.reason || "").trim()
+    });
+  }).filter(Boolean);
+}
+
 function parseVerification(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("final repair result field verification must be an object");
@@ -369,7 +404,8 @@ function parseRepairResult(output) {
         closeRecommended: parsed.closeRecommended,
         proposedChoices: Array.isArray(parsed.proposedChoices)
           ? parsed.proposedChoices.map(choice => String(choice).trim()).filter(Boolean)
-          : []
+          : [],
+        missingMcpItems: parseMissingMcpItems(parsed.missingMcpItems)
       };
       validateRepairResult(result);
       return result;
@@ -404,6 +440,7 @@ function executionResultFromRepairResult(repairResult, agentRun) {
     draftComment: repairResult.draftComment,
     closeRecommended: repairResult.closeRecommended,
     proposedChoices: repairResult.proposedChoices || [],
+    missingMcpItems: repairResult.missingMcpItems || [],
     agentRunId: agentRun?.id || null,
     modelConfig: agentRun?.config || null
   };
@@ -629,16 +666,29 @@ export class MediaIssueAgent {
     this.config = config;
     this.client = client;
     this.initPromise = null;
+    this.diagnosticLogger = createDiagnosticLogger(config);
+  }
+
+  diagnostic(level, event, payload = {}) {
+    return this.diagnosticLogger.log(level, event, payload);
   }
 
   async init() {
     if (!this.initPromise) {
       this.initPromise = (async () => {
         await initDb(this.config.dbPath);
-        const recovered = recoverInterruptedAgentRuns(this.config.dbPath);
+        const recovered = recoverInterruptedAgentRuns(this.config.dbPath, {
+          staleSeconds: this.config.recoverStaleRunSeconds
+        });
         if (recovered) {
+          this.diagnostic("warn", "interrupted_repair_runs_recovered", { count: recovered });
           recordAudit(this.config.dbPath, "interrupted_repair_runs_recovered", sanitizeValue({ count: recovered }));
         }
+        this.diagnostic("info", "agent_initialized", {
+          dbPath: this.config.dbPath,
+          logPath: this.config.logPath,
+          recoverStaleRunSeconds: this.config.recoverStaleRunSeconds
+        });
       })();
     }
     await this.initPromise;
@@ -646,6 +696,7 @@ export class MediaIssueAgent {
 
   async pollOnce() {
     await this.init();
+    this.diagnostic("debug", "poll_started", {});
     const listed = await this.client.callTool("plex_reported_issues", {
       status: "all",
       source: "all",
@@ -667,6 +718,12 @@ export class MediaIssueAgent {
       }
       recordAudit(this.config.dbPath, "issue_seen", sanitizeValue(issue), job.id);
     }
+    this.diagnostic("info", "poll_completed", {
+      snapshotId: snapshot.id,
+      issueCount: issues.length,
+      openIssueCount: issues.filter(issue => !issue.isClosed).length,
+      closedIssueCount: issues.filter(issue => issue.isClosed).length
+    });
     return {
       snapshotId: snapshot.id,
       issueCount: issues.length,
@@ -697,6 +754,32 @@ export class MediaIssueAgent {
 
   approvals(limit) {
     return listApprovals(this.config.dbPath, limit);
+  }
+
+  missingMcpItems() {
+    return listMissingMcpItems(this.config.dbPath);
+  }
+
+  removeMissingMcpItem(itemId, actor = "operator") {
+    const item = dismissMissingMcpItem(this.config.dbPath, itemId);
+    if (!item) {
+      throw new Error(`Missing MCP item ${itemId} was not found`);
+    }
+    this.diagnostic("info", "missing_mcp_item_removed", {
+      actor,
+      itemId: item.id,
+      jobId: item.jobId,
+      title: item.title
+    });
+    if (item.jobId) {
+      recordAudit(this.config.dbPath, "missing_mcp_item_removed", sanitizeValue({
+        actor,
+        itemId: item.id,
+        title: item.title,
+        suggestedToolName: item.suggestedToolName || null
+      }), item.jobId);
+    }
+    return item;
   }
 
   jobDetails(jobId) {
@@ -877,9 +960,22 @@ export class MediaIssueAgent {
       throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
     }
     const job = ensureJob(this.config.dbPath, entry.source, entry.issueId, "queued_for_investigation");
+    this.diagnostic("info", "investigation_requested", {
+      jobId: job.id,
+      snapshotId,
+      index,
+      source: entry.source,
+      issueId: entry.issueId,
+      force: Boolean(options.force)
+    });
     const cached = investigationForJob(this.config.dbPath, job.id);
     if (cached && !options.force) {
       const approval = pendingApprovalForJob(this.config.dbPath, job.id);
+      this.diagnostic("info", "investigation_cache_hit", {
+        jobId: job.id,
+        approvalId: approval?.id || null,
+        status: cached.status
+      });
       return {
         jobId: job.id,
         approvalId: approval?.id || null,
@@ -914,9 +1010,18 @@ export class MediaIssueAgent {
     const evidence = sanitizeValue({ entry, details, diagnosis });
     let summary;
     try {
+      this.diagnostic("info", "codex_investigation_started", { jobId: job.id });
       summary = await runCodex(this.config, investigationPrompt(evidence));
+      this.diagnostic("info", "codex_investigation_completed", {
+        jobId: job.id,
+        summaryLength: summary.length
+      });
     } catch (error) {
       const message = redactText(error.message);
+      this.diagnostic("error", "codex_investigation_failed", {
+        jobId: job.id,
+        error: error.message
+      });
       summary = [
         "Codex investigation summary could not be generated automatically.",
         `Reason: ${message}`,
@@ -942,6 +1047,13 @@ export class MediaIssueAgent {
     transitionJob(this.config.dbPath, job.id, ["investigating"], "awaiting_action_approval");
     const approvalPayload = buildPlan(entry, evidence, summary);
     const approval = createApproval(this.config.dbPath, job.id, "action", approvalPayload);
+    this.diagnostic("info", "investigation_ready", {
+      jobId: job.id,
+      approvalId: approval.id,
+      classification: approvalPayload?.plan?.classification,
+      executionMode: approvalPayload?.plan?.executionMode,
+      summaryLength: summary.length
+    });
     recordAudit(this.config.dbPath, "investigation_ready", sanitizeValue({ approval, summary }), job.id);
     return { jobId: job.id, approvalId: approval.id, summary, evidence, status: investigation.status, cached: false };
   }
@@ -975,6 +1087,11 @@ export class MediaIssueAgent {
       "blocked_needs_human"
     ], "investigating");
     supersedePendingApprovals(this.config.dbPath, jobId, "action");
+    this.diagnostic("info", "operator_steered_investigation", {
+      jobId,
+      actor,
+      messageLength: operatorMessage.length
+    });
     recordAudit(this.config.dbPath, "operator_steered_investigation", sanitizeValue({ actor, message: operatorMessage }), jobId);
     const evidence = sanitizeValue({
       ...current.evidence,
@@ -986,9 +1103,18 @@ export class MediaIssueAgent {
     });
     let summary;
     try {
+      this.diagnostic("info", "codex_steered_investigation_started", { jobId });
       summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage));
+      this.diagnostic("info", "codex_steered_investigation_completed", {
+        jobId,
+        summaryLength: summary.length
+      });
     } catch (error) {
       const reason = redactText(error.message);
+      this.diagnostic("error", "codex_steered_investigation_failed", {
+        jobId,
+        error: error.message
+      });
       summary = [
         current.summary,
         "",
@@ -1005,6 +1131,13 @@ export class MediaIssueAgent {
     });
     transitionJob(this.config.dbPath, jobId, ["investigating"], "awaiting_action_approval");
     const approval = createApproval(this.config.dbPath, jobId, "action", buildPlan(job, evidence, summary, operatorMessage));
+    this.diagnostic("info", "steered_investigation_ready", {
+      jobId,
+      approvalId: approval.id,
+      classification: approval.payload?.plan?.classification,
+      executionMode: approval.payload?.plan?.executionMode,
+      summaryLength: summary.length
+    });
     recordAudit(this.config.dbPath, "steered_investigation_ready", sanitizeValue({ approval, summary }), jobId);
     return {
       jobId,
@@ -1023,11 +1156,21 @@ export class MediaIssueAgent {
     }
     if (pending.kind === "action") {
       const approvals = setPendingApprovals(this.config.dbPath, jobId, "approved", actor, pending.kind);
+      this.diagnostic("info", "action_approval_accepted", {
+        jobId,
+        approvalId: pending.id,
+        actor
+      });
       recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: pending.id, kind: pending.kind, actor }), jobId);
       transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval"], "approved_for_execution");
       return this.continueJob(jobId, actor, { approvals });
     }
     if (pending.kind === "resolution") {
+      this.diagnostic("info", "resolution_approval_accepted", {
+        jobId,
+        approvalId: pending.id,
+        actor
+      });
       recordAudit(this.config.dbPath, "resolution_approval_attempted", sanitizeValue({ approvalId: pending.id, kind: pending.kind, actor }), jobId);
       return this.closeApprovedIssue(jobId, pending, actor);
     }
@@ -1041,6 +1184,12 @@ export class MediaIssueAgent {
     }
     const approvals = setPendingApprovals(this.config.dbPath, jobId, "rejected", actor, pending?.kind || null);
     transitionJob(this.config.dbPath, jobId, ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"], "blocked_needs_human");
+    this.diagnostic("warn", "approval_rejected", {
+      jobId,
+      approvalId: pending.id,
+      kind: pending.kind,
+      actor
+    });
     recordAudit(this.config.dbPath, "approval_rejected", sanitizeValue({ approvals, actor }), jobId);
     return approvals;
   }
@@ -1050,7 +1199,7 @@ export class MediaIssueAgent {
     if (!job) {
       throw new Error(`Job ${jobId} was not found`);
     }
-    if (job.state !== "failed_retryable") {
+    if (!["failed_retryable", "failed_terminal"].includes(job.state)) {
       throw new Error(`Job ${jobId} cannot retry repair from ${job.state}`);
     }
     if (pendingApprovalForJob(this.config.dbPath, jobId, "resolution")) {
@@ -1064,6 +1213,11 @@ export class MediaIssueAgent {
     if (!retryNote) {
       throw new Error("Repair retry note is required");
     }
+    this.diagnostic("info", "repair_retry_requested", {
+      jobId,
+      actor,
+      noteLength: retryNote.length
+    });
     recordAudit(this.config.dbPath, "repair_retry_requested", sanitizeValue({ actor, note: retryNote }), jobId);
     return this.executeApprovedPlan(jobId, actor, { repairRetryNote: retryNote });
   }
@@ -1100,6 +1254,11 @@ export class MediaIssueAgent {
     } catch (error) {
       const message = redactText(error.message);
       toolBriefing = { tools: [], error: message };
+      this.diagnostic("warn", "repair_tool_list_failed", {
+        jobId,
+        actor,
+        error: error.message
+      });
       recordAudit(this.config.dbPath, "repair_tool_list_failed", sanitizeValue({ actor, error: error.message }), jobId);
     }
     const payload = actionApproval.payload || {};
@@ -1144,7 +1303,14 @@ export class MediaIssueAgent {
     if (!actionApproval) {
       throw new Error(`Job ${jobId} has no approved action plan`);
     }
-    transitionJob(this.config.dbPath, jobId, ["approved_for_execution", "failed_retryable"], "executing");
+    transitionJob(this.config.dbPath, jobId, ["approved_for_execution", "failed_retryable", "failed_terminal"], "executing");
+    this.diagnostic("info", "execution_started", {
+      jobId,
+      actor,
+      approvalId: actionApproval.id,
+      classification: actionApproval.payload?.plan?.classification,
+      executionMode: actionApproval.payload?.plan?.executionMode
+    });
     recordAudit(this.config.dbPath, "execution_started", sanitizeValue({ actor, plan: actionApproval.payload.plan }), jobId);
     const plan = actionApproval.payload?.plan || {};
     const classification = plan.classification;
@@ -1155,40 +1321,126 @@ export class MediaIssueAgent {
         actionsRequested: 0,
         actionsExecuted: 0,
         actions: [],
-        verification: { status: "not_applicable", details: "No server-side repair was required." }
+        verification: { status: "not_applicable", details: "No server-side repair was required." },
+        missingMcpItems: []
       };
+      this.diagnostic("info", "execution_completed_client_side", {
+        jobId,
+        actor,
+        executionResult
+      });
       recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
       transitionJob(this.config.dbPath, jobId, ["executing"], "drafting_comment");
       return this.draftResolutionApproval(jobId, actor, executionResult, context);
     }
     const { prompt: repairPrompt, workspace, settings, toolBriefing } = await this.buildExecutionRepairPrompt(jobId, actor, actionApproval, context);
     const agentRun = createAgentRun(this.config.dbPath, jobId, "repair", repairPrompt, settings);
+    this.diagnostic("info", "repair_agent_started", {
+      jobId,
+      actor,
+      runId: agentRun.id,
+      settings,
+      workspace,
+      toolCount: toolBriefing?.tools?.length || 0,
+      retry: Boolean(context.repairRetryNote)
+    });
     recordAudit(this.config.dbPath, "repair_agent_started", sanitizeValue({ actor, runId: agentRun.id, settings, workspace, toolCount: toolBriefing?.tools?.length || 0, retry: Boolean(context.repairRetryNote) }), jobId);
     let completedRun = null;
     let repairResult = null;
+    const heartbeatMs = Math.max(5000, Math.min(30000, Math.floor((this.config.recoverStaleRunSeconds || 120) * 1000 / 3)));
+    const heartbeatTimer = setInterval(() => {
+      try {
+        touchAgentRun(this.config.dbPath, agentRun.id);
+      } catch {
+        // Best-effort heartbeat; the repair run itself remains authoritative.
+      }
+    }, heartbeatMs);
+    heartbeatTimer.unref?.();
     try {
       const output = await runCodexRepair(this.config, repairPrompt, settings, {
         codexWorkspace: workspace,
-        onEvent: event => recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, event?.type || "event", sanitizeValue(event))
+        onEvent: event => {
+          const eventType = event?.type || "event";
+          recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, sanitizeValue(event));
+          this.diagnostic("debug", "repair_agent_event", {
+            jobId,
+            runId: agentRun.id,
+            eventType,
+            event
+          });
+        }
       });
       recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, "codex_exit", sanitizeValue({
         args: output.args,
         settings: output.settings,
         stderr: output.stderr
       }));
+      this.diagnostic("info", "repair_agent_codex_exit", {
+        jobId,
+        runId: agentRun.id,
+        settings: output.settings,
+        stderrLength: String(output.stderr || "").length
+      });
       repairResult = parseRepairResult(output.finalMessage);
+      const savedMissingMcpItems = upsertMissingMcpItems(this.config.dbPath, jobId, agentRun.id, repairResult.missingMcpItems || []);
+      if (savedMissingMcpItems.length) {
+        this.diagnostic("info", "missing_mcp_items_recorded", {
+          jobId,
+          runId: agentRun.id,
+          count: savedMissingMcpItems.length,
+          items: savedMissingMcpItems.map(item => ({
+            id: item.id,
+            title: item.title,
+            suggestedToolName: item.suggestedToolName || null
+          }))
+        });
+        recordAudit(this.config.dbPath, "missing_mcp_items_recorded", sanitizeValue({
+          runId: agentRun.id,
+          items: savedMissingMcpItems.map(item => ({
+            id: item.id,
+            title: item.title,
+            description: item.description,
+            suggestedToolName: item.suggestedToolName || null,
+            category: item.category || null
+          }))
+        }), jobId);
+      }
       if (textDelegatesOwnerWork(repairResult.summary, repairResult.draftComment, repairResult.actionsTaken.join("\n"))) {
         throw new Error("Repair runner delegated media-side work back to the server owner/operator instead of attempting it.");
       }
       completedRun = completeAgentRun(this.config.dbPath, agentRun.id, repairResult.status, repairResult, null);
+      this.diagnostic("info", "repair_agent_final_result", {
+        jobId,
+        runId: agentRun.id,
+        status: repairResult.status,
+        summary: repairResult.summary,
+        verification: repairResult.verification,
+        actionCount: repairResult.actionsTaken.length,
+        missingMcpItemCount: repairResult.missingMcpItems.length,
+        closeRecommended: repairResult.closeRecommended
+      });
       if (repairResult.status === "needs_operator_decision") {
         const message = repairResult.summary || "Repair runner needs an operator decision before continuing.";
+        this.diagnostic("warn", "repair_agent_needs_operator_decision", {
+          jobId,
+          runId: agentRun.id,
+          message,
+          proposedChoices: repairResult.proposedChoices
+        });
         recordAudit(this.config.dbPath, "repair_agent_needs_operator_decision", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
         setJobState(this.config.dbPath, jobId, "failed_retryable", redactText(message));
         throw new Error(message);
       }
       if (repairResult.status === "failed_retryable" || repairResult.status === "failed_terminal") {
         const message = repairResult.summary || `Repair runner returned ${repairResult.status}`;
+        this.diagnostic("error", "repair_agent_failed_status", {
+          jobId,
+          runId: agentRun.id,
+          status: repairResult.status,
+          message,
+          verification: repairResult.verification,
+          missingMcpItemCount: repairResult.missingMcpItems.length
+        });
         recordAudit(this.config.dbPath, "repair_agent_failed", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
         setJobState(this.config.dbPath, jobId, repairResult.status, redactText(message));
         throw new Error(message);
@@ -1199,14 +1451,29 @@ export class MediaIssueAgent {
         completeAgentRun(this.config.dbPath, agentRun.id, "failed_retryable", null, message);
       }
       recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, "repair_failed", sanitizeValue({ error: error.message }));
+      this.diagnostic("error", "repair_agent_error", {
+        jobId,
+        runId: agentRun.id,
+        error: error.message
+      });
       recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, runId: agentRun.id, error: error.message }), jobId);
       const current = jobForId(this.config.dbPath, jobId);
       if (current?.state !== "failed_retryable" && current?.state !== "failed_terminal") {
         setJobState(this.config.dbPath, jobId, "failed_retryable", message);
       }
       throw error;
+    } finally {
+      clearInterval(heartbeatTimer);
     }
     const executionResult = executionResultFromRepairResult(repairResult, completedRun || agentRun);
+    this.diagnostic("info", "execution_completed", {
+      jobId,
+      runId: agentRun.id,
+      outcome: executionResult.outcome,
+      actionsRequested: executionResult.actionsRequested,
+      actionsExecuted: executionResult.actionsExecuted,
+      verification: executionResult.verification
+    });
     recordAudit(this.config.dbPath, "execution_completed", sanitizeValue(executionResult), jobId);
     transitionSuccessfulRepairToDrafting(this.config.dbPath, jobId, completedRun || agentRun, repairResult);
     return this.draftResolutionApproval(jobId, actor, executionResult, context);
@@ -1218,6 +1485,11 @@ export class MediaIssueAgent {
     if (!details.investigation) {
       throw new Error(`Job ${jobId} has no investigation to draft from`);
     }
+    this.diagnostic("info", "resolution_draft_started", {
+      jobId,
+      actor,
+      outcome: executionResult?.outcome
+    });
     const evidence = sanitizeValue({
       job: details.job,
       investigation: details.investigation,
@@ -1229,6 +1501,10 @@ export class MediaIssueAgent {
       try {
         draft = await runCodex(this.config, commentDraftPrompt(evidence));
       } catch (error) {
+        this.diagnostic("error", "codex_comment_draft_failed", {
+          jobId,
+          error: error.message
+        });
         recordAudit(this.config.dbPath, "codex_comment_draft_failed", sanitizeValue({ error: error.message }), jobId);
         draft = fallbackDraftComment(details.job.source, executionResult);
       }
@@ -1236,6 +1512,11 @@ export class MediaIssueAgent {
     if (textDelegatesOwnerWork(draft)) {
       const note = "Draft resolution delegated media-side work back to the server owner/operator.";
       transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
+      this.diagnostic("error", "resolution_draft_rejected", {
+        jobId,
+        actor,
+        reason: note
+      });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message: draft }), jobId);
       throw new Error(note);
     }
@@ -1243,12 +1524,22 @@ export class MediaIssueAgent {
     if (textDelegatesOwnerWork(message)) {
       const note = "Draft resolution delegated media-side work back to the server owner/operator.";
       transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", note);
+      this.diagnostic("error", "resolution_draft_rejected", {
+        jobId,
+        actor,
+        reason: note
+      });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message }), jobId);
       throw new Error(note);
     }
     const validation = validateDraftComment(details.job.source, message);
     if (!validation.valid) {
       transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "failed_retryable", validation.errors.join("; "));
+      this.diagnostic("error", "resolution_draft_validation_failed", {
+        jobId,
+        actor,
+        errors: validation.errors
+      });
       throw new Error(`Draft comment failed validation: ${validation.errors.join("; ")}`);
     }
     const approval = createApproval(this.config.dbPath, jobId, "resolution", {
@@ -1260,6 +1551,13 @@ export class MediaIssueAgent {
       executionResult
     });
     transitionJob(this.config.dbPath, jobId, ["drafting_comment"], "awaiting_resolution_approval");
+    this.diagnostic("info", "resolution_draft_ready", {
+      jobId,
+      approvalId: approval.id,
+      actor,
+      characterCount: validation.characterCount,
+      closeIssue: approval.payload.closeIssue
+    });
     recordAudit(this.config.dbPath, "resolution_draft_ready", sanitizeValue({ approval, characterCount: validation.characterCount, executionResult }), jobId);
     return {
       ...context,
@@ -1277,6 +1575,15 @@ export class MediaIssueAgent {
     const { source, issueId, message, closeIssue = true } = approval.payload;
     const actions = closeIssue ? closeActionsFor(source, issueId, message) : commentActionsFor(source, issueId, message);
     const results = [];
+    this.diagnostic("info", "issue_close_started", {
+      jobId,
+      actor,
+      approvalId: approval.id,
+      source,
+      issueId,
+      closeIssue,
+      actionCount: actions.length
+    });
     try {
       const executedActions = this.jobDetails(jobId).plannedActions.filter(action => action.riskLevel === "resolution" && action.executedAt);
       for (const action of actions) {
@@ -1286,6 +1593,10 @@ export class MediaIssueAgent {
           continue;
         }
         const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, "resolution");
+        this.diagnostic("debug", "closing_action_started", {
+          jobId,
+          toolName: action.toolName
+        });
         recordAudit(this.config.dbPath, "closing_action_started", sanitizeValue({ action: planned }), jobId);
         const result = await this.client.callTool(action.toolName, action.args);
         const sanitized = sanitizeValue(result);
@@ -1294,10 +1605,21 @@ export class MediaIssueAgent {
       }
       if (closeIssue) {
         transitionJob(this.config.dbPath, jobId, ["closing_issue"], "closed");
+        this.diagnostic("info", "issue_closed", {
+          jobId,
+          actor,
+          actionCount: results.length
+        });
         recordAudit(this.config.dbPath, "issue_closed", sanitizeValue({ actor, results }), jobId);
       } else {
         const note = "Repair result did not recommend closing the issue; posted the approved update and left the job for human follow-up.";
         transitionJob(this.config.dbPath, jobId, ["closing_issue"], "blocked_needs_human", note);
+        this.diagnostic("warn", "resolution_comment_posted_without_closure", {
+          jobId,
+          actor,
+          actionCount: results.length,
+          note
+        });
         recordAudit(this.config.dbPath, "resolution_comment_posted_without_closure", sanitizeValue({ actor, results }), jobId);
       }
       const approvals = setPendingApprovals(this.config.dbPath, jobId, "approved", actor, "resolution");
@@ -1311,6 +1633,12 @@ export class MediaIssueAgent {
     } catch (error) {
       const messageText = redactText(error.message);
       transitionJob(this.config.dbPath, jobId, ["closing_issue"], "failed_retryable", messageText);
+      this.diagnostic("error", "issue_close_failed", {
+        jobId,
+        actor,
+        error: error.message,
+        completedActionCount: results.length
+      });
       recordAudit(this.config.dbPath, "issue_close_failed", sanitizeValue({ actor, error: error.message, results }), jobId);
       throw error;
     }
@@ -1318,13 +1646,15 @@ export class MediaIssueAgent {
 
   async pollLoop(log = console.error) {
     await this.init();
-    log("media-issue-agent: starting poll loop");
+    this.diagnostic("info", "poll_loop_started", { pollIntervalSeconds: this.config.pollIntervalSeconds });
+    log(`${new Date().toISOString()} media-issue-agent: starting poll loop`);
     for (;;) {
       try {
         const result = await this.pollOnce();
-        log(`media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.openIssueCount} open and ${result.closedIssueCount} closed issues`);
+        log(`${new Date().toISOString()} media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.openIssueCount} open and ${result.closedIssueCount} closed issues`);
       } catch (error) {
-        log(`media-issue-agent: poll failed: ${error.message}`);
+        this.diagnostic("error", "poll_failed", { error: error.message });
+        log(`${new Date().toISOString()} media-issue-agent: poll failed: ${redactText(error.message)}`);
       }
       await sleep(this.config.pollIntervalSeconds * 1000);
     }
