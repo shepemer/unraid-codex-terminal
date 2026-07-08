@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   final_result_json TEXT,
   error TEXT,
   started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   completed_at TEXT
 );
 
@@ -143,7 +144,36 @@ CREATE TABLE IF NOT EXISTS agent_run_events (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS missing_mcp_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+  agent_run_id INTEGER REFERENCES agent_runs(id) ON DELETE SET NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  suggested_tool_name TEXT,
+  category TEXT,
+  source_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  dismissed_at TEXT
+);
 `);
+  ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
+  sqliteExec(dbPath, `
+UPDATE agent_runs
+SET heartbeat_at = COALESCE(heartbeat_at, started_at)
+WHERE heartbeat_at IS NULL;
+`);
+}
+
+function ensureColumn(dbPath, tableName, columnName, definition) {
+  const columns = sqliteExec(dbPath, `PRAGMA table_info(${tableName});`, { json: true });
+  if (columns.some(column => column.name === columnName)) {
+    return;
+  }
+  sqliteExec(dbPath, `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition};`);
 }
 
 export function stableHash(value) {
@@ -470,11 +500,19 @@ LIMIT 1;
 
 export function createAgentRun(dbPath, jobId, kind, prompt, config) {
   const [{ id }] = sqliteExec(dbPath, sql`
-INSERT INTO agent_runs (job_id, kind, status, prompt, config_json)
-VALUES (${jobId}, ${kind}, 'running', ${prompt}, ${JSON.stringify(config || {})})
+INSERT INTO agent_runs (job_id, kind, status, prompt, config_json, heartbeat_at)
+VALUES (${jobId}, ${kind}, 'running', ${prompt}, ${JSON.stringify(config || {})}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 RETURNING id;
 `, { json: true });
   return { id, jobId, kind, status: "running", prompt, config: config || {} };
+}
+
+export function touchAgentRun(dbPath, runId) {
+  sqliteExec(dbPath, sql`
+UPDATE agent_runs
+SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${runId} AND status = 'running';
+`);
 }
 
 export function completeAgentRun(dbPath, runId, status, finalResult = null, error = null) {
@@ -483,6 +521,7 @@ UPDATE agent_runs
 SET status = ${status},
     final_result_json = ${finalResult === null || finalResult === undefined ? null : JSON.stringify(finalResult)},
     error = ${error},
+    heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE id = ${runId};
 `);
@@ -496,6 +535,7 @@ SELECT
 	  final_result_json AS finalResultJson,
 	  error,
   started_at AS startedAt,
+  heartbeat_at AS heartbeatAt,
   completed_at AS completedAt
 FROM agent_runs
 WHERE id = ${runId}
@@ -507,16 +547,28 @@ LIMIT 1;
   }))[0] || null;
 }
 
-export function recoverInterruptedAgentRuns(dbPath, message = "Media issue agent restarted while repair was running. Retry the repair from the job detail pane.") {
+export function recoverInterruptedAgentRuns(dbPath, options = {}) {
+  const staleSeconds = Math.max(1, Number(options.staleSeconds || 120));
+  const message = options.message || "Media issue agent restarted while repair was running. Retry the repair from the job detail pane.";
   const runs = sqliteExec(dbPath, sql`
-SELECT id, job_id AS jobId
+SELECT id, job_id AS jobId, started_at AS startedAt, heartbeat_at AS heartbeatAt
 FROM agent_runs
-WHERE status = 'running';
+WHERE status = 'running'
+  AND julianday(COALESCE(heartbeat_at, started_at)) <= julianday('now') - (${staleSeconds} / 86400.0);
 `, { json: true });
   for (const run of runs) {
     completeAgentRun(dbPath, run.id, "failed_retryable", null, message);
-    recordAgentRunEvent(dbPath, run.id, run.jobId, "repair_recovered_after_restart", { error: message });
-    recordAudit(dbPath, "interrupted_repair_run_recovered", { runId: run.id, error: message }, run.jobId);
+    recordAgentRunEvent(dbPath, run.id, run.jobId, "repair_recovered_after_restart", {
+      error: message,
+      staleSeconds,
+      lastHeartbeatAt: run.heartbeatAt || run.startedAt
+    });
+    recordAudit(dbPath, "interrupted_repair_run_recovered", {
+      runId: run.id,
+      error: message,
+      staleSeconds,
+      lastHeartbeatAt: run.heartbeatAt || run.startedAt
+    }, run.jobId);
     sqliteExec(dbPath, sql`
 UPDATE jobs
 SET state = 'failed_retryable',
@@ -534,6 +586,160 @@ export function recordAgentRunEvent(dbPath, runId, jobId, eventType, payload) {
 INSERT INTO agent_run_events (run_id, job_id, event_type, payload_json)
 VALUES (${runId}, ${jobId}, ${eventType}, ${JSON.stringify(payload || {})});
 `);
+  touchAgentRun(dbPath, runId);
+}
+
+function normalizeMissingMcpDbItem(item) {
+  const title = String(item?.title || item?.capability || item?.suggestedToolName || "").trim();
+  const description = String(item?.description || item?.reason || title || "").trim();
+  if (!title && !description) {
+    return null;
+  }
+  const normalized = {
+    title: title || description.slice(0, 120),
+    description: description || title,
+    suggestedToolName: String(item?.suggestedToolName || item?.toolName || "").trim(),
+    category: String(item?.category || item?.type || "").trim(),
+    source: item || {}
+  };
+  normalized.fingerprint = stableHash({
+    title: normalized.title.toLowerCase(),
+    description: normalized.description.toLowerCase(),
+    suggestedToolName: normalized.suggestedToolName.toLowerCase(),
+    category: normalized.category.toLowerCase()
+  });
+  return normalized;
+}
+
+export function upsertMissingMcpItems(dbPath, jobId, agentRunId, items = []) {
+  const saved = [];
+  for (const rawItem of items || []) {
+    const item = normalizeMissingMcpDbItem(rawItem);
+    if (!item) {
+      continue;
+    }
+    const [row] = sqliteExec(dbPath, sql`
+INSERT INTO missing_mcp_items (
+  job_id, agent_run_id, fingerprint, title, description, suggested_tool_name, category, source_json
+) VALUES (
+  ${jobId || null},
+  ${agentRunId || null},
+  ${item.fingerprint},
+  ${item.title},
+  ${item.description},
+  ${item.suggestedToolName || null},
+  ${item.category || null},
+  ${JSON.stringify(item.source)}
+)
+ON CONFLICT(fingerprint) DO UPDATE SET
+  job_id = excluded.job_id,
+  agent_run_id = excluded.agent_run_id,
+  title = excluded.title,
+  description = excluded.description,
+  suggested_tool_name = excluded.suggested_tool_name,
+  category = excluded.category,
+  source_json = excluded.source_json,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+  dismissed_at = NULL
+RETURNING
+  id,
+  job_id AS jobId,
+  agent_run_id AS agentRunId,
+  fingerprint,
+  title,
+  description,
+  suggested_tool_name AS suggestedToolName,
+  category,
+  source_json AS sourceJson,
+  created_at AS createdAt,
+  updated_at AS updatedAt,
+  dismissed_at AS dismissedAt;
+`, { json: true });
+    if (row) {
+      saved.push({ ...row, source: parseJson(row.sourceJson, {}) });
+    }
+  }
+  return saved;
+}
+
+function mapMissingMcpItem(row) {
+  return {
+    ...row,
+    source: parseJson(row.sourceJson, {})
+  };
+}
+
+export function listMissingMcpItems(dbPath, options = {}) {
+  const includeDismissed = Boolean(options.includeDismissed);
+  const rows = sqliteExec(dbPath, `
+SELECT
+  missing_mcp_items.id,
+  missing_mcp_items.job_id AS jobId,
+  missing_mcp_items.agent_run_id AS agentRunId,
+  missing_mcp_items.fingerprint,
+  missing_mcp_items.title,
+  missing_mcp_items.description,
+  missing_mcp_items.suggested_tool_name AS suggestedToolName,
+  missing_mcp_items.category,
+  missing_mcp_items.source_json AS sourceJson,
+  missing_mcp_items.created_at AS createdAt,
+  missing_mcp_items.updated_at AS updatedAt,
+  missing_mcp_items.dismissed_at AS dismissedAt,
+  jobs.source AS jobSource,
+  jobs.issue_id AS jobIssueId,
+  jobs.state AS jobState
+FROM missing_mcp_items
+LEFT JOIN jobs ON jobs.id = missing_mcp_items.job_id
+WHERE ${includeDismissed ? "1 = 1" : "missing_mcp_items.dismissed_at IS NULL"}
+ORDER BY missing_mcp_items.updated_at DESC, missing_mcp_items.id DESC;
+`, { json: true });
+  return rows.map(mapMissingMcpItem);
+}
+
+export function missingMcpItemsForJob(dbPath, jobId) {
+  const rows = sqliteExec(dbPath, sql`
+SELECT
+  id,
+  job_id AS jobId,
+  agent_run_id AS agentRunId,
+  fingerprint,
+  title,
+  description,
+  suggested_tool_name AS suggestedToolName,
+  category,
+  source_json AS sourceJson,
+  created_at AS createdAt,
+  updated_at AS updatedAt,
+  dismissed_at AS dismissedAt
+FROM missing_mcp_items
+WHERE job_id = ${jobId}
+  AND dismissed_at IS NULL
+ORDER BY updated_at DESC, id DESC;
+`, { json: true });
+  return rows.map(mapMissingMcpItem);
+}
+
+export function dismissMissingMcpItem(dbPath, itemId) {
+  const [row] = sqliteExec(dbPath, sql`
+UPDATE missing_mcp_items
+SET dismissed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${itemId}
+RETURNING
+  id,
+  job_id AS jobId,
+  agent_run_id AS agentRunId,
+  fingerprint,
+  title,
+  description,
+  suggested_tool_name AS suggestedToolName,
+  category,
+  source_json AS sourceJson,
+  created_at AS createdAt,
+  updated_at AS updatedAt,
+  dismissed_at AS dismissedAt;
+`, { json: true });
+  return row ? mapMissingMcpItem(row) : null;
 }
 
 export function setPendingApprovals(dbPath, jobId, status, actor = "operator", kind = null) {
@@ -655,6 +861,7 @@ SELECT
   final_result_json AS finalResultJson,
   error,
   started_at AS startedAt,
+  heartbeat_at AS heartbeatAt,
   completed_at AS completedAt
 FROM agent_runs
 WHERE job_id = ${jobId}
@@ -678,7 +885,8 @@ WHERE job_id = ${jobId}
 ORDER BY id DESC
 LIMIT 50;
 `, { json: true }).map(row => ({ ...row, payload: parseJson(row.payloadJson, {}) }));
-  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents, agentRuns, agentRunEvents };
+  const missingMcpItems = missingMcpItemsForJob(dbPath, jobId);
+  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents, agentRuns, agentRunEvents, missingMcpItems };
 }
 
 export function createPlannedAction(dbPath, jobId, toolName, args, riskLevel = "comment") {

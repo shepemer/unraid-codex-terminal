@@ -331,8 +331,8 @@ async function createFakeCodexBin(root, logPath) {
     "  const verification = await callMedia('plex_verify_subtitle_track', { ratingKey: '900001', language: 'ko' });",
     "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_verify_subtitle_track', status: 'completed' } })}\\n`);",
     "  const final = verification.found",
-    "    ? { status: 'fixed', summary: 'Downloaded Korean subtitles, refreshed Plex, and verified the Korean subtitle track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.', 'Verified Korean subtitles are visible.'], verification: { status: 'passed', details: 'Korean subtitle track found on Plex item 900001.' }, draftComment: 'Downloaded and verified the requested Korean subtitles. Automated response from Codex.', closeRecommended: true }",
-    "    : { status: 'failed_retryable', summary: 'Subtitle download ran, but verification did not find the track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.'], verification: { status: 'failed', details: 'Korean subtitle track was not visible after refresh.' }, draftComment: '', closeRecommended: false };",
+    "    ? { status: 'fixed', summary: 'Downloaded Korean subtitles, refreshed Plex, and verified the Korean subtitle track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.', 'Verified Korean subtitles are visible.'], verification: { status: 'passed', details: 'Korean subtitle track found on Plex item 900001.' }, draftComment: 'Downloaded and verified the requested Korean subtitles. Automated response from Codex.', closeRecommended: true, missingMcpItems: [] }",
+    "    : { status: 'failed_retryable', summary: 'Subtitle download ran, but verification did not find the track.', actionsTaken: ['Downloaded Korean subtitles through media-mcp.', 'Refreshed Plex metadata for rating key 900001.'], verification: { status: 'failed', details: 'Korean subtitle track was not visible after refresh.' }, draftComment: '', closeRecommended: false, missingMcpItems: [{ title: 'Subtitle verification diagnostics', description: 'Expose why Plex did not show a downloaded subtitle track after refresh.', suggestedToolName: 'plex_explain_missing_subtitle_track', category: 'plex' }] };",
     "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(final) } })}\\n`);",
     "} else if (kind === 'steered-investigation') {",
     "  process.stdout.write('Revised investigation: this appears to be a client-side playback problem. No server-side action is required.\\nNext action: explain that no media repair was applied.\\n');",
@@ -583,6 +583,10 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   assert.equal(details.plannedActions.length, 0);
   assert.equal(details.agentRuns.length, 1);
   assert.equal(details.agentRuns[0].status, "fixed");
+  assert.deepEqual(details.agentRuns[0].finalResult.missingMcpItems, []);
+  assert.deepEqual(pendingApproval(details, "resolution").payload.executionResult.missingMcpItems, []);
+  assert.deepEqual(details.missingMcpItems, []);
+  assert.deepEqual((await api(baseUrl, "/api/mcp-missing-items")).items, []);
   assert.match(details.agentRuns[0].prompt, /Current media MCP tool briefing/);
   assert.match(details.agentRuns[0].prompt, /bazarr_download_movie_subtitles_for_plex/);
   assert.match(details.agentRuns[0].prompt, /Persistent scratch workspace/);

@@ -1,5 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
+import { defaultDiagnosticLogPath } from "./diagnostic-log.js";
 
 function truthy(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
@@ -113,6 +114,7 @@ export async function loadConfig(env = process.env, options = {}) {
     mediaMcpUrl: env.ISSUE_AGENT_MEDIA_MCP_URL || "http://media-mcp:6971/mcp",
     mediaMcpBearerToken: env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN || "",
     dbPath: env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite",
+    logPath: env.ISSUE_AGENT_LOG_PATH || defaultDiagnosticLogPath(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"),
     repairWorkspaceRoot: env.ISSUE_AGENT_REPAIR_WORKSPACE_ROOT || path.join(path.dirname(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"), "repair-workspaces"),
     repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || "",
     pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
@@ -125,6 +127,7 @@ export async function loadConfig(env = process.env, options = {}) {
     codexWorkspace: env.ISSUE_AGENT_CODEX_WORKSPACE || "/tmp/media-issue-agent-workspace",
     codexTimeoutMs: integer(env.ISSUE_AGENT_CODEX_TIMEOUT_MS, 120000, 10000),
     codexRepairTimeoutMs: integer(env.ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS, 900000, 10000),
+    recoverStaleRunSeconds: integer(env.ISSUE_AGENT_RECOVER_STALE_RUN_SECONDS, 120, 30),
     codexModel: env.ISSUE_AGENT_CODEX_MODEL || "gpt-5.5",
     codexReasoningEffort: env.ISSUE_AGENT_CODEX_REASONING_EFFORT || "xhigh",
     codexFastMode: truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, true),

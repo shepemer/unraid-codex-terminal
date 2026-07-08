@@ -13,11 +13,13 @@ import {
   insertSnapshot,
   setPendingApprovals,
   transitionJob,
+  upsertMissingMcpItems,
   upsertInvestigation
 } from "../src/db.js";
 import { issueTableMarkdown } from "../src/issues.js";
 import { startWebServer } from "../src/web.js";
 import { closeServer, createCodexHome, jsonRpcError, jsonRpcResult, readBody } from "./helpers.js";
+import { appendDiagnosticLog } from "../src/diagnostic-log.js";
 
 const WEB_USERNAME = "operator";
 const WEB_PASSWORD = "web-e2e-password";
@@ -204,6 +206,7 @@ async function startHarness(root, fakeMcp) {
 async function newPage(browser, baseUrl, viewport = null) {
   const context = await browser.newContext({
     ...(viewport ? { viewport } : {}),
+    acceptDownloads: true,
     httpCredentials: {
       username: WEB_USERNAME,
       password: WEB_PASSWORD
@@ -235,6 +238,23 @@ async function assertNoHorizontalOverflow(page) {
   assert.ok(layout.bodyScrollWidth <= layout.viewportWidth + 2, JSON.stringify(layout));
 }
 
+function datetimeLocalValue(date) {
+  const pad = value => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    "-",
+    pad(date.getMonth() + 1),
+    "-",
+    pad(date.getDate()),
+    "T",
+    pad(date.getHours()),
+    ":",
+    pad(date.getMinutes()),
+    ":",
+    pad(date.getSeconds())
+  ].join("");
+}
+
 async function testIssueStateActionMatrix(browser) {
   const root = await tempDir();
   const fakeMcp = await startFakeMediaMcp([]);
@@ -249,7 +269,8 @@ async function testIssueStateActionMatrix(browser) {
       { source: "seerr", issueId: "202", date: "2026-01-02T00:00:00Z", reporter: "Fixture", mediaTitle: "Needs Approval", status: "open", description: "Approval issue" },
       { source: "seerr", issueId: "203", date: "2026-01-03T00:00:00Z", reporter: "Fixture", mediaTitle: "Approved", status: "open", description: "Approved issue" },
       { source: "seerr", issueId: "204", date: "2026-01-04T00:00:00Z", reporter: "Fixture", mediaTitle: "Resolution", status: "open", description: "Resolution issue" },
-      { source: "seerr", issueId: "205", date: "2026-01-05T00:00:00Z", reporter: "Fixture", mediaTitle: "Closed", status: "open", description: "Closed issue" }
+      { source: "seerr", issueId: "205", date: "2026-01-05T00:00:00Z", reporter: "Fixture", mediaTitle: "Closed", status: "open", description: "Closed issue" },
+      { source: "seerr", issueId: "206", date: "2026-01-06T00:00:00Z", reporter: "Fixture", mediaTitle: "Terminal", status: "open", description: "Terminal repair issue" }
     ];
     insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
 
@@ -276,9 +297,32 @@ async function testIssueStateActionMatrix(browser) {
     transitionJob(dbPath, closed.id, "detected", "closed");
     upsertInvestigation(dbPath, closed.id, { status: "ready", summary: "Closed summary", evidence: {} });
 
+    const terminal = ensureJob(dbPath, "seerr", "206");
+    transitionJob(dbPath, terminal.id, "detected", "failed_terminal", "Terminal fixture");
+    upsertInvestigation(dbPath, terminal.id, { status: "ready", summary: "Terminal summary", evidence: {} });
+    createApproval(dbPath, terminal.id, "action", {
+      plan: { classification: "server_action", executionMode: "approved_repair_agent", actions: [] }
+    });
+    setPendingApprovals(dbPath, terminal.id, "approved", "fixture", "action");
+    upsertMissingMcpItems(dbPath, terminal.id, null, [{
+      title: "Replace a fixture episode",
+      description: "Expose a test MCP tool for replacing fixture episodes from the Web UI test.",
+      suggestedToolName: "sonarr_replace_fixture_episode",
+      category: "sonarr"
+    }]);
+
     const pageHandle = await newPage(browser, harness.baseUrl);
     context = pageHandle.context;
     const page = pageHandle.page;
+    await page.locator("#mcp-gaps-button").click();
+    await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
+    await expect(page.locator("#mcp-gaps-list")).toContainText("sonarr_replace_fixture_episode");
+    await page.locator("[data-remove-mcp-gap]").click();
+    await expect(page.locator("#mcp-gaps-list")).toContainText("No active missing MCP items");
+    await page.locator("#mcp-gaps-close-button").click();
+    await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
+
     await expect(row(page, 1).getByRole("button", { name: "Investigate" })).toBeVisible();
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
     await expect(row(page, 2).getByRole("button", { name: "Re-investigate" })).toBeVisible();
@@ -290,6 +334,8 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 5).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(row(page, 5).getByRole("button", { name: "Close" })).toHaveCount(0);
     await expect(row(page, 5)).toHaveClass(/issue-closed/);
+    await expect(row(page, 6).getByRole("button", { name: "Retry repair" })).toBeVisible();
+    await expect(row(page, 6).getByRole("button", { name: "Re-investigate" })).toHaveCount(0);
 
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
@@ -334,6 +380,11 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#detail-band")).toBeHidden();
     await expect(page.locator("#work-area")).not.toHaveClass(/detail-open/);
     await expect(row(page, 5)).not.toHaveClass(/issue-active/);
+
+    await row(page, 6).getByRole("button", { name: "Retry repair" }).click();
+    await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
+    await expect(page.locator("#investigation-output")).toContainText("Failed");
+    await expect(page.locator("#repair-retry-panel")).toBeVisible();
   } finally {
     await context?.close();
     await harness?.close();
@@ -657,6 +708,51 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
   }
 }
 
+async function testDiagnosticLogDownloadDialog(browser) {
+  const root = await tempDir();
+  const fakeMcp = await startFakeMediaMcp([]);
+  let harness;
+  let context;
+  try {
+    harness = await startHarness(root, fakeMcp);
+    const inside = new Date(Date.now() - 60_000);
+    const outside = new Date(Date.now() - 600_000);
+    appendDiagnosticLog(harness.config.logPath, "info", "download_outside_range", {
+      message: "This log line should not be downloaded."
+    }, { timestamp: outside.toISOString() });
+    appendDiagnosticLog(harness.config.logPath, "error", "download_inside_range", {
+      jobId: 44,
+      error: "Synthetic repair failure for download test."
+    }, { timestamp: inside.toISOString() });
+
+    const pageHandle = await newPage(browser, harness.baseUrl);
+    context = pageHandle.context;
+    const page = pageHandle.page;
+
+    await page.locator("#logs-button").click();
+    await expect(page.locator("#logs-dialog")).toBeVisible();
+    await page.locator("#logs-from").fill(datetimeLocalValue(new Date(inside.getTime() - 5_000)));
+    await page.locator("#logs-to").fill(datetimeLocalValue(new Date(inside.getTime() + 5_000)));
+    const downloadPromise = page.waitForEvent("download");
+    await page.locator("#logs-download-button").click();
+    const download = await downloadPromise;
+    assert.equal(download.suggestedFilename(), "media-issue-agent.log");
+    const downloadedPath = await download.path();
+    const text = await readFile(downloadedPath, "utf8");
+    assert.match(text, /"timestamp":/);
+    assert.match(text, /download_inside_range/);
+    assert.doesNotMatch(text, /download_outside_range/);
+    assert.match(text, /Synthetic repair failure/);
+    await page.locator("#logs-cancel-button").click();
+    await expect(page.locator("#logs-dialog")).toBeHidden();
+  } finally {
+    await context?.close();
+    await harness?.close();
+    await fakeMcp.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function assertMobileDetailSheet(page) {
   const layout = await page.locator("#detail-band").evaluate(node => {
     const rect = node.getBoundingClientRect();
@@ -673,6 +769,28 @@ async function assertMobileDetailSheet(page) {
   assert.ok(Math.abs(layout.left) <= 1, JSON.stringify(layout));
   assert.ok(Math.abs(layout.width - layout.viewportWidth) <= 2, JSON.stringify(layout));
   assert.ok(Math.abs(layout.height - layout.viewportHeight) <= 2, JSON.stringify(layout));
+}
+
+async function assertMobileRunnerPanelInViewport(page) {
+  const layout = await page.locator("#codex-settings-panel").evaluate(node => {
+    const rect = node.getBoundingClientRect();
+    return {
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      left: rect.left,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight
+    };
+  });
+  assert.ok(layout.top >= -1, JSON.stringify(layout));
+  assert.ok(layout.left >= -1, JSON.stringify(layout));
+  assert.ok(layout.right <= layout.viewportWidth + 1, JSON.stringify(layout));
+  assert.ok(layout.bottom <= layout.viewportHeight + 1, JSON.stringify(layout));
+  assert.ok(layout.width <= layout.viewportWidth + 1, JSON.stringify(layout));
+  assert.ok(layout.height <= layout.viewportHeight + 1, JSON.stringify(layout));
 }
 
 async function testMobileTriageLayoutAndManualActions(browser) {
@@ -708,6 +826,10 @@ async function testMobileTriageLayoutAndManualActions(browser) {
     await page.locator("#runner-settings-button").click();
     await expect(page.locator("#app-shell")).toHaveClass(/runner-settings-open/);
     await expect(page.locator("#codex-settings-panel")).toBeVisible();
+    await assertMobileRunnerPanelInViewport(page);
+    await expect(page.locator("#codex-model")).toBeInViewport();
+    await expect(page.locator("#codex-settings-save")).toBeInViewport();
+    await expect(page.locator("#runner-settings-close-button")).toBeInViewport();
     await page.locator("#codex-model").fill("gpt-5.5");
     await page.locator("#codex-reasoning").selectOption("xhigh");
     await page.locator("#codex-fast-mode").setChecked(true);
@@ -947,6 +1069,7 @@ async function run() {
     await testFullBrowserWorkflow(browser);
     await testManualCloseReopenBrowser(browser);
     await testExecutingRepairStatusRendersFromIssueQueue(browser);
+    await testDiagnosticLogDownloadDialog(browser);
     await testMobileTriageLayoutAndManualActions(browser);
     await testMobileDetailSheetAndJobControls(browser);
     await testMobileSeededApprovalRejectAndRetryControls(browser);
