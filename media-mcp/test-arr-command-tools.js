@@ -7,6 +7,19 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+function readText(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      resolve(data);
+    });
+    req.on("error", reject);
+  });
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -128,6 +141,16 @@ async function run() {
       downloadId: "radarr-library-bug"
     }
   ];
+  const qbitTorrents = [{
+    hash: "existing-qbit-hash",
+    name: "Existing.Show.S01E01.1080p-GRP",
+    category: "sonarr",
+    tags: "sonarr",
+    state: "uploading",
+    progress: 1,
+    size: 123
+  }];
+  let qbitAddCount = 0;
   function sonarrWantedEpisode(id, overrides = {}) {
     return {
       id,
@@ -445,6 +468,44 @@ async function run() {
   }
 
   const mock = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    if (url.pathname.startsWith("/api/v2/")) {
+      const qbitPath = url.pathname.replace(/^\/api\/v2\//, "");
+      const text = await readText(req);
+      const form = Object.fromEntries(new URLSearchParams(text));
+      calls.push({ service: "qbittorrent", method: req.method, path: qbitPath, query: Object.fromEntries(url.searchParams), form });
+      if (req.method === "POST" && qbitPath === "auth/login") {
+        if (form.username !== "qbit" || form.password !== "tibq123") {
+          res.writeHead(403, { "content-type": "text/plain" });
+          return res.end("Fails.");
+        }
+        res.writeHead(200, { "content-type": "text/plain", "set-cookie": "SID=fixture; HttpOnly" });
+        return res.end("Ok.");
+      }
+      if (!String(req.headers.cookie || "").includes("SID=fixture")) {
+        res.writeHead(403, { "content-type": "text/plain" });
+        return res.end("Forbidden");
+      }
+      if (req.method === "GET" && qbitPath === "torrents/info") {
+        return sendJson(res, 200, qbitTorrents);
+      }
+      if (req.method === "POST" && qbitPath === "torrents/add") {
+        qbitAddCount += 1;
+        qbitTorrents.push({
+          hash: `fixture-qbit-hash-${qbitAddCount}`,
+          name: "Show.S01.MULTi.1080p.WEB-DL-GRP",
+          category: form.category,
+          tags: form.tags,
+          state: "downloading",
+          progress: 0,
+          size: 456
+        });
+        res.writeHead(200, { "content-type": "text/plain" });
+        return res.end("Ok.");
+      }
+      return sendJson(res, 404, { error: `unexpected qbit ${req.method} ${qbitPath}` });
+    }
+
     if (req.url === "/jsonrpc") {
       const request = await readJson(req);
       calls.push({ service: "nzbget", method: "RPC", path: request.method, params: request.params });
@@ -474,15 +535,36 @@ async function run() {
       return sendJson(res, 200, { jsonrpc: "2.0", id: request.id, result });
     }
 
-    const url = new URL(req.url, "http://127.0.0.1");
-    const [service] = url.pathname.split("/").filter(Boolean);
-    const path = url.pathname.replace(`/${service}/api/v3/`, "");
+    const [service, apiSegment, apiVersion, ...pathParts] = url.pathname.split("/").filter(Boolean);
+    const path = apiSegment === "api" && apiVersion ? pathParts.join("/") : url.pathname.replace(`/${service}/api/v3/`, "");
     const body = await readJson(req);
     const query = Object.fromEntries(url.searchParams);
     calls.push({ service, method: req.method, path, query, body });
 
     if (req.headers["x-api-key"] !== `${service}-key`) {
       return sendJson(res, 401, { error: "bad key" });
+    }
+    if (service === "prowlarr" && req.method === "GET" && path === "indexer") {
+      return sendJson(res, 200, [
+        { id: 99, name: "Mock Prowlarr Indexer", enable: true, categories: [{ id: 5000, name: "TV" }] }
+      ]);
+    }
+    if (service === "prowlarr" && req.method === "GET" && path === "search") {
+      return sendJson(res, 200, [
+        {
+          guid: "prowlarr-guid",
+          indexerId: 99,
+          indexer: "Mock Prowlarr Indexer",
+          title: "Show.S01.MULTi.1080p.WEB-DL-GRP",
+          protocol: "torrent",
+          size: 456,
+          seeders: 12,
+          leechers: 1,
+          publishDate: "2026-07-02T00:00:00Z",
+          categories: [{ id: 5000, name: "TV" }],
+          downloadUrl: "https://example.invalid/prowlarr/download?apikey=secret-token"
+        }
+      ]);
     }
     if (req.method === "GET" && path.startsWith("wanted/")) {
       const kind = path.split("/")[1];
@@ -635,6 +717,11 @@ async function run() {
       }]);
     }
     if (req.method === "POST" && path === "release") {
+      if (service === "sonarr" && body.guid === "prowlarr-cache-miss") {
+        return sendJson(res, 400, {
+          message: "Couldn't find requested release in cache"
+        });
+      }
       return sendJson(res, 200, {
         grabbed: true,
         ...body,
@@ -727,6 +814,11 @@ async function run() {
       SONARR_API_KEY: "sonarr-key",
       RADARR_URL: `http://127.0.0.1:${mockPort}/radarr`,
       RADARR_API_KEY: "radarr-key",
+      PROWLARR_URL: `http://127.0.0.1:${mockPort}/prowlarr`,
+      PROWLARR_API_KEY: "prowlarr-key",
+      QBITTORRENT_URL: `http://127.0.0.1:${mockPort}`,
+      QBITTORRENT_USERNAME: "qbit",
+      QBITTORRENT_PASSWORD: "tibq123",
       NZBGET_URL: `http://127.0.0.1:${mockPort}`,
       NZBGET_USERNAME: "nzbget",
       NZBGET_PASSWORD: "tegbzn6789",
@@ -833,9 +925,11 @@ async function run() {
       "sonarr_import_queue_item",
       "sonarr_interactive_search_episode",
       "sonarr_subtitle_replacement_candidates",
+      "sonarr_subtitle_replacement_candidates_async",
       "sonarr_replace_episode_for_subtitles",
       "sonarr_interactive_search_season",
       "sonarr_grab_release",
+      "sonarr_grab_prowlarr_release",
       "sonarr_blocklist_episode_file_source",
       "sonarr_download_client_scan",
       "sonarr_command_cancel",
@@ -873,7 +967,9 @@ async function run() {
       "nzbget_download_files",
       "nzbget_retry_postprocess",
       "download_client_archive_diagnosis",
-      "nzbget_extract_archives"
+      "nzbget_extract_archives",
+      "prowlarr_search",
+      "qbittorrent_add_prowlarr_release"
     ]) {
       assert.ok(toolNames.has(name), `missing tool ${name}`);
     }
@@ -1173,6 +1269,21 @@ async function run() {
     const noSubtitleSignalCandidate = subtitleCandidates.records.find(record => record.guid === "sonarr-no-subtitle-signal-guid");
     assert.equal(noSubtitleSignalCandidate.subtitleReplacement.hasRequiredSubtitleSignal, false);
     assert.equal(noSubtitleSignalCandidate.subtitleReplacement.eligibleIfOverrideEqualOrHigherExisting, false);
+    const asyncSubtitleStart = await tool("sonarr_subtitle_replacement_candidates_async", {
+      episodeIds: [301],
+      requiredSubtitleLanguage: "English",
+      indexerIds: [11],
+      limit: 5,
+      waitMs: 5000
+    });
+    assert.equal(asyncSubtitleStart.status, "completed");
+    assert.equal(asyncSubtitleStart.episodeResults.length, 1);
+    assert.ok(asyncSubtitleStart.records.some(record => record.guid === "sonarr-subtitle-soft-guid"));
+    const asyncSubtitlePoll = await tool("sonarr_subtitle_replacement_candidates_async", {
+      jobId: asyncSubtitleStart.jobId
+    });
+    assert.equal(asyncSubtitlePoll.status, "completed");
+    assert.equal(asyncSubtitlePoll.records.length, asyncSubtitleStart.records.length);
 
     const blockedSubtitleReplacement = await tool("sonarr_replace_episode_for_subtitles", {
       episodeId: 301,
@@ -1219,6 +1330,50 @@ async function run() {
     assert.equal(lastCall().path, "release");
     assert.equal(lastCall().body.guid, "sonarr-subtitle-soft-guid");
     assert.equal(lastCall().body.downloadUrl, undefined);
+
+    const prowlarrResults = await tool("prowlarr_search", { query: "Show S01 MULTi", categories: "5000", limit: 5 });
+    assert.equal(prowlarrResults.records[0].guid, "prowlarr-guid");
+    const prowlarrRelease = prowlarrResults.records[0];
+    const beforeDryQbitCalls = calls.filter(call => call.service === "qbittorrent").length;
+    const qbitDryRun = await tool("qbittorrent_add_prowlarr_release", {
+      release: prowlarrRelease,
+      category: "sonarr",
+      tags: ["sonarr", "media-issue-agent"],
+      dryRun: true
+    });
+    assert.equal(qbitDryRun.added, false);
+    assert.equal(qbitDryRun.release.hasDownloadUrl, true);
+    assert.doesNotMatch(JSON.stringify(qbitDryRun), /secret-token|"downloadUrl"|https:\/\/example/);
+    assert.equal(calls.filter(call => call.service === "qbittorrent").length, beforeDryQbitCalls);
+    const qbitAdd = await tool("qbittorrent_add_prowlarr_release", {
+      release: prowlarrRelease,
+      category: "sonarr",
+      tags: ["sonarr", "media-issue-agent"],
+      dryRun: false
+    });
+    assert.equal(qbitAdd.added, true);
+    assert.equal(qbitAdd.trackedDownloadId, "fixture-qbit-hash-1");
+    assert.equal(qbitAdd.torrent.category, "sonarr");
+    assert.doesNotMatch(JSON.stringify(qbitAdd), /secret-token|"downloadUrl"|https:\/\/example/);
+    const qbitAddCall = calls.findLast(call => call.service === "qbittorrent" && call.path === "torrents/add");
+    assert.equal(qbitAddCall.form.category, "sonarr");
+    assert.equal(qbitAddCall.form.tags, "sonarr,media-issue-agent");
+    assert.match(qbitAddCall.form.urls, /secret-token/);
+    const sonarrProwlarrFallback = await tool("sonarr_grab_prowlarr_release", {
+      release: {
+        ...prowlarrRelease,
+        guid: "prowlarr-cache-miss",
+        indexerId: 99
+      },
+      category: "sonarr",
+      tags: ["sonarr", "media-issue-agent"],
+      dryRun: false
+    });
+    assert.equal(sonarrProwlarrFallback.grabbed, true);
+    assert.equal(sonarrProwlarrFallback.grabbedBy, "qbittorrent");
+    assert.match(sonarrProwlarrFallback.sonarrError, /release in cache/i);
+    assert.equal(sonarrProwlarrFallback.qbittorrent.trackedDownloadId, "fixture-qbit-hash-2");
+    assert.doesNotMatch(JSON.stringify(sonarrProwlarrFallback), /secret-token|"downloadUrl"|https:\/\/example/);
 
     const movieSubtitleCandidates = await tool("radarr_subtitle_replacement_candidates", {
       movieIds: [401],
