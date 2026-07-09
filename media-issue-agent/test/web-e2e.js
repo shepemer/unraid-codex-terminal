@@ -628,9 +628,13 @@ async function testFullBrowserWorkflow(browser) {
     context = pageHandle.context;
     const page = pageHandle.page;
 
-    await expect(page.locator("#codex-settings-panel")).toBeVisible();
+    await expect(page.locator("#codex-settings-panel")).toBeHidden();
+    await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-5.5 Very High");
+    await expect(page.locator("#runner-settings-button")).toBeVisible();
     const topbarHeight = await page.locator(".topbar").evaluate(node => node.getBoundingClientRect().height);
     assert.ok(topbarHeight <= 76, `topbar too tall: ${topbarHeight}`);
+    await page.locator("#runner-settings-button").click();
+    await expect(page.locator("#codex-settings-panel")).toBeVisible();
     await page.locator("#codex-model").fill("gpt-5");
     await page.locator("#codex-reasoning").selectOption("high");
     await page.locator("#codex-fast-mode").setChecked(false);
@@ -641,15 +645,22 @@ async function testFullBrowserWorkflow(browser) {
     await page.locator("#repair-context-save-button").click();
     await expect(page.locator("#toast")).toContainText("Codex settings saved");
     await expect(page.locator("#repair-context-dialog")).toBeHidden();
+    await page.locator("#runner-settings-close-button").click();
+    await expect(page.locator("#codex-settings-panel")).toBeHidden();
     await page.getByRole("button", { name: "Reload" }).click();
+    await page.locator("#runner-settings-button").click();
+    await expect(page.locator("#codex-settings-panel")).toBeVisible();
     await expect(page.locator("#codex-model")).toHaveValue("gpt-5");
     await expect(page.locator("#codex-reasoning")).toHaveValue("high");
     await expect(page.locator("#codex-fast-mode")).not.toBeChecked();
+    await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-5 High");
     await expect(page.locator("#repair-context-button")).toHaveText("Context Set");
     await page.locator("#repair-context-button").click();
     await expect(page.locator("#codex-repair-context")).toHaveValue("Prefer exact IDs in browser tests.");
     await page.locator("#repair-context-cancel-button").click();
     await expect(page.locator("#repair-context-dialog")).toBeHidden();
+    await page.locator("#runner-settings-close-button").click();
+    await expect(page.locator("#codex-settings-panel")).toBeHidden();
 
     await page.getByRole("button", { name: "Poll Now" }).click();
     await expect(row(page, 1)).toContainText("Browser Flow Fixture");
@@ -893,6 +904,8 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     await expect(page.locator("#detail-processing")).toBeVisible();
     await expect(page.locator("#detail-processing")).toContainText("Executing repair");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
+    await expect(page.locator("#abort-repair-button")).toBeVisible();
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
   } finally {
     await context?.close();
     await harness?.close();
