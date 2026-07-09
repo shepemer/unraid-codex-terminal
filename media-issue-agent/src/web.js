@@ -34,7 +34,10 @@ const HTML = `<!doctype html>
       </div>
       <nav class="toolbar" aria-label="Primary actions">
         <div id="codex-settings-panel" class="runner-strip" aria-label="Codex model settings">
-          <span class="runner-label">Codex</span>
+          <div class="runner-panel-header">
+            <span class="runner-label">Codex Runner</span>
+            <button id="runner-settings-close-button" type="button" class="secondary">Close</button>
+          </div>
           <label class="compact-field compact-model">
             <span>Model</span>
             <input id="codex-model" type="text" autocomplete="off">
@@ -57,11 +60,13 @@ const HTML = `<!doctype html>
             <span>Tier</span>
             <input id="codex-service-tier" type="text" autocomplete="off">
           </label>
-          <button id="repair-context-button" type="button" class="secondary">Context</button>
-          <button id="codex-settings-save" type="button" class="secondary">Save</button>
-          <button id="runner-settings-close-button" type="button" class="secondary mobile-only">Close</button>
+          <div class="runner-button-row">
+            <button id="repair-context-button" type="button" class="secondary">Context</button>
+            <button id="codex-settings-save" type="button">Save</button>
+          </div>
         </div>
-        <button id="runner-settings-button" class="secondary mobile-only" type="button" aria-expanded="false">Runner</button>
+        <span id="runner-settings-summary" class="runner-summary">GPT-5.5 Very High</span>
+        <button id="runner-settings-button" class="secondary" type="button" aria-expanded="false">Configure</button>
         <button id="activity-drawer-button" class="secondary mobile-only" type="button" aria-expanded="false">Activity</button>
         <button id="logs-button" class="secondary" type="button">Logs</button>
         <div class="theme-toggle" aria-label="Theme">
@@ -142,6 +147,7 @@ const HTML = `<!doctype html>
             <button id="detail-close-button" type="button" class="secondary">Close</button>
             <button id="reopen-button" type="button" class="secondary hidden">Re-open</button>
             <button id="continue-button" type="button" class="secondary hidden">Continue</button>
+            <button id="abort-repair-button" type="button" class="danger hidden">Abort repair</button>
             <div id="approval-actions" class="toolbar hidden">
               <button id="approve-button" type="button">Approve</button>
               <button id="reject-button" type="button" class="danger">Reject</button>
@@ -412,6 +418,10 @@ button.danger:hover { background: color-mix(in srgb, var(--danger) 84%, #000); }
   z-index: 10;
 }
 
+.app-shell.runner-settings-open .topbar {
+  z-index: 45;
+}
+
 .brand-block {
   display: flex;
   align-items: center;
@@ -477,19 +487,39 @@ p { color: var(--muted); margin-top: 2px; }
 }
 
 .runner-strip {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 40px;
-  padding: 4px;
+  display: none;
+  gap: 10px;
+  padding: 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
-  background: color-mix(in srgb, var(--panel-2) 88%, transparent);
+  background: var(--panel);
   min-width: 0;
 }
 
+.app-shell.runner-settings-open .runner-strip {
+  position: fixed;
+  top: 72px;
+  right: 14px;
+  z-index: 46;
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  width: min(420px, calc(100vw - 28px));
+  max-height: calc(100vh - 86px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+  box-shadow: var(--shadow);
+}
+
+.runner-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .runner-label {
-  padding: 0 6px 0 4px;
   color: var(--subtle);
   font-size: 11px;
   font-weight: 780;
@@ -498,11 +528,30 @@ p { color: var(--muted); margin-top: 2px; }
   white-space: nowrap;
 }
 
+.runner-summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  max-width: 180px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .compact-field {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: 1fr;
   align-items: center;
   gap: 5px;
+  width: 100%;
   min-width: 0;
 }
 
@@ -516,9 +565,9 @@ p { color: var(--muted); margin-top: 2px; }
   white-space: nowrap;
 }
 
-.compact-model { width: 98px; }
-.compact-reasoning { width: 112px; }
-.compact-tier { width: 64px; }
+.compact-model,
+.compact-reasoning,
+.compact-tier { width: 100%; }
 
 .runner-strip input[type="text"],
 .runner-strip select {
@@ -543,8 +592,8 @@ p { color: var(--muted); margin-top: 2px; }
   display: flex;
   align-items: center;
   gap: 5px;
-  min-height: 30px;
-  padding: 0 4px;
+  min-height: 36px;
+  padding: 0;
 }
 
 .compact-toggle input {
@@ -554,9 +603,14 @@ p { color: var(--muted); margin-top: 2px; }
 }
 
 .runner-strip button {
-  min-height: 30px;
-  padding: 0 8px;
+  min-height: 36px;
   font-size: 12px;
+}
+
+.runner-button-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
 }
 
 .token-usage {
@@ -1653,6 +1707,10 @@ pre {
     width: 100%;
   }
 
+  .runner-button-row {
+    grid-template-columns: 1fr;
+  }
+
   .runner-strip input[type="text"],
   .runner-strip select {
     min-height: 44px;
@@ -1963,6 +2021,7 @@ const el = {
   codexServiceTier: document.getElementById("codex-service-tier"),
   codexRepairContext: document.getElementById("codex-repair-context"),
   codexSettingsSave: document.getElementById("codex-settings-save"),
+  runnerSettingsSummary: document.getElementById("runner-settings-summary"),
   repairContextButton: document.getElementById("repair-context-button"),
   repairContextDialog: document.getElementById("repair-context-dialog"),
   repairContextCancelButton: document.getElementById("repair-context-cancel-button"),
@@ -2012,6 +2071,7 @@ const el = {
   detailProcessing: document.getElementById("detail-processing"),
   reopenButton: document.getElementById("reopen-button"),
   continueButton: document.getElementById("continue-button"),
+  abortRepairButton: document.getElementById("abort-repair-button"),
   approvalActions: document.getElementById("approval-actions"),
   approveButton: document.getElementById("approve-button"),
   rejectButton: document.getElementById("reject-button"),
@@ -2585,6 +2645,22 @@ function renderAuth(auth, login) {
   el.loginOutput.textContent = output;
 }
 
+function displayModelName(value) {
+  const model = String(value || "gpt-5.5").trim();
+  return model.replace(/^gpt/i, "GPT");
+}
+
+function displayReasoningEffort(value) {
+  const labels = {
+    minimal: "Minimal",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "Very High"
+  };
+  return labels[String(value || "xhigh")] || String(value || "Very High");
+}
+
 function renderCodexSettings(settings) {
   state.codexSettings = settings || null;
   const effective = settings?.effective || settings?.defaults || {};
@@ -2593,6 +2669,13 @@ function renderCodexSettings(settings) {
   el.codexFastMode.checked = effective.fastMode !== false;
   el.codexServiceTier.value = effective.serviceTier || "";
   el.codexRepairContext.value = effective.repairContext || "";
+  const summary = displayModelName(effective.model) + " " + displayReasoningEffort(effective.reasoningEffort);
+  el.runnerSettingsSummary.textContent = summary;
+  el.runnerSettingsSummary.title = [
+    summary,
+    effective.fastMode !== false ? "Fast mode" : "Standard mode",
+    effective.serviceTier ? "Tier " + effective.serviceTier : ""
+  ].filter(Boolean).join(" · ");
   el.repairContextButton.textContent = effective.repairContext ? "Context Set" : "Context";
   el.repairContextButton.title = effective.repairContext
     ? "Edit non-secret repair context"
@@ -3735,6 +3818,9 @@ function updateJobControls(detail) {
   const hasPendingResolution = pending?.kind === "resolution";
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
+  const canAbortRepair = stateName === "executing";
+  el.abortRepairButton.classList.toggle("hidden", !canAbortRepair);
+  el.abortRepairButton.disabled = !canAbortRepair || state.busy || !state.authOk;
   setRepairRetryVisible(false);
   setSteerVisible(stateName === "awaiting_action_approval"
     || (["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution));
@@ -4131,6 +4217,29 @@ async function retrySameRepair() {
   }
 }
 
+async function abortRepair() {
+  if (!state.activeJobId) return;
+  setBusy(true);
+  setDetailOpen(true);
+  setDetailProcessing(true, "Aborting repair");
+  try {
+    const result = await api("/api/jobs/" + state.activeJobId + "/abort-repair", {
+      method: "POST",
+      body: "{}"
+    });
+    toast("Job " + state.activeJobId + " abort requested");
+    el.output.textContent = result.result?.message || formatJson(result.result);
+    await refresh();
+    await showJob(state.activeJobId);
+  } catch (error) {
+    setDetailProcessing(false);
+    el.output.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function steerInvestigation() {
   if (!state.activeJobId) return;
   const message = el.steerInput.value.trim();
@@ -4164,7 +4273,7 @@ el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
 el.loginButton.addEventListener("click", startLogin);
 el.codexSettingsSave.addEventListener("click", saveCodexSettings);
-el.runnerSettingsButton.addEventListener("click", () => setRunnerSettingsOpen(true));
+el.runnerSettingsButton.addEventListener("click", () => setRunnerSettingsOpen(!state.runnerSettingsOpen));
 el.runnerSettingsCloseButton.addEventListener("click", () => setRunnerSettingsOpen(false));
 el.runnerSettingsBackdrop.addEventListener("click", () => setRunnerSettingsOpen(false));
 el.activityDrawerButton.addEventListener("click", () => setActivityDrawerOpen(true));
@@ -4261,6 +4370,7 @@ el.rejectButton.addEventListener("click", () => approval("reject"));
 el.detailCloseButton.addEventListener("click", closeDetail);
 el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
+el.abortRepairButton.addEventListener("click", abortRepair);
 el.repairRetryButton.addEventListener("click", retryRepair);
 el.retrySameRepairButton.addEventListener("click", retrySameRepair);
 el.steerButton.addEventListener("click", steerInvestigation);
@@ -4617,6 +4727,13 @@ export function createWebHandler(agent, config) {
       if (req.method === "POST" && retryRepairMatch) {
         const body = await readJson(req);
         const result = await agent.retryRepair(Number(retryRepairMatch[1]), body.note, "web");
+        sendJson(res, 200, { ok: true, result });
+        return;
+      }
+      const abortRepairMatch = url.pathname.match(/^\/api\/jobs\/(\d+)\/abort-repair$/);
+      if (req.method === "POST" && abortRepairMatch) {
+        await readJson(req);
+        const result = await agent.abortRepair(Number(abortRepairMatch[1]), "web");
         sendJson(res, 200, { ok: true, result });
         return;
       }

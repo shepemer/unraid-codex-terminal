@@ -353,6 +353,7 @@ async function run() {
 
     const tools = await rpc("tools/list");
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
+    const toolsByName = new Map(tools.result.tools.map(toolInfo => [toolInfo.name, toolInfo]));
     assert.ok(toolNames.has("media_file_delete"));
     assert.ok(toolNames.has("media_probe_video_content"));
     assert.ok(toolNames.has("plex_delete_metadata"));
@@ -362,6 +363,13 @@ async function run() {
     assert.ok(toolNames.has("radarr_delete_movie_file"));
     assert.ok(toolNames.has("sonarr_list_episodes"));
     assert.ok(toolNames.has("sonarr_replace_episode_files"));
+    assert.ok(toolNames.has("sonarr_blocklist_episode_file_source"));
+    assert.match(toolsByName.get("media_probe_video_content").description, /show\/season child episode/);
+    assert.ok(toolsByName.get("media_probe_video_content").inputSchema.properties.childRatingKey);
+    assert.ok(toolsByName.get("media_probe_video_content").inputSchema.properties.seasonIndex);
+    assert.ok(toolsByName.get("media_probe_video_content").inputSchema.properties.episodeIndex);
+    assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /delete\/remove bad-content workflows/);
+    assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /content-probe-confirmed bad files/);
 
     const dryFileDelete = await tool("media_file_delete", {
       path: "/movies/Delete Fixture (2026)/Delete Fixture.mkv",
@@ -522,6 +530,23 @@ async function run() {
     assert.equal(probe.frameHashes[0].algorithm, "average_hash_8x8");
     assert.equal(probe.comparison.resolvedPath, compareEpisodeFile);
     assert.equal(probe.comparison.hammingDistances[0].distance, 0);
+
+    const seasonProbe = await tool("media_probe_video_content", {
+      ratingKey: "season-13",
+      episodeIndex: 3
+    });
+    assert.equal(seasonProbe.resolvedPath, episodeFile);
+    assert.equal(seasonProbe.plexSelection.source, "ratingKeyChildren");
+    assert.equal(seasonProbe.plexSelection.selected.ratingKey, "episode-1301");
+
+    const showProbe = await tool("media_probe_video_content", {
+      ratingKey: "show-55",
+      seasonIndex: 13,
+      episodeIndex: 3
+    });
+    assert.equal(showProbe.resolvedPath, episodeFile);
+    assert.equal(showProbe.plexSelection.source, "showSeasonChildren");
+    assert.equal(showProbe.plexSelection.selected.ratingKey, "episode-1301");
 
     const suffixMappedProbe = await tool("media_probe_video_content", {
       path: "/opaque/plex/library/tv/Fixture Series/Season 13/Fixture Series - S13E03.mkv"

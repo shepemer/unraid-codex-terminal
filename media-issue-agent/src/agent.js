@@ -582,6 +582,32 @@ function executionResultFromRepairResult(repairResult, agentRun) {
   };
 }
 
+function repairFailureResultFromError(error) {
+  const message = redactText(error?.message || error || "Repair runner failed before returning a final result.");
+  if (!/timed?\s*out|timeout/i.test(message)) {
+    return null;
+  }
+  return {
+    status: "failed_retryable",
+    summary: message,
+    actionsTaken: [],
+    verification: {
+      status: "failed",
+      details: "The repair runner timed out before it could finish and verify the queued media work."
+    },
+    draftComment: "",
+    closeRecommended: false,
+    proposedChoices: [],
+    missingMcpItems: [{
+      title: "Download and import completion watcher",
+      description: "Expose a media-mcp helper that waits for exact Sonarr/Radarr/Bazarr queue or download identifiers to finish importing, then returns final queue, history, import, and error state for the repair runner.",
+      suggestedToolName: "media_wait_for_download_import",
+      category: "diagnostics",
+      reason: "The autonomous repair timed out while waiting for background download/import work to complete before it could verify the final media state."
+    }]
+  };
+}
+
 function transitionSuccessfulRepairToDrafting(dbPath, jobId, agentRun, repairResult) {
   const current = jobForId(dbPath, jobId);
   if (!current) {
@@ -901,6 +927,7 @@ function mcpToolRequirementFailures(item, tool) {
   requireIf(hasMcpStem(requestText, ["delete", "delet", "remove", "removal"]), "delete/remove operation", ["delete", "delet", "remove", "removal"]);
   requireIf(hasMcpStem(requestText, ["stat"]), "stat or inspection operation", ["stat", "metadata", "probe", "inspect"]);
   requireIf(hasMcpStem(requestText, ["blocklist", "blacklist"]), "blocklist/blacklist support", ["blocklist", "blacklist"]);
+  requireIf(hasMcpStem(requestText, ["list", "listing"]), "listing support", ["list", "listing"]);
   requireIf(hasMcpStem(requestText, ["interactive"]), "interactive search support", ["interactive"]);
   requireIf(hasMcpStem(requestText, ["season"]), "season-level support", ["season"]);
   requireIf(hasMcpStem(requestText, ["show"]), "show/series-level support", ["show", "series", "parent"]);
@@ -1353,6 +1380,7 @@ export class MediaIssueAgent {
     this.fetch = options.fetch || globalThis.fetch;
     this.initPromise = null;
     this.diagnosticLogger = createDiagnosticLogger(config);
+    this.activeRepairRuns = new Map();
   }
 
   diagnostic(level, event, payload = {}) {
@@ -2158,6 +2186,41 @@ export class MediaIssueAgent {
     return this.steerInvestigation(jobId, retryNote, actor);
   }
 
+  async abortRepair(jobId, actor = "operator") {
+    await this.init();
+    const job = jobForId(this.config.dbPath, jobId);
+    if (!job) {
+      throw new Error(`Job ${jobId} was not found`);
+    }
+    if (!["approved_for_execution", "executing"].includes(job.state)) {
+      throw new Error(`Job ${jobId} is not executing a repair`);
+    }
+    const active = this.activeRepairRuns.get(Number(jobId));
+    if (!active?.controller) {
+      throw new Error(`Job ${jobId} has no live repair process owned by this media issue agent instance`);
+    }
+    const message = `Repair aborted by ${actor}.`;
+    active.controller.abort(message);
+    this.diagnostic("warn", "repair_abort_requested", {
+      jobId,
+      runId: active.runId || null,
+      actor
+    });
+    if (active.runId) {
+      recordAgentRunEvent(this.config.dbPath, active.runId, jobId, "repair_abort_requested", sanitizeValue({ actor, message }));
+    }
+    recordAudit(this.config.dbPath, "repair_abort_requested", sanitizeValue({
+      actor,
+      runId: active.runId || null
+    }), jobId);
+    return {
+      jobId,
+      runId: active.runId || null,
+      status: "abort_requested",
+      message
+    };
+  }
+
   returnRepairToInvestigationReview(jobId, actor, message, context = {}) {
     const details = this.jobDetails(jobId);
     if (!details?.investigation) {
@@ -2354,9 +2417,16 @@ export class MediaIssueAgent {
       }
     }, heartbeatMs);
     heartbeatTimer.unref?.();
+    const abortController = new AbortController();
+    this.activeRepairRuns.set(Number(jobId), {
+      controller: abortController,
+      runId: agentRun.id,
+      startedAt: new Date().toISOString()
+    });
     try {
       const output = await runCodexRepair(this.config, repairPrompt, settings, {
         codexWorkspace: workspace,
+        abortSignal: abortController.signal,
         onEvent: event => {
           const eventType = event?.type || "event";
           this.recordCodexTokenUsage(event, {
@@ -2365,12 +2435,13 @@ export class MediaIssueAgent {
             source: "repair",
             settings
           });
-          recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, sanitizeValue(compactAgentRunEventForStorage(event)));
+          const compactedEvent = sanitizeValue(compactAgentRunEventForStorage(event));
+          recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, compactedEvent);
           this.diagnostic("debug", "repair_agent_event", {
             jobId,
             runId: agentRun.id,
             eventType,
-            event
+            event: compactedEvent
           });
         }
       });
@@ -2455,8 +2526,35 @@ export class MediaIssueAgent {
       }
     } catch (error) {
       const message = redactText(error.message);
+      const fallbackRepairResult = repairFailureResultFromError(error);
+      if (fallbackRepairResult && !repairResult) {
+        repairResult = fallbackRepairResult;
+      }
       if (!completedRun) {
-        completeAgentRun(this.config.dbPath, agentRun.id, "failed_retryable", null, message);
+        completeAgentRun(this.config.dbPath, agentRun.id, "failed_retryable", repairResult, message);
+      }
+      if (fallbackRepairResult?.missingMcpItems?.length) {
+        const savedMissingMcpItems = upsertMissingMcpItems(this.config.dbPath, jobId, agentRun.id, fallbackRepairResult.missingMcpItems);
+        this.diagnostic("info", "missing_mcp_items_recorded_after_failure", {
+          jobId,
+          runId: agentRun.id,
+          count: savedMissingMcpItems.length,
+          items: savedMissingMcpItems.map(item => ({
+            id: item.id,
+            title: item.title,
+            suggestedToolName: item.suggestedToolName || null
+          }))
+        });
+        recordAudit(this.config.dbPath, "missing_mcp_items_recorded_after_failure", sanitizeValue({
+          runId: agentRun.id,
+          items: savedMissingMcpItems.map(item => ({
+            id: item.id,
+            title: item.title,
+            description: item.description,
+            suggestedToolName: item.suggestedToolName || null,
+            category: item.category || null
+          }))
+        }), jobId);
       }
       recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, "repair_failed", sanitizeValue({ error: error.message }));
       this.diagnostic("error", "repair_agent_error", {
@@ -2475,6 +2573,10 @@ export class MediaIssueAgent {
       throw error;
     } finally {
       clearInterval(heartbeatTimer);
+      const active = this.activeRepairRuns.get(Number(jobId));
+      if (active?.runId === agentRun.id) {
+        this.activeRepairRuns.delete(Number(jobId));
+      }
     }
     const executionResult = executionResultFromRepairResult(repairResult, completedRun || agentRun);
     this.diagnostic("info", "execution_completed", {

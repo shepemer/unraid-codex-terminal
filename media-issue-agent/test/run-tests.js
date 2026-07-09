@@ -42,6 +42,23 @@ async function tempDir() {
   return mkdtemp(path.join(os.tmpdir(), "media-issue-agent-test-"));
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitFor(predicate, timeoutMs = 5000) {
+  const started = Date.now();
+  let lastValue;
+  while (Date.now() - started < timeoutMs) {
+    lastValue = await predicate();
+    if (lastValue) {
+      return lastValue;
+    }
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for condition; last value: ${JSON.stringify(lastValue)}`);
+}
+
 async function authHome(authJson = { chatgpt: { account: "fixture" } }) {
   const dir = await tempDir();
   await writeFile(path.join(dir, "auth.json"), JSON.stringify(authJson));
@@ -1253,6 +1270,99 @@ async function testRepairRunnerRecordsMissingMcpItems() {
   }
 }
 
+async function testRepairTimeoutRecordsMissingMcpItem() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-repair-timeout-fixture.mjs");
+  await writeFile(codexBin, [
+    "#!/usr/bin/env node",
+    "let input = '';",
+    "process.stdin.on('data', chunk => { input += chunk; });",
+    "process.on('SIGTERM', () => process.exit(143));",
+    "process.stdin.on('end', () => {",
+    "  if (!input.includes('Autonomous approved media repair execution')) {",
+    "    process.stdout.write('Investigation summary: server-side repair is required and should be verified.\\n');",
+    "    return;",
+    "  }",
+    "  process.stdout.write(`${JSON.stringify({ type: 'repair_mcp_tool_result', calls: [{ toolName: 'sonarr_queue' }], status: 200, result: [{ status: 'downloading', summary: 'fixture queue still importing' }] })}\\n`);",
+    "  setInterval(() => {}, 1000);",
+    "});"
+  ].join("\n"));
+  await chmod(codexBin, 0o700);
+  const client = {
+    async listTools() {
+      return [{ name: "sonarr_queue", description: "Read Sonarr queue." }];
+    },
+    async callTool(name, args) {
+      if (name === "plex_issue_details" || name === "media_diagnose_issue") {
+        return {
+          issue: {
+            source: "plex",
+            id: args.issueId,
+            status: "open",
+            message: "Missing subtitles.",
+            mediaTitle: "Fixture Episode",
+            mediaType: "episode",
+            plexRatingKey: "900003",
+            comments: []
+          }
+        };
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  };
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 100,
+      dryRun: false,
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000
+    }, client);
+    await agent.init();
+    const snapshot = insertSnapshot(dbPath, issueTableMarkdown([{
+      source: "plex",
+      issueId: "plex-timeout-gap",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Episode",
+      status: "open",
+      description: "Missing subtitles."
+    }]), [{
+      source: "plex",
+      issueId: "plex-timeout-gap",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Episode",
+      status: "open",
+      description: "Missing subtitles."
+    }]);
+    const investigated = await agent.investigate(snapshot.id, 1, { force: true });
+    const returned = await agent.approve(investigated.jobId, "fixture");
+    assert.equal(returned.status, "awaiting_action_approval");
+    const details = jobDetails(dbPath, investigated.jobId);
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /timed out/);
+    assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.match(details.agentRuns[0].finalResult.summary, /timed out/);
+    const item = details.missingMcpItems.find(entry => entry.suggestedToolName === "media_wait_for_download_import");
+    assert.ok(item);
+    assert.match(item.description, /waits for exact Sonarr\/Radarr\/Bazarr/);
+    assert.match(item.source.reason, /background download\/import work/);
+    assert.equal(details.auditEvents.some(event => event.eventType === "missing_mcp_items_recorded_after_failure"), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
 async function testMissingMcpCapabilityCheckUsesLiveTools() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -1449,6 +1559,18 @@ async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
         description: "Expose a safe exact-delete operation for a Radarr movieFileId, optionally with a no-replace/no-search guard.",
         suggestedToolName: "radarr_delete_movie_file",
         category: "radarr"
+      },
+      {
+        title: "Sonarr imported-source blocklisting",
+        description: "Expose a guarded Sonarr workflow to blocklist the source associated with already-imported episode files when deleting bad content.",
+        suggestedToolName: "sonarr_blocklist_episode_file_source",
+        category: "sonarr"
+      },
+      {
+        title: "Plex-to-media path mapping for probes",
+        description: "media_probe_video_content should be able to resolve Plex library paths such as [REDACTED_PATH]",
+        suggestedToolName: "media_probe_video_content",
+        category: "diagnostics"
       }
     ]);
     const agent = new MediaIssueAgent({
@@ -1489,10 +1611,13 @@ async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
           {
             name: "media_probe_video_content",
             title: "Video Content Probe",
-            description: "Probe one exact media file or Plex media part with ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+            description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with MEDIA_MCP_PATH_MAPS path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
             inputSchema: {
               path: "",
               ratingKey: "",
+              childRatingKey: "",
+              seasonIndex: 0,
+              episodeIndex: 0,
               partFile: "",
               includeFrameHashes: true
             }
@@ -1505,6 +1630,17 @@ async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
               movieFileId: 1,
               dryRun: true
             }
+          },
+          {
+            name: "sonarr_blocklist_episode_file_source",
+            title: "Sonarr Imported-Source Blocklisting",
+            description: "Derive the imported source associated with exact Sonarr episode files or episode IDs and mark the matching Sonarr history record failed so Sonarr blocklists that source. Supports delete/remove bad-content workflows, including content-probe-confirmed bad files before or after media_file_delete/sonarr_replace_episode_files. Dry-run is enabled by default.",
+            inputSchema: {
+              episodeFileIds: [],
+              episodeIds: [],
+              sourceTitle: "",
+              dryRun: true
+            }
           }
         ];
       }
@@ -1515,10 +1651,10 @@ async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
     assert.notEqual(first.agentSummary, second.agentSummary);
     assert.deepEqual(stableMcpCapabilityRows(first), stableMcpCapabilityRows(second));
     assert.deepEqual(first.detectedItemIds.sort(), second.detectedItemIds.sort());
-    assert.deepEqual(first.detectedItemIds.sort(), [1, 3, 4]);
+    assert.deepEqual(first.detectedItemIds.sort(), [1, 3, 4, 5, 6]);
     const seasonListing = first.results.find(entry => entry.itemId === 2);
     assert.equal(seasonListing.detected, false);
-    assert.match(seasonListing.reason, /season-level support/);
+    assert.match(seasonListing.reason, /listing support/);
     const noSearchDelete = first.results.find(entry => entry.itemId === 4);
     assert.equal(noSearchDelete.detected, true);
     assert.equal(noSearchDelete.toolName, "radarr_delete_movie_file");
@@ -1808,6 +1944,98 @@ async function testRetryRepairWithoutNoteRerunsSameInvestigation() {
   }
 }
 
+async function testAbortExecutingRepairTerminatesRunAndReturnsToReview() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const codexHome = await authHome();
+  const codexBin = path.join(dir, "codex-abort-fixture.mjs");
+  const signalPath = path.join(dir, "sigterm.txt");
+  try {
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
+      "process.stdin.resume();",
+      `process.on('SIGTERM', () => { writeFileSync(${JSON.stringify(signalPath)}, 'terminated'); process.exit(130); });`,
+      "setInterval(() => {",
+      "  console.log(JSON.stringify({ type: 'item.started', item: { type: 'mcp_tool_call', name: 'media.fixture_long_repair', status: 'running' } }));",
+      "}, 50);"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    await initDb(dbPath);
+    const job = ensureJob(dbPath, "plex", "abort-repair-fixture");
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Investigation summary: run a long server-side repair and verify it.",
+      evidence: { entry: { source: "plex", issueId: "abort-repair-fixture" } }
+    });
+    transitionJob(dbPath, job.id, "detected", "awaiting_action_approval");
+    createApproval(dbPath, job.id, "action", {
+      source: "plex",
+      issueId: "abort-repair-fixture",
+      summary: "Investigation summary: run a long server-side repair and verify it.",
+      evidence: { entry: { source: "plex", issueId: "abort-repair-fixture" } },
+      plan: {
+        classification: "server_action",
+        executionMode: "approved_repair_agent",
+        actionSummary: {
+          mode: "server_action",
+          headline: "Run autonomous media repair for plex issue abort-repair-fixture",
+          bullets: [],
+          expectedSteps: []
+        }
+      }
+    });
+    const agent = new MediaIssueAgent({
+      dbPath,
+      codexHome,
+      codexBin,
+      codexWorkspace: path.join(dir, "codex-workspace"),
+      repairWorkspaceRoot: path.join(dir, "repair-workspaces"),
+      codexTimeoutMs: 10000,
+      codexRepairTimeoutMs: 30000,
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
+      codexFastMode: true,
+      codexServiceTier: "fast",
+      mediaMcpUrl: "http://media-mcp.invalid/mcp",
+      mediaMcpBearerToken: "test-token",
+      mcpRequestTimeoutMs: 10000,
+      logPath: path.join(dir, "agent.log"),
+      recoverStaleRunSeconds: 120
+    }, {
+      async listTools() {
+        return [{ name: "fixture_long_repair", description: "Long-running fixture repair." }];
+      }
+    });
+    await agent.init();
+    const approvalPromise = agent.approve(job.id, "fixture");
+    await waitFor(() => {
+      const details = jobDetails(dbPath, job.id);
+      return details.job.state === "executing" && details.agentRuns[0]?.status === "running" && details.agentRunEvents.length
+        ? details
+        : null;
+    });
+    const abort = await agent.abortRepair(job.id, "fixture");
+    assert.equal(abort.status, "abort_requested");
+    assert.match(abort.message, /Repair aborted by fixture/);
+    const result = await approvalPromise;
+    assert.equal(result.status, "awaiting_action_approval");
+    const signalText = await readFile(signalPath, "utf8");
+    assert.equal(signalText, "terminated");
+    const details = jobDetails(dbPath, job.id);
+    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.match(details.job.lastError, /Repair aborted by fixture/);
+    assert.equal(details.agentRuns[0].status, "failed_retryable");
+    assert.match(details.agentRuns[0].error, /Repair aborted by fixture/);
+    assert.equal(details.agentRunEvents.some(event => event.eventType === "repair_abort_requested"), true);
+    assert.equal(details.auditEvents.some(event => event.eventType === "repair_abort_requested"), true);
+    assert.equal(details.approvals.some(approval => approval.kind === "action" && approval.status === "pending"), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
 async function testRepairAgentEventsAreCompactedForJobDetail() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -1828,7 +2056,7 @@ async function testRepairAgentEventsAreCompactedForJobDetail() {
       "process.stdin.resume();",
       "process.stdin.on('end', () => {",
       "  const huge = 'x'.repeat(200000);",
-      "  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_get_metadata', status: 'completed', arguments: { ratingKey: '900001' }, result: { content: [{ type: 'text', text: huge }] } } }));",
+      "  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', name: 'media.plex_get_metadata', status: 'completed', arguments: { ratingKey: '900001', Parameters: [{ Name: '*Unpack:Password', Value: 'fixture-secret-password' }] }, result: { content: [{ type: 'text', text: huge }] } } }));",
       `  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: ${JSON.stringify(JSON.stringify(finalResult))} } }));`,
       "});"
     ].join("\n"));
@@ -1888,7 +2116,12 @@ async function testRepairAgentEventsAreCompactedForJobDetail() {
     const stored = JSON.stringify(event.payload);
     assert.ok(stored.length < 12000, `stored event should be compact, got ${stored.length} chars`);
     assert.doesNotMatch(stored, /x{10000}/);
+    assert.doesNotMatch(stored, /fixture-secret-password/);
     assert.match(stored, /resultSummary/);
+    const logText = await readFile(path.join(dir, "agent.log"), "utf8");
+    assert.doesNotMatch(logText, /x{10000}/);
+    assert.doesNotMatch(logText, /fixture-secret-password/);
+    assert.match(logText, /resultSummary/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -2705,6 +2938,15 @@ function testRedaction() {
     tokenUsage: { totalTokens: 1234, inputTokens: 1000, outputTokens: 234 },
     tokens: "[REDACTED]"
   });
+  assert.deepEqual(sanitizeValue({
+    Name: "*Unpack:Password",
+    Value: "fixture-unpack-password",
+    Label: "safe"
+  }), {
+    Name: "*Unpack:Password",
+    Value: "[REDACTED]",
+    Label: "safe"
+  });
 }
 
 async function testWebAuthAndApi() {
@@ -3065,11 +3307,13 @@ async function run() {
   await testRepairRunnerRejectsOwnerDelegation();
   await testRepairRunnerInvalidJsonFailsWithoutResolution();
   await testRepairRunnerRecordsMissingMcpItems();
+  await testRepairTimeoutRecordsMissingMcpItem();
   await testMissingMcpCapabilityCheckUsesLiveTools();
   await testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries();
   await testRepairRunnerNeedsOperatorDecisionCanRetryWithNote();
   await testRepairPromptCompactsOversizedEvidence();
   await testRetryRepairWithoutNoteRerunsSameInvestigation();
+  await testAbortExecutingRepairTerminatesRunAndReturnsToReview();
   await testRepairAgentEventsAreCompactedForJobDetail();
   await testRepairRunnerUnverifiedFixedFailsWithoutResolution();
   await testRepairResultWithoutCloseRecommendationPostsCommentOnly();

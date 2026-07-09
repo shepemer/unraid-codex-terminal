@@ -2570,6 +2570,135 @@ function plexPartsFromMetadata(body) {
   return plexMetadataRecords(body).flatMap(item => summarizePlexMetadataItem(item).parts || []);
 }
 
+function selectPlexChildRecord(records, options = {}) {
+  const ratingKey = options.ratingKey !== undefined && options.ratingKey !== null ? String(options.ratingKey) : "";
+  if (ratingKey) {
+    const found = records.find(record => String(record?.ratingKey || "") === ratingKey);
+    if (found) {
+      return found;
+    }
+  }
+  if (Number.isInteger(options.plexIndex)) {
+    const found = records.find(record => Number(record?.index) === options.plexIndex);
+    if (found) {
+      return found;
+    }
+  }
+  const childIndex = Number.isInteger(options.childIndex) ? options.childIndex : 0;
+  return records[childIndex] || null;
+}
+
+async function plexProbePartsFromRatingKey(input) {
+  const ratingKey = String(input.ratingKey || "").trim();
+  if (!ratingKey) {
+    return {
+      plexParts: [],
+      plexSelection: null
+    };
+  }
+  const selection = {
+    requestedRatingKey: ratingKey,
+    childRatingKey: input.childRatingKey ? String(input.childRatingKey) : undefined,
+    seasonRatingKey: input.seasonRatingKey ? String(input.seasonRatingKey) : undefined,
+    seasonIndex: input.seasonIndex,
+    episodeIndex: input.episodeIndex,
+    childIndex: input.childIndex,
+    traversal: []
+  };
+  try {
+    const metadataBody = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}`);
+    const metadataSummary = summarizePlexMetadata(metadataBody);
+    selection.metadata = metadataSummary;
+    const directParts = plexPartsFromMetadata(metadataBody);
+    if (directParts.length) {
+      selection.selected = metadataSummary;
+      selection.source = "ratingKey";
+      return { plexParts: directParts, plexSelection: compactObject(selection) };
+    }
+  } catch (error) {
+    selection.metadataError = error.message;
+  }
+
+  if (input.childRatingKey) {
+    const childRatingKey = String(input.childRatingKey);
+    try {
+      const childBody = await plexApi(`library/metadata/${encodeURIComponent(childRatingKey)}`);
+      const childParts = plexPartsFromMetadata(childBody);
+      const childSummary = summarizePlexMetadata(childBody);
+      selection.traversal.push({ from: ratingKey, to: childRatingKey, type: "childRatingKey", selected: childSummary });
+      if (childParts.length) {
+        selection.selected = childSummary;
+        selection.source = "childRatingKey";
+        return { plexParts: childParts, plexSelection: compactObject(selection) };
+      }
+    } catch (error) {
+      selection.childMetadataError = error.message;
+    }
+  }
+
+  let children = [];
+  try {
+    const childBody = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}/children`);
+    children = plexMetadataRecords(childBody);
+    selection.traversal.push({ from: ratingKey, type: "children", count: children.length });
+  } catch (error) {
+    selection.childrenError = error.message;
+  }
+
+  const playableChildren = children.filter(record => (summarizePlexMetadataItem(record).parts || []).length);
+  if (playableChildren.length) {
+    const selectedEpisode = selectPlexChildRecord(playableChildren, {
+      ratingKey: input.childRatingKey,
+      plexIndex: Number.isInteger(input.episodeIndex) ? input.episodeIndex : undefined,
+      childIndex: input.childIndex
+    });
+    const selectedSummary = summarizePlexMetadataItem(selectedEpisode);
+    selection.selected = selectedSummary;
+    selection.source = "ratingKeyChildren";
+    return {
+      plexParts: selectedSummary.parts || [],
+      plexSelection: compactObject(selection)
+    };
+  }
+
+  const selectedSeason = selectPlexChildRecord(children, {
+    ratingKey: input.seasonRatingKey,
+    plexIndex: Number.isInteger(input.seasonIndex) ? input.seasonIndex : undefined,
+    childIndex: input.childIndex
+  });
+  if (!selectedSeason?.ratingKey) {
+    return {
+      plexParts: [],
+      plexSelection: compactObject(selection)
+    };
+  }
+  const selectedSeasonSummary = summarizePlexSeasonItem(selectedSeason);
+  selection.traversal.push({ from: ratingKey, to: selectedSeason.ratingKey, type: "season", selected: selectedSeasonSummary });
+  try {
+    const seasonBody = await plexApi(`library/metadata/${encodeURIComponent(String(selectedSeason.ratingKey))}/children`);
+    const episodeRecords = plexMetadataRecords(seasonBody);
+    selection.traversal.push({ from: selectedSeason.ratingKey, type: "seasonChildren", count: episodeRecords.length });
+    const selectedEpisode = selectPlexChildRecord(episodeRecords, {
+      ratingKey: input.childRatingKey,
+      plexIndex: Number.isInteger(input.episodeIndex) ? input.episodeIndex : undefined,
+      childIndex: 0
+    });
+    const selectedSummary = summarizePlexMetadataItem(selectedEpisode);
+    selection.selected = selectedSummary;
+    selection.source = "showSeasonChildren";
+    return {
+      plexParts: selectedSummary.parts || [],
+      plexSelection: compactObject(selection)
+    };
+  } catch (error) {
+    selection.seasonChildrenError = error.message;
+    return {
+      plexParts: [],
+      plexSelection: compactObject(selection)
+    };
+  }
+}
+
 function embeddedTitlesFromProbe(probe) {
   const titles = [];
   const formatTitle = probe?.format?.tags?.title || probe?.format?.tags?.TITLE;
@@ -2637,11 +2766,7 @@ async function frameAverageHash(ffmpeg, pathValue, timestampSeconds) {
 }
 
 async function mediaProbeVideoContent(input) {
-  let plexParts = [];
-  if (input.ratingKey) {
-    const plexMetadata = await plexApi(`library/metadata/${encodeURIComponent(String(input.ratingKey))}`);
-    plexParts = plexPartsFromMetadata(plexMetadata);
-  }
+  const { plexParts, plexSelection } = await plexProbePartsFromRatingKey(input);
   const selectedPart = input.partFile
     ? { file: input.partFile }
     : plexParts[input.partIndex || 0];
@@ -2657,7 +2782,8 @@ async function mediaProbeVideoContent(input) {
     candidates: resolution.candidates,
     allowedRoots: resolution.allowedRoots,
     checked: resolution.checked,
-    plexParts
+    plexParts,
+    plexSelection
   };
   if (!resolution.path) {
     return { ...base, blockers: resolution.blockers };
@@ -9357,11 +9483,16 @@ function createServer() {
 
   server.registerTool("media_probe_video_content", {
     title: "Video Content Probe",
-    description: "Probe one exact media file or Plex media part with ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+    description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with MEDIA_MCP_PATH_MAPS path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       path: z.string().min(1).optional(),
       ratingKey: z.union([z.string(), z.number()]).optional(),
+      childRatingKey: z.union([z.string(), z.number()]).optional(),
+      seasonRatingKey: z.union([z.string(), z.number()]).optional(),
+      seasonIndex: z.number().int().min(0).optional(),
+      episodeIndex: z.number().int().min(0).optional(),
+      childIndex: z.number().int().min(0).default(0),
       partIndex: z.number().int().min(0).default(0),
       partFile: z.string().min(1).optional(),
       includeFrameHashes: z.boolean().default(false),
@@ -10026,7 +10157,7 @@ function createServer() {
 
   server.registerTool("sonarr_blocklist_episode_file_source", {
     title: "Sonarr Imported-Source Blocklisting",
-    description: "Derive the imported source associated with exact Sonarr episode files or episode IDs and mark the matching Sonarr history record failed so Sonarr blocklists that source. Dry-run is enabled by default.",
+    description: "Derive the imported source associated with exact Sonarr episode files or episode IDs and mark the matching Sonarr history record failed so Sonarr blocklists that source. Supports delete/remove bad-content workflows, including content-probe-confirmed bad files before or after media_file_delete/sonarr_replace_episode_files. Dry-run is enabled by default.",
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
       episodeFileIds: z.array(z.number().int().positive()).max(20).optional(),

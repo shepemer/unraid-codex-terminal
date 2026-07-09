@@ -41,6 +41,18 @@ export function sanitizeValue(value, key = "") {
   if (Array.isArray(value)) {
     return value.map(item => sanitizeValue(item));
   }
+  if (
+    typeof value.Name === "string"
+    && SECRET_KEY_PATTERN.test(value.Name)
+    && Object.prototype.hasOwnProperty.call(value, "Value")
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        childKey === "Value" ? "[REDACTED]" : sanitizeValue(childValue, childKey)
+      ])
+    );
+  }
   return Object.fromEntries(
     Object.entries(value).map(([childKey, childValue]) => [childKey, sanitizeValue(childValue, childKey)])
   );

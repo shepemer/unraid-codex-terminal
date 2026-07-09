@@ -64,6 +64,14 @@ function runProcess(command, args, options) {
   });
 }
 
+function abortError(reason = "Codex repair aborted") {
+  const message = typeof reason === "string" ? reason : reason?.message || "Codex repair aborted";
+  const error = new Error(redactText(message));
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
 const BASE_CODEX_ENV_ALLOWLIST = [
   "PATH",
   "LANG",
@@ -218,6 +226,8 @@ export function repairExecutionPrompt(evidence, approvedPlan, context = {}) {
     "Do not post reporter-facing issue comments and do not close or resolve the issue; media-issue-agent will do that after final human approval.",
     "Do not ask the server owner/operator to perform media-side work that you can attempt with media tools.",
     "See the repair through to a completed, verified result whenever the required tools and evidence are available.",
+    "When a repair queues downloads, imports, subtitle searches, scans, or refreshes, keep monitoring the relevant queue/history/status tools until the operation completes or a true blocker appears, then verify the media state before returning your final JSON.",
+    "Do not stop after merely starting a background operation. A final successful result requires completed work and verification, not just queued work.",
     "If you cannot complete the repair, return a failed status with the exact blocker. Do not draft a success comment.",
     "For subtitle-only requests, try Bazarr subtitle search/download/verification tools first. If Bazarr has no matching subtitle candidates or cannot download/verify subtitles, use guarded Sonarr/Radarr subtitle replacement candidate tools such as sonarr_subtitle_replacement_candidates, sonarr_replace_episode_for_subtitles, radarr_subtitle_replacement_candidates, and radarr_replace_movie_for_subtitles. Equal-or-higher existing quality/custom-format score is not a blocker for this subtitle-replacement fallback when the tool reports an exact subtitle-bearing candidate with only soft blockers; do not use unrelated deletion/reacquisition paths.",
     "Always include missingMcpItems. Use an empty array when no MCP additions would help. If blocked by unavailable media capabilities, list concrete MCP tools or data surfaces that would have helped.",
@@ -592,6 +602,9 @@ async function startRepairMcpProxy(config, hooks = {}) {
 }
 
 export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) {
+  if (hooks.abortSignal?.aborted) {
+    throw abortError(hooks.abortSignal.reason || "Codex repair aborted before it started");
+  }
   const codexWorkspace = hooks.codexWorkspace || config.codexWorkspace;
   await mkdir(codexWorkspace, { recursive: true });
   const outputDir = await mkdtemp(path.join(os.tmpdir(), "media-issue-agent-codex-"));
@@ -613,13 +626,17 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
         env,
         stdio: ["pipe", "pipe", "pipe"]
       });
+      hooks.onChild?.(child);
       let stdout = "";
       let stderr = "";
       let stdoutBuffer = "";
       let finalMessage = "";
       let settled = false;
+      let abortRequested = null;
+      let abortKillTimer = null;
       const rejectOnce = error => {
         clearTimeout(timeout);
+        clearTimeout(abortKillTimer);
         if (!settled) {
           settled = true;
           reject(error);
@@ -639,6 +656,16 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
         child.kill("SIGTERM");
         rejectOnce(new Error(`Codex repair timed out after ${config.codexRepairTimeoutMs || config.codexTimeoutMs}ms`));
       }, config.codexRepairTimeoutMs || config.codexTimeoutMs);
+      const abortHandler = () => {
+        abortRequested = abortError(hooks.abortSignal?.reason || "Codex repair aborted by operator");
+        emit({ type: "repair_abort_requested", error: abortRequested.message });
+        child.kill("SIGTERM");
+        abortKillTimer = setTimeout(() => {
+          child.kill("SIGKILL");
+        }, 5000);
+        abortKillTimer.unref?.();
+      };
+      hooks.abortSignal?.addEventListener("abort", abortHandler, { once: true });
       const handleStdoutLine = line => {
         const trimmed = line.trim();
         if (!trimmed) {
@@ -680,6 +707,8 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       }
       child.on("close", async code => {
         clearTimeout(timeout);
+        clearTimeout(abortKillTimer);
+        hooks.abortSignal?.removeEventListener("abort", abortHandler);
         if (stdoutBuffer.trim()) {
           handleStdoutLine(stdoutBuffer);
         }
@@ -687,6 +716,10 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
           return;
         }
         settled = true;
+        if (abortRequested) {
+          reject(abortRequested);
+          return;
+        }
         if (code !== 0) {
           reject(new Error(`Codex repair exited with ${code}: ${stderr || stdout}`));
           return;
