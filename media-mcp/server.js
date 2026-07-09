@@ -709,6 +709,10 @@ async function mapConcurrent(items, concurrency, mapper) {
   return results;
 }
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function decodeHtmlEntities(value) {
   if (typeof value !== "string") {
     return value;
@@ -8256,7 +8260,8 @@ async function arrSubtitleReplacementSearch(serviceName, query, input) {
   const limit = Number(input.limit || 50);
   const body = await arrApi(serviceName, "v3", "release", { query });
   const records = Array.isArray(body) ? body : [];
-  const mapped = records.slice(0, limit).map(record => summarizeSubtitleReplacementCandidate(record, {
+  const filtered = filterReleaseRecordsByIndexers(records, input);
+  const filteredMapped = filtered.slice(0, limit).map(record => summarizeSubtitleReplacementCandidate(record, {
     ...input,
     ...query
   }));
@@ -8265,12 +8270,125 @@ async function arrSubtitleReplacementSearch(serviceName, query, input) {
     query,
     requiredSubtitleLanguage: input.requiredSubtitleLanguage || "English",
     total: records.length,
-    returned: mapped.length,
-    eligibleCount: mapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting).length,
+    filteredTotal: filtered.length,
+    returned: filteredMapped.length,
+    eligibleCount: filteredMapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting).length,
     records: input.includeIneligible === false
-      ? mapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting)
-      : mapped
+      ? filteredMapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting)
+      : filteredMapped
   };
+}
+
+function releaseIndexerMatches(record, input = {}) {
+  const indexerIds = (input.indexerIds || []).map(Number).filter(Number.isFinite);
+  const indexers = (input.indexers || []).map(value => String(value).trim().toLowerCase()).filter(Boolean);
+  if (!indexerIds.length && !indexers.length) {
+    return true;
+  }
+  const recordIndexerId = Number(record?.indexerId);
+  const recordIndexer = String(record?.indexer || record?.indexerName || "").trim().toLowerCase();
+  return (indexerIds.length > 0 && indexerIds.includes(recordIndexerId))
+    || (indexers.length > 0 && indexers.some(indexer => recordIndexer.includes(indexer)));
+}
+
+function filterReleaseRecordsByIndexers(records, input = {}) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+  return records.filter(record => releaseIndexerMatches(record, input));
+}
+
+const sonarrSubtitleReplacementAsyncJobs = new Map();
+let sonarrSubtitleReplacementAsyncJobId = 0;
+
+function pruneSonarrSubtitleReplacementAsyncJobs() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [jobId, job] of sonarrSubtitleReplacementAsyncJobs.entries()) {
+    if (new Date(job.updatedAt).getTime() < cutoff) {
+      sonarrSubtitleReplacementAsyncJobs.delete(jobId);
+    }
+  }
+  while (sonarrSubtitleReplacementAsyncJobs.size > 50) {
+    const oldest = [...sonarrSubtitleReplacementAsyncJobs.entries()]
+      .sort(([, left], [, right]) => new Date(left.updatedAt) - new Date(right.updatedAt))[0];
+    if (!oldest) break;
+    sonarrSubtitleReplacementAsyncJobs.delete(oldest[0]);
+  }
+}
+
+function sonarrSubtitleReplacementAsyncJobView(job) {
+  return compactObject({
+    service: "sonarr",
+    jobId: job.jobId,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt,
+    error: job.error,
+    requiredSubtitleLanguage: job.input.requiredSubtitleLanguage || "English",
+    episodeIds: job.episodeIds,
+    totalEpisodes: job.episodeIds.length,
+    completedEpisodes: job.episodeResults.length,
+    episodeResults: job.episodeResults,
+    records: job.episodeResults.flatMap(result => result.records || []),
+    eligibleCount: job.episodeResults.reduce((count, result) => count + Number(result.eligibleCount || 0), 0),
+    pollAfterMs: job.status === "queued" || job.status === "running" ? 1000 : undefined,
+    note: "Poll this tool again with jobId for status. Results are appended as each exact episode search completes."
+  });
+}
+
+async function runSonarrSubtitleReplacementAsyncJob(job) {
+  job.status = "running";
+  job.updatedAt = new Date().toISOString();
+  try {
+    for (const episodeId of job.episodeIds) {
+      const result = await arrSubtitleReplacementSearch("sonarr", { episodeId }, job.input);
+      job.episodeResults.push(result);
+      job.updatedAt = new Date().toISOString();
+    }
+    job.status = "completed";
+    job.completedAt = new Date().toISOString();
+    job.updatedAt = job.completedAt;
+  } catch (error) {
+    job.status = "failed";
+    job.error = redactText(error?.message || String(error));
+    job.completedAt = new Date().toISOString();
+    job.updatedAt = job.completedAt;
+  }
+}
+
+async function sonarrSubtitleReplacementCandidatesAsync(input) {
+  pruneSonarrSubtitleReplacementAsyncJobs();
+  if (input.jobId) {
+    const job = sonarrSubtitleReplacementAsyncJobs.get(input.jobId);
+    if (!job) {
+      throw new Error(`unknown Sonarr subtitle replacement async job ${input.jobId}`);
+    }
+    return sonarrSubtitleReplacementAsyncJobView(job);
+  }
+  const episodeIds = uniquePositiveIds([...(input.episodeIds || []), input.episodeId].filter(Boolean)).filter(id => id > 0);
+  if (!episodeIds.length) {
+    throw new Error("provide episodeId or episodeIds");
+  }
+  const now = new Date().toISOString();
+  const job = {
+    jobId: `sonarr-subtitle-${++sonarrSubtitleReplacementAsyncJobId}`,
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    completedAt: null,
+    error: null,
+    input,
+    episodeIds,
+    episodeResults: []
+  };
+  sonarrSubtitleReplacementAsyncJobs.set(job.jobId, job);
+  runSonarrSubtitleReplacementAsyncJob(job);
+  const deadline = Date.now() + Number(input.waitMs || 0);
+  while ((job.status === "queued" || job.status === "running") && Date.now() < deadline) {
+    await delay(50);
+  }
+  return sonarrSubtitleReplacementAsyncJobView(job);
 }
 
 async function sonarrSubtitleReplacementCandidates(input) {
@@ -8430,6 +8548,195 @@ async function grabArrRelease(serviceName, input) {
     release: summarizeArrReleaseCandidate(payload),
     result: redactSensitiveObject(result)
   };
+}
+
+function buildProwlarrReleasePayload(input) {
+  const release = input.release && typeof input.release === "object" ? input.release : {};
+  const payload = compactObject({
+    ...release,
+    guid: input.guid ?? release.guid,
+    indexerId: input.indexerId ?? release.indexerId,
+    title: input.title ?? release.title,
+    indexer: input.indexer ?? release.indexer,
+    protocol: input.protocol ?? release.protocol,
+    size: input.size ?? release.size,
+    downloadUrl: input.downloadUrl ?? release.downloadUrl ?? release.DownloadUrl,
+    magnetUrl: input.magnetUrl ?? release.magnetUrl ?? release.MagnetUrl
+  });
+  if (!payload.downloadUrl && !payload.magnetUrl) {
+    throw new Error("Prowlarr handoff requires an exact release downloadUrl or magnetUrl");
+  }
+  if (!payload.title && !payload.guid) {
+    throw new Error("Prowlarr handoff requires a release title or guid for auditability");
+  }
+  return payload;
+}
+
+function summarizeProwlarrReleaseCandidate(record) {
+  return compactObject({
+    guid: record.guid,
+    indexerId: record.indexerId,
+    indexer: record.indexer,
+    title: record.title,
+    protocol: record.protocol,
+    size: record.size,
+    seeders: record.seeders,
+    leechers: record.leechers,
+    publishDate: record.publishDate,
+    categories: record.categories,
+    hasDownloadUrl: Boolean(record.downloadUrl),
+    hasMagnetUrl: Boolean(record.magnetUrl)
+  });
+}
+
+function summarizeQbitTorrent(record) {
+  return compactObject({
+    hash: record.hash,
+    name: record.name,
+    category: record.category,
+    tags: record.tags,
+    state: record.state,
+    progress: record.progress,
+    size: record.size,
+    addedOn: record.added_on ?? record.addedOn
+  });
+}
+
+function qbitAddForm(input, release) {
+  return compactObject({
+    urls: release.downloadUrl || release.magnetUrl,
+    category: input.category,
+    tags: (input.tags || []).join(","),
+    paused: input.paused ? "true" : "false",
+    skip_checking: input.skipHashCheck ? "true" : undefined,
+    savepath: input.savePath
+  });
+}
+
+async function listQbitTorrentInfo() {
+  const body = await qbitRequest("torrents/info");
+  return Array.isArray(body) ? body : [];
+}
+
+function matchAddedQbitTorrent(before, after, release, input) {
+  const beforeHashes = new Set(before.map(record => String(record.hash || "")));
+  const added = after.find(record => record.hash && !beforeHashes.has(String(record.hash)));
+  if (added) {
+    return added;
+  }
+  const category = String(input.category || "");
+  const title = String(release.title || release.guid || "").toLowerCase();
+  return after.find(record => {
+    const name = String(record.name || "").toLowerCase();
+    const recordCategory = String(record.category || "");
+    return (!category || recordCategory === category) && (!title || name.includes(title.slice(0, Math.min(title.length, 40))));
+  }) || null;
+}
+
+async function qbittorrentAddProwlarrRelease(input) {
+  const release = buildProwlarrReleasePayload(input);
+  const request = compactObject({
+    category: input.category,
+    tags: input.tags,
+    paused: input.paused,
+    skipHashCheck: input.skipHashCheck,
+    savePath: input.savePath
+  });
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      service: "qbittorrent",
+      added: false,
+      release: summarizeProwlarrReleaseCandidate(release),
+      request,
+      note: "Set dryRun to false to add this exact Prowlarr release URL to qBittorrent."
+    };
+  }
+
+  const before = await listQbitTorrentInfo();
+  const addResult = await qbitRequest("torrents/add", {
+    method: "POST",
+    form: qbitAddForm(input, release)
+  });
+  const after = await listQbitTorrentInfo();
+  const torrent = matchAddedQbitTorrent(before, after, release, input);
+  return {
+    dryRun: false,
+    service: "qbittorrent",
+    added: true,
+    release: summarizeProwlarrReleaseCandidate(release),
+    request,
+    trackedDownloadId: torrent?.hash || null,
+    torrent: torrent ? summarizeQbitTorrent(torrent) : null,
+    addResult: redactSensitiveObject(addResult),
+    note: torrent?.hash
+      ? "qBittorrent accepted the exact Prowlarr release. Use the trackedDownloadId to monitor import from Sonarr."
+      : "qBittorrent accepted the release, but no new torrent hash was visible in the immediate post-add torrent list."
+  };
+}
+
+async function sonarrGrabProwlarrRelease(input) {
+  const release = buildProwlarrReleasePayload(input);
+  const sonarrPayload = compactObject({
+    guid: input.guid ?? release.guid,
+    indexerId: input.indexerId ?? release.indexerId,
+    title: input.title ?? release.title,
+    indexer: input.indexer ?? release.indexer
+  });
+  const canTrySonarr = input.trySonarrGrab !== false && sonarrPayload.guid && sonarrPayload.indexerId;
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      service: "sonarr",
+      grabbed: false,
+      release: summarizeProwlarrReleaseCandidate(release),
+      sonarrAttempt: canTrySonarr
+        ? { wouldAttempt: true, payload: summarizeArrReleaseCandidate(sonarrPayload) }
+        : { wouldAttempt: false, reason: "release lacks guid/indexerId for Sonarr cache grab" },
+      qbittorrentFallback: await qbittorrentAddProwlarrRelease({ ...input, dryRun: true }),
+      note: "Set dryRun to false to try Sonarr first when possible, then fall back to qBittorrent with Sonarr-compatible metadata."
+    };
+  }
+
+  let sonarrError = null;
+  if (canTrySonarr) {
+    try {
+      const result = await arrApi("sonarr", "v3", "release", { method: "POST", body: sonarrPayload });
+      return {
+        dryRun: false,
+        service: "sonarr",
+        grabbed: true,
+        grabbedBy: "sonarr",
+        release: summarizeProwlarrReleaseCandidate(release),
+        result: redactSensitiveObject(result)
+      };
+    } catch (error) {
+      sonarrError = redactText(error?.message || String(error));
+    }
+  }
+
+  try {
+    const qbittorrent = await qbittorrentAddProwlarrRelease({ ...input, dryRun: false });
+    return {
+      dryRun: false,
+      service: "sonarr",
+      grabbed: qbittorrent.added,
+      grabbedBy: "qbittorrent",
+      release: summarizeProwlarrReleaseCandidate(release),
+      sonarrError,
+      qbittorrent
+    };
+  } catch (error) {
+    return {
+      dryRun: false,
+      service: "sonarr",
+      grabbed: false,
+      release: summarizeProwlarrReleaseCandidate(release),
+      sonarrError,
+      qbittorrentError: redactText(error?.message || String(error)),
+      blockers: ["Sonarr could not grab the release and qBittorrent fallback did not complete."]
+    };
+  }
 }
 
 async function arrRecentLogs(serviceName, limit) {
@@ -10383,6 +10690,24 @@ function createServer() {
     }
   }, async (input) => jsonText(await sonarrSubtitleReplacementCandidates(input)));
 
+  server.registerTool("sonarr_subtitle_replacement_candidates_async", {
+    title: "Async Sonarr Subtitle Replacement Search",
+    description: "Start or poll a longer-running asynchronous Sonarr subtitle replacement candidate search with partial results, indexer filtering, and status polling so large searches do not time out the MCP request.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      jobId: z.string().min(1).optional(),
+      episodeId: z.number().int().positive().optional(),
+      episodeIds: z.array(z.number().int().positive()).max(100).optional(),
+      requiredSubtitleLanguage: z.string().min(1).default("English"),
+      allowLanguageOnlySignal: z.boolean().default(false),
+      includeIneligible: z.boolean().default(true),
+      indexerIds: z.array(z.number().int().positive()).max(50).optional(),
+      indexers: z.array(z.string().min(1)).max(50).optional(),
+      limit: z.number().int().min(1).max(250).default(50),
+      waitMs: z.number().int().min(0).max(10000).default(0)
+    }
+  }, async (input) => jsonText(await sonarrSubtitleReplacementCandidatesAsync(input)));
+
   server.registerTool("sonarr_replace_episode_for_subtitles", {
     title: "Sonarr Replace Episode For Subtitles",
     description: "Guarded exact-release Sonarr grab for subtitle repairs. It may override equal/higher existing quality only when the candidate advertises subtitles and has no hard rejection reasons. Dry-run is enabled by default.",
@@ -10426,6 +10751,30 @@ function createServer() {
       dryRun: z.boolean().default(true)
     }
   }, async (input) => jsonText(await grabArrRelease("sonarr", input)));
+
+  server.registerTool("sonarr_grab_prowlarr_release", {
+    title: "Sonarr Release Push From Prowlarr Result",
+    description: "Repair-scoped handoff that pushes one exact Prowlarr release result into Sonarr when possible, or falls back to a Sonarr-compatible qBittorrent download-client path when Sonarr rejects the release because it is not in cache. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      protocol: z.string().min(1).optional(),
+      size: z.number().int().positive().optional(),
+      downloadUrl: z.string().min(1).optional(),
+      magnetUrl: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      trySonarrGrab: z.boolean().default(true),
+      category: z.string().min(1).default("sonarr"),
+      tags: z.array(z.string().min(1)).max(20).default(["sonarr", "media-issue-agent"]),
+      savePath: z.string().min(1).optional(),
+      paused: z.boolean().default(false),
+      skipHashCheck: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await sonarrGrabProwlarrRelease(input)));
 
   server.registerTool("sonarr_download_client_scan", {
     title: "Sonarr Download Client Scan",
@@ -10872,6 +11221,29 @@ function createServer() {
     const urlParams = new URLSearchParams(params);
     return jsonText(limitList(await qbitRequest(`torrents/info?${urlParams.toString()}`), limit));
   });
+
+  server.registerTool("qbittorrent_add_prowlarr_release", {
+    title: "Repair-Scoped Add Torrent From Prowlarr",
+    description: "Guarded qBittorrent/Prowlarr handoff that adds or queues one exact Prowlarr torrent result with Sonarr-compatible category/tag metadata and returns a tracked download ID for later Sonarr import monitoring. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      protocol: z.string().min(1).optional(),
+      size: z.number().int().positive().optional(),
+      downloadUrl: z.string().min(1).optional(),
+      magnetUrl: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      category: z.string().min(1).default("sonarr"),
+      tags: z.array(z.string().min(1)).max(20).default(["sonarr", "media-issue-agent"]),
+      savePath: z.string().min(1).optional(),
+      paused: z.boolean().default(false),
+      skipHashCheck: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await qbittorrentAddProwlarrRelease(input)));
 
   server.registerTool("qbittorrent_control_torrents", {
     title: "qBittorrent Control Torrents",
