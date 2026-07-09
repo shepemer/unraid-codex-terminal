@@ -122,6 +122,8 @@ export async function loadConfig(env = process.env, options = {}) {
     approvalBackend: env.ISSUE_AGENT_APPROVAL_BACKEND || "cli",
     discordBotToken: env.ISSUE_AGENT_DISCORD_BOT_TOKEN || "",
     discordChannelId: env.ISSUE_AGENT_DISCORD_CHANNEL_ID || "",
+    pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",
+    pushoverUserKey: env.ISSUE_AGENT_PUSHOVER_USER_KEY || "",
     codexHome: env.CODEX_HOME || "",
     codexBin: env.ISSUE_AGENT_CODEX_BIN || "codex",
     codexWorkspace: env.ISSUE_AGENT_CODEX_WORKSPACE || "/tmp/media-issue-agent-workspace",

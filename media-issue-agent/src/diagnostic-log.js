@@ -1,9 +1,12 @@
 import { once } from "node:events";
-import { appendFileSync, createReadStream, mkdirSync } from "node:fs";
+import { appendFileSync, createReadStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { redactText, sanitizeValue } from "./redact.js";
+
+export const DEFAULT_DIAGNOSTIC_LOG_MAX_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_DIAGNOSTIC_LOG_ROTATED_FILES = 4;
 
 const ensuredDirs = new Set();
 const reportedLogFailures = new Set();
@@ -41,6 +44,44 @@ export function normalizeDiagnosticLogRange(range = {}) {
   return { from, to };
 }
 
+function rotatedLogPath(logPath, index) {
+  return `${logPath}.${index}`;
+}
+
+export function diagnosticLogFiles(logPath) {
+  return [
+    ...Array.from(
+      { length: DEFAULT_DIAGNOSTIC_LOG_ROTATED_FILES },
+      (_, index) => rotatedLogPath(logPath, DEFAULT_DIAGNOSTIC_LOG_ROTATED_FILES - index)
+    ),
+    logPath
+  ].filter(file => existsSync(file));
+}
+
+export function rotateDiagnosticLogIfNeeded(logPath, incomingBytes = 0, options = {}) {
+  const maxBytes = Number(options.maxBytes || DEFAULT_DIAGNOSTIC_LOG_MAX_BYTES);
+  const rotatedFiles = Number(options.rotatedFiles || DEFAULT_DIAGNOSTIC_LOG_ROTATED_FILES);
+  if (!logPath || maxBytes <= 0 || rotatedFiles <= 0 || !existsSync(logPath)) {
+    return false;
+  }
+  const currentSize = statSync(logPath).size;
+  if (currentSize + Number(incomingBytes || 0) <= maxBytes) {
+    return false;
+  }
+  const oldest = rotatedLogPath(logPath, rotatedFiles);
+  if (existsSync(oldest)) {
+    unlinkSync(oldest);
+  }
+  for (let index = rotatedFiles - 1; index >= 1; index -= 1) {
+    const from = rotatedLogPath(logPath, index);
+    if (existsSync(from)) {
+      renameSync(from, rotatedLogPath(logPath, index + 1));
+    }
+  }
+  renameSync(logPath, rotatedLogPath(logPath, 1));
+  return true;
+}
+
 export function appendDiagnosticLog(logPath, level, event, payload = {}, options = {}) {
   if (!logPath) {
     return null;
@@ -52,7 +93,9 @@ export function appendDiagnosticLog(logPath, level, event, payload = {}, options
     payload: sanitizeValue(payload)
   };
   ensureLogDir(logPath);
-  appendFileSync(logPath, `${JSON.stringify(record)}\n`, "utf8");
+  const line = `${JSON.stringify(record)}\n`;
+  rotateDiagnosticLogIfNeeded(logPath, Buffer.byteLength(line), options);
+  appendFileSync(logPath, line, "utf8");
   return record;
 }
 
@@ -96,20 +139,22 @@ export async function streamDiagnosticLog(logPath, range = {}, writable) {
     return;
   }
   const { from, to } = normalizeDiagnosticLogRange(range);
-  try {
-    await access(logPath);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return;
+  for (const file of diagnosticLogFiles(logPath)) {
+    try {
+      await access(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+      throw error;
     }
-    throw error;
-  }
 
-  const input = createReadStream(logPath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (shouldIncludeLine(line, from, to)) {
-      await writeChunk(writable, `${line}\n`);
+    const input = createReadStream(file, { encoding: "utf8" });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (shouldIncludeLine(line, from, to)) {
+        await writeChunk(writable, `${line}\n`);
+      }
     }
   }
 }
@@ -123,6 +168,23 @@ export async function readDiagnosticLog(logPath, range = {}) {
     }
   });
   return text;
+}
+
+export async function readDiagnosticLogRecords(logPath, range = {}, options = {}) {
+  const text = await readDiagnosticLog(logPath, range);
+  const records = text
+    .split("\n")
+    .filter(Boolean)
+    .map(line => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  const limit = Math.max(1, Math.min(Number(options.limit || 500), 5000));
+  return records.slice(-limit);
 }
 
 function reportLogFailure(logPath, error) {

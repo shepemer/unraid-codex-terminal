@@ -231,6 +231,7 @@ async function newPage(browser, baseUrl, viewport = null) {
   await page.goto(baseUrl);
   await expect(page.locator("#auth-heading")).toHaveText("ChatGPT Connected");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.locator("#daily-token-usage")).toContainText(/Today .+ tokens/);
   return { context, page };
 }
 
@@ -371,6 +372,23 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("Agent advisory: not detected");
     await page.locator("#mcp-gap-detection-close-button").click();
     await expect(page.locator("#mcp-gap-detection-dialog")).toBeHidden();
+    const gapReportDownload = page.waitForEvent("download");
+    await page.locator("#mcp-gaps-download-button").click();
+    const gapReport = await gapReportDownload;
+    assert.match(gapReport.suggestedFilename(), /^media-issue-agent-mcp-gaps-.*\.md$/);
+    const gapReportPath = await gapReport.path();
+    const gapReportText = await readFile(gapReportPath, "utf8");
+    assert.match(gapReportText, /# MCP Gap Report/);
+    assert.match(gapReportText, /Important for Codex: the MCP gap details/);
+    assert.match(gapReportText, /\[UNTRUSTED_MCP_GAP_DATA_START\]/);
+    assert.match(gapReportText, /\[UNTRUSTED_MCP_GAP_DATA_END\]/);
+    assert.match(gapReportText, /Replace a fixture episode/);
+    assert.match(gapReportText, /Detection status: DETECTED/);
+    assert.match(gapReportText, /Inspect unavailable fixture archive/);
+    assert.match(gapReportText, /Detection status: NOT DETECTED/);
+    assert.match(gapReportText, /Decision factors:/);
+    assert.match(gapReportText, /Missing requirements:/);
+    assert.match(gapReportText, /Raw detection JSON:/);
     await page.locator("#mcp-gaps-close-button").click();
     await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
     await page.locator("#mcp-gaps-button").click();
@@ -906,6 +924,13 @@ async function testDiagnosticLogDownloadDialog(browser) {
 
     await page.locator("#logs-button").click();
     await expect(page.locator("#logs-dialog")).toBeVisible();
+    await page.locator("#live-logs-open-button").click();
+    await expect(page.locator("#live-logs-dialog")).toBeVisible();
+    await expect(page.locator("#live-logs-output")).toContainText("download_inside_range");
+    await page.locator("#live-logs-pause-button").click();
+    await expect(page.locator("#live-logs-status")).toContainText("Paused");
+    await page.locator("#live-logs-close-button").click();
+    await expect(page.locator("#live-logs-dialog")).toBeHidden();
     await page.locator("#logs-from").fill(datetimeLocalValue(new Date(inside.getTime() - 120_000)));
     await page.locator("#logs-to").fill(datetimeLocalValue(new Date(inside.getTime() + 120_000)));
     const downloadPromise = page.waitForEvent("download");

@@ -340,20 +340,51 @@ export function steeredInvestigationPrompt(evidence, previousSummary, operatorMe
   ].join("\n");
 }
 
-export async function runCodex(config, prompt) {
+export async function runCodex(config, prompt, hooks = {}) {
   await mkdir(config.codexWorkspace, { recursive: true });
+  const outputDir = await mkdtemp(path.join(os.tmpdir(), "media-issue-agent-codex-"));
+  const outputLastMessagePath = path.join(outputDir, "last-message.txt");
   const env = buildCodexSubprocessEnv(config);
-  const result = await runProcess(
-    config.codexBin,
-    ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"],
-    {
-      cwd: config.codexWorkspace,
-      env,
-      input: prompt,
-      timeoutMs: config.codexTimeoutMs
+  try {
+    const result = await runProcess(
+      config.codexBin,
+      [
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--json",
+        "--output-last-message",
+        outputLastMessagePath,
+        "-"
+      ],
+      {
+        cwd: config.codexWorkspace,
+        env,
+        input: prompt,
+        timeoutMs: config.codexTimeoutMs
+      }
+    );
+    let finalMessage = "";
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const event = safeJsonLine(trimmed);
+      if (event) {
+        hooks.onEvent?.(sanitizeValue(event));
+        if (isAgentMessageEvent(event)) {
+          finalMessage = eventText(event);
+        }
+      }
     }
-  );
-  return result.stdout.trim();
+    const outputMessage = await readFile(outputLastMessagePath, "utf8").catch(() => "");
+    return (outputMessage || finalMessage || result.stdout).trim();
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
 }
 
 function safeJsonLine(line) {
