@@ -83,7 +83,7 @@ For full configuration, validation, local development, and security notes, see [
    - a persistent `CODEX_HOME` mount containing Codex ChatGPT auth
    - strong `ISSUE_AGENT_WEB_PASSWORD`
 
-   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`; use the Web UI Codex Auth panel or run Codex login with ChatGPT auth instead. Approved server-side fixes run as autonomous Codex repair prompts with direct `media-mcp` access, live tool discovery, optional non-secret repair context, and per-job scratch workspaces, then return to the Web UI for final resolution-comment approval.
+   The issue agent refuses `OPENAI_API_KEY` and `CODEX_API_KEY`; use the Web UI Codex Auth panel or run Codex login with ChatGPT auth instead. Approved server-side fixes run as autonomous Codex repair prompts with direct `media-mcp` access, live tool discovery, optional non-secret repair context, and per-job scratch workspaces, then return to the Web UI for final resolution-comment approval. To receive Pushover notifications for newly detected open issues, set `ISSUE_AGENT_PUSHOVER_APP_TOKEN` and `ISSUE_AGENT_PUSHOVER_USER_KEY`.
 
 Do not publish host ports for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. Only SSH, the Codex terminal WebUI, and the password-protected media issue agent WebUI should be reachable from your LAN, VPN, or Tailscale.
 

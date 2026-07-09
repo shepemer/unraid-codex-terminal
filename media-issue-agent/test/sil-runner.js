@@ -306,7 +306,7 @@ async function createFakeCodexBin(root, logPath) {
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
-    "if (process.argv.includes('--json') || prompt.includes('Autonomous approved media repair execution')) kind = 'repair-execution';",
+    "if (prompt.includes('Autonomous approved media repair execution')) kind = 'repair-execution';",
     "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",

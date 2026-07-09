@@ -42,4 +42,6 @@
   <Config Name="WebUI Port Env" Target="ISSUE_AGENT_WEB_PORT" Default="6983" Mode="" Description="Container port for the built-in Web UI." Type="Variable" Display="advanced" Required="true" Mask="false">6983</Config>
   <Config Name="Discord Bot Token" Target="ISSUE_AGENT_DISCORD_BOT_TOKEN" Default="" Mode="" Description="Optional Discord bot token for approval notifications." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Discord Channel ID" Target="ISSUE_AGENT_DISCORD_CHANNEL_ID" Default="" Mode="" Description="Optional Discord channel ID for approval notifications." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Pushover App Token" Target="ISSUE_AGENT_PUSHOVER_APP_TOKEN" Default="" Mode="" Description="Optional Pushover application API token. When paired with a user key, the agent sends a notification when newly open issues are detected." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Pushover User Key" Target="ISSUE_AGENT_PUSHOVER_USER_KEY" Default="" Mode="" Description="Optional Pushover user or group key for newly open issue notifications." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 </Container>

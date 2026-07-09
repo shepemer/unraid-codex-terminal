@@ -12,6 +12,7 @@ import {
   initDb,
   insertSnapshot,
   investigationForJob,
+  issueLogRecords,
   jobDetails as readJobDetails,
   jobForId,
   latestSnapshot,
@@ -23,6 +24,9 @@ import {
   pruneSnapshots,
   recordAgentRunEvent,
   recordAudit,
+  recordIssueLogEvent,
+  extractTokenUsageFromCodexEvent,
+  recordTokenUsageEvent,
   recoverInterruptedAgentRuns,
   setPendingApprovals,
   setJobState,
@@ -43,9 +47,20 @@ import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
 import { createDiagnosticLogger } from "./diagnostic-log.js";
+import { pushoverConfigured, sendPushoverMessage } from "./pushover.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export const STARTUP_FOLLOW_UP_POLL_SECONDS = 60;
+
+export function pollLoopDelaySecondsAfterAttempt(attemptNumber, pollIntervalSeconds) {
+  const interval = Math.max(1, Number(pollIntervalSeconds || 1));
+  if (attemptNumber === 1) {
+    return Math.min(interval, STARTUP_FOLLOW_UP_POLL_SECONDS);
+  }
+  return interval;
 }
 
 function isInterruptedPollError(error) {
@@ -1218,6 +1233,103 @@ function entryIsClosed(entry) {
   return entry?.jobState === "closed";
 }
 
+function issueIdentity(entry) {
+  return `${String(entry?.source || "").toLowerCase()}\0${String(entry?.issueId ?? entry?.id ?? "")}`;
+}
+
+function issueRefKey(ref) {
+  return `${String(ref.source || "").toLowerCase()}\0${String(ref.issueId ?? "")}`;
+}
+
+function collectIssueRefsFromValue(value, refs = new Map()) {
+  if (!value || typeof value !== "object") {
+    return refs;
+  }
+  if (Array.isArray(value)) {
+    value.forEach(item => collectIssueRefsFromValue(item, refs));
+    return refs;
+  }
+  const source = typeof value.source === "string" ? value.source : "";
+  const issueId = value.issueId ?? value.id;
+  if (source && issueId !== undefined && issueId !== null) {
+    const ref = { source, issueId: String(issueId) };
+    refs.set(issueRefKey(ref), ref);
+  }
+  for (const nested of Object.values(value)) {
+    collectIssueRefsFromValue(nested, refs);
+  }
+  return refs;
+}
+
+function lastSnapshotEntriesByIssue(dbPath) {
+  const snapshot = latestSnapshot(dbPath);
+  if (!snapshot) {
+    return new Map();
+  }
+  return new Map(snapshotEntries(dbPath, snapshot.id).map(entry => [issueIdentity(entry), entry]));
+}
+
+function preserveLastKnownLifecycleForDetailFailures(issues, previousEntries) {
+  if (!previousEntries.size) {
+    return { issues, preserved: [] };
+  }
+  const preserved = [];
+  const reconciled = issues.map(issue => {
+    if (!issue.detailUnavailable || issue.isClosed) {
+      return issue;
+    }
+    const previous = previousEntries.get(issueIdentity(issue));
+    if (!previous) {
+      return issue;
+    }
+    const closed = entryIsClosed(previous);
+    const lifecycle = closed ? "closed" : "open";
+    const status = closed ? "closed" : "open";
+    preserved.push({
+      source: issue.source,
+      issueId: issue.issueId,
+      status,
+      previousSnapshotId: previous.snapshotId
+    });
+    return {
+      ...issue,
+      status,
+      lifecycle,
+      isClosed: closed,
+      raw: {
+        ...(issue.raw || {}),
+        status,
+        lifecycle,
+        isClosed: closed,
+        detailLifecyclePreserved: true,
+        previousLifecycleSnapshotId: previous.snapshotId
+      }
+    };
+  });
+  return { issues: reconciled, preserved };
+}
+
+function newlyOpenIssues(issues, previousEntries) {
+  return issues.filter(issue => {
+    if (issue.isClosed) {
+      return false;
+    }
+    const previous = previousEntries.get(issueIdentity(issue));
+    return !previous || entryIsClosed(previous);
+  });
+}
+
+function sortIssueQueue(issues) {
+  return issues.toSorted((left, right) => {
+    if (left.isClosed !== right.isClosed) {
+      return left.isClosed ? 1 : -1;
+    }
+    const leftDate = left.updatedAt || left.createdAt || left.date || "";
+    const rightDate = right.updatedAt || right.createdAt || right.date || "";
+    return rightDate.localeCompare(leftDate);
+  });
+}
+
 function supersedeAllPendingApprovals(dbPath, jobId) {
   supersedePendingApprovals(dbPath, jobId, "action");
   supersedePendingApprovals(dbPath, jobId, "resolution");
@@ -1235,15 +1347,84 @@ function commentSummary(comments) {
 }
 
 export class MediaIssueAgent {
-  constructor(config, client = new MediaMcpClient(config)) {
+  constructor(config, client = new MediaMcpClient(config), options = {}) {
     this.config = config;
     this.client = client;
+    this.fetch = options.fetch || globalThis.fetch;
     this.initPromise = null;
     this.diagnosticLogger = createDiagnosticLogger(config);
   }
 
   diagnostic(level, event, payload = {}) {
-    return this.diagnosticLogger.log(level, event, payload);
+    const record = this.diagnosticLogger.log(level, event, payload);
+    if (record) {
+      this.persistIssueDiagnostic(record);
+    }
+    return record;
+  }
+
+  recordCodexTokenUsage(event, context = {}) {
+    const usage = extractTokenUsageFromCodexEvent(event);
+    if (!usage) {
+      return null;
+    }
+    const recorded = recordTokenUsageEvent(this.config.dbPath, {
+      jobId: context.jobId,
+      agentRunId: context.agentRunId,
+      source: context.source || event?.type || "codex",
+      model: context.model || context.settings?.model || this.codexSettings().effective.model,
+      usage
+    });
+    this.diagnostic("info", "codex_token_usage_recorded", {
+      jobId: context.jobId || null,
+      runId: context.agentRunId || null,
+      source: recorded.source,
+      model: recorded.model || null,
+      totalTokens: recorded.totalTokens,
+      inputTokens: recorded.inputTokens,
+      cachedInputTokens: recorded.cachedInputTokens,
+      outputTokens: recorded.outputTokens,
+      reasoningOutputTokens: recorded.reasoningOutputTokens
+    });
+    return recorded;
+  }
+
+  persistIssueDiagnostic(record) {
+    try {
+      const refs = collectIssueRefsFromValue(record.payload);
+      const jobIds = new Set();
+      const visit = value => {
+        if (!value || typeof value !== "object") return;
+        if (Array.isArray(value)) {
+          value.forEach(visit);
+          return;
+        }
+        if (value.jobId !== undefined && value.jobId !== null) {
+          jobIds.add(Number(value.jobId));
+        }
+        Object.values(value).forEach(visit);
+      };
+      visit(record.payload);
+      for (const jobId of jobIds) {
+        if (!Number.isInteger(jobId) || jobId <= 0) {
+          continue;
+        }
+        const job = jobForId(this.config.dbPath, jobId);
+        if (job) {
+          refs.set(issueRefKey(job), { source: job.source, issueId: job.issueId, jobId: job.id });
+        }
+      }
+      for (const ref of refs.values()) {
+        recordIssueLogEvent(this.config.dbPath, {
+          jobId: ref.jobId || null,
+          source: ref.source,
+          issueId: ref.issueId,
+          record
+        });
+      }
+    } catch {
+      // Diagnostic persistence must never break the main workflow.
+    }
   }
 
   async init() {
@@ -1280,14 +1461,27 @@ export class MediaIssueAgent {
       verbose: false
     });
     const records = Array.isArray(listed?.records) ? listed.records : [];
+    const previousEntries = lastSnapshotEntriesByIssue(this.config.dbPath);
     const detailFailures = [];
-    const issues = await issueQueue(records, this.client, {
+    const queuedIssues = await issueQueue(records, this.client, {
       onDetailError: failure => detailFailures.push(failure)
     });
+    const reconciled = preserveLastKnownLifecycleForDetailFailures(
+      queuedIssues,
+      previousEntries
+    );
+    const issues = sortIssueQueue(reconciled.issues);
+    const notificationIssues = newlyOpenIssues(issues, previousEntries);
     if (detailFailures.length) {
       this.diagnostic("warn", "poll_issue_detail_failures", {
         count: detailFailures.length,
         failures: detailFailures.slice(0, 20)
+      });
+    }
+    if (reconciled.preserved.length) {
+      this.diagnostic("warn", "poll_issue_detail_lifecycle_preserved", {
+        count: reconciled.preserved.length,
+        issues: reconciled.preserved.slice(0, 20)
       });
     }
     const markdown = issueTableMarkdown(issues);
@@ -1302,6 +1496,7 @@ export class MediaIssueAgent {
       }
       recordAudit(this.config.dbPath, "issue_seen", sanitizeValue(issue), job.id);
     }
+    await this.notifyNewOpenIssues(notificationIssues, snapshot.id);
     this.diagnostic("info", "poll_completed", {
       snapshotId: snapshot.id,
       issueCount: issues.length,
@@ -1317,6 +1512,47 @@ export class MediaIssueAgent {
       detailFailureCount: detailFailures.length,
       markdown
     };
+  }
+
+  async notifyNewOpenIssues(issues, snapshotId) {
+    if (!issues.length || !pushoverConfigured(this.config)) {
+      return;
+    }
+    this.diagnostic("info", "new_open_issue_notifications_started", {
+      backend: "pushover",
+      snapshotId,
+      issueCount: issues.length
+    });
+    let sentCount = 0;
+    let failedCount = 0;
+    for (const issue of issues) {
+      try {
+        await sendPushoverMessage(this.config, issue, this.fetch);
+        sentCount += 1;
+        this.diagnostic("info", "new_open_issue_notification_sent", {
+          backend: "pushover",
+          snapshotId,
+          source: issue.source,
+          issueId: issue.issueId
+        });
+      } catch (error) {
+        failedCount += 1;
+        this.diagnostic("warn", "new_open_issue_notification_failed", {
+          backend: "pushover",
+          snapshotId,
+          source: issue.source,
+          issueId: issue.issueId,
+          error: error.message
+        });
+      }
+    }
+    this.diagnostic("info", "new_open_issue_notifications_completed", {
+      backend: "pushover",
+      snapshotId,
+      issueCount: issues.length,
+      sentCount,
+      failedCount
+    });
   }
 
   latest() {
@@ -1370,7 +1606,13 @@ export class MediaIssueAgent {
     const settings = this.codexSettings().effective;
     try {
       output = await runCodexMcpCapabilityCheck(this.config, items, tools, settings, {
-        onEvent: event => this.diagnostic("debug", "missing_mcp_capability_agent_event", { event })
+        onEvent: event => {
+          this.recordCodexTokenUsage(event, {
+            source: "mcp_capability_check",
+            settings
+          });
+          this.diagnostic("debug", "missing_mcp_capability_agent_event", { event });
+        }
       });
       parsed = parseMcpCapabilityCheckResult(output.finalMessage, items, tools);
     } catch (error) {
@@ -1535,6 +1777,19 @@ export class MediaIssueAgent {
     };
   }
 
+  async issueLogs(snapshotId, index) {
+    await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) {
+      throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
+    }
+    return {
+      source: entry.source,
+      issueId: entry.issueId,
+      records: issueLogRecords(this.config.dbPath, entry.source, entry.issueId)
+    };
+  }
+
   async runIssueActions(jobId, actions, auditPrefix, actor) {
     const results = [];
     for (const action of actions) {
@@ -1666,7 +1921,12 @@ export class MediaIssueAgent {
     let summary;
     try {
       this.diagnostic("info", "codex_investigation_started", { jobId: job.id });
-      summary = await runCodex(this.config, investigationPrompt(evidence));
+      summary = await runCodex(this.config, investigationPrompt(evidence), {
+        onEvent: event => this.recordCodexTokenUsage(event, {
+          jobId: job.id,
+          source: "investigation"
+        })
+      });
       this.diagnostic("info", "codex_investigation_completed", {
         jobId: job.id,
         summaryLength: summary.length
@@ -1758,7 +2018,12 @@ export class MediaIssueAgent {
     let summary;
     try {
       this.diagnostic("info", "codex_steered_investigation_started", { jobId });
-      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage));
+      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage), {
+        onEvent: event => this.recordCodexTokenUsage(event, {
+          jobId,
+          source: "steered_investigation"
+        })
+      });
       this.diagnostic("info", "codex_steered_investigation_completed", {
         jobId,
         summaryLength: summary.length
@@ -2094,6 +2359,12 @@ export class MediaIssueAgent {
         codexWorkspace: workspace,
         onEvent: event => {
           const eventType = event?.type || "event";
+          this.recordCodexTokenUsage(event, {
+            jobId,
+            agentRunId: agentRun.id,
+            source: "repair",
+            settings
+          });
           recordAgentRunEvent(this.config.dbPath, agentRun.id, jobId, eventType, sanitizeValue(compactAgentRunEventForStorage(event)));
           this.diagnostic("debug", "repair_agent_event", {
             jobId,
@@ -2239,7 +2510,13 @@ export class MediaIssueAgent {
     let draft = executionResult?.draftComment;
     if (!draft) {
       try {
-        draft = await runCodex(this.config, commentDraftPrompt(evidence));
+        draft = await runCodex(this.config, commentDraftPrompt(evidence), {
+          onEvent: event => this.recordCodexTokenUsage(event, {
+            jobId,
+            agentRunId: executionResult?.agentRunId,
+            source: "comment_draft"
+          })
+        });
       } catch (error) {
         this.diagnostic("error", "codex_comment_draft_failed", {
           jobId,
@@ -2394,8 +2671,15 @@ export class MediaIssueAgent {
 
   async pollLoop(log = console.error) {
     await this.init();
-    this.diagnostic("info", "poll_loop_started", { pollIntervalSeconds: this.config.pollIntervalSeconds });
+    this.diagnostic("info", "poll_loop_started", {
+      pollIntervalSeconds: this.config.pollIntervalSeconds,
+      startupFollowUpPollSeconds: Math.min(
+        Math.max(1, Number(this.config.pollIntervalSeconds || 1)),
+        STARTUP_FOLLOW_UP_POLL_SECONDS
+      )
+    });
     log(`${new Date().toISOString()} media-issue-agent: starting poll loop`);
+    let attemptNumber = 0;
     for (;;) {
       try {
         const result = await this.pollOnce();
@@ -2414,7 +2698,8 @@ export class MediaIssueAgent {
           log(`${new Date().toISOString()} media-issue-agent: poll failed: ${redactText(error.message)}`);
         }
       }
-      await sleep(this.config.pollIntervalSeconds * 1000);
+      attemptNumber += 1;
+      await sleep(pollLoopDelaySecondsAfterAttempt(attemptNumber, this.config.pollIntervalSeconds) * 1000);
     }
   }
 

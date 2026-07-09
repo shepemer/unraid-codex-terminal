@@ -3,23 +3,29 @@ import { mkdtemp, rm, writeFile, mkdir, chmod, readFile } from "node:fs/promises
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { MediaIssueAgent } from "../src/agent.js";
+import { MediaIssueAgent, STARTUP_FOLLOW_UP_POLL_SECONDS, pollLoopDelaySecondsAfterAttempt } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import { buildCodexSubprocessEnv, buildRepairCodexArgs, investigationPrompt, runCodexRepair, steeredInvestigationPrompt } from "../src/codex.js";
 import {
   createApproval,
   createAgentRun,
   ensureJob,
+  extractTokenUsageFromCodexEvent,
   initDb,
   insertSnapshot,
   investigationForJob,
   jobDetails,
   listJobs,
   pendingApprovalForJob,
+  pruneIssueLogEvents,
   pruneSnapshots,
+  recordIssueLogEvent,
+  recordTokenUsageEvent,
+  issueLogRecords,
   setJobState,
   snapshotEntries,
   snapshotEntry,
+  statusSummary,
   supersedePendingApprovals,
   transitionJob,
   upsertMissingMcpItems,
@@ -30,7 +36,7 @@ import { validateDraftComment, AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER 
 import { redactText, sanitizeValue } from "../src/redact.js";
 import { sqliteExec } from "../src/sqlite.js";
 import { createWebHandler } from "../src/web.js";
-import { appendDiagnosticLog, createDiagnosticLogger, readDiagnosticLog } from "../src/diagnostic-log.js";
+import { appendDiagnosticLog, createDiagnosticLogger, readDiagnosticLog, rotateDiagnosticLogIfNeeded } from "../src/diagnostic-log.js";
 
 async function tempDir() {
   return mkdtemp(path.join(os.tmpdir(), "media-issue-agent-test-"));
@@ -184,6 +190,332 @@ async function testPollOnceRecordsPartialIssueDetailFailures() {
   const diagnosticLines = (await readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   assert.equal(diagnosticLines.some(line => line.event === "poll_issue_detail_failures" && line.level === "warn"), true);
   await rm(dir, { recursive: true, force: true });
+}
+
+async function testPollOncePreservesClosedLifecycleOnTransientDetailFailure() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const logPath = path.join(dir, "agent.log");
+  const closedComments = [{ message: CLOSED_MARKER, createdAt: "2026-01-01T00:00:00Z" }];
+  try {
+    await initDb(dbPath);
+    const previousEntries = [{
+      source: "plex",
+      issueId: "plex-transient-closed",
+      date: "2026-01-02T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Closed",
+      status: "closed",
+      lifecycle: "closed",
+      isClosed: true,
+      description: "Already closed.",
+      raw: {
+        source: "plex",
+        id: "plex-transient-closed",
+        status: "closed",
+        comments: closedComments,
+        isClosed: true,
+        lifecycle: "closed"
+      }
+    }, {
+      source: "plex",
+      issueId: "plex-explicit-closed",
+      date: "2026-01-02T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Explicit Closed",
+      status: "open",
+      lifecycle: "open",
+      isClosed: false,
+      description: "Previously open.",
+      raw: {
+        source: "plex",
+        id: "plex-explicit-closed",
+        status: "open",
+        comments: [],
+        isClosed: false,
+        lifecycle: "open"
+      }
+    }];
+    insertSnapshot(dbPath, issueTableMarkdown(previousEntries), previousEntries);
+    const job = ensureJob(dbPath, "plex", "plex-transient-closed");
+    setJobState(dbPath, job.id, "closed");
+    const agent = new MediaIssueAgent({
+      dbPath,
+      logPath,
+      suppressInitLog: true,
+      recoverStaleRunSeconds: 300,
+      issueSnapshotRetention: 10
+    }, {
+      async callTool(name) {
+        if (name === "plex_reported_issues") {
+          return {
+            records: [
+              { source: "plex", id: "plex-transient-closed", status: "open", commentCount: 1, message: "Maybe already handled", updatedAt: "2026-01-03T00:00:00Z" },
+              { source: "plex", id: "plex-open", status: "open", commentCount: 0, message: "Needs triage", updatedAt: "2026-01-04T00:00:00Z" },
+              { source: "plex", id: "plex-explicit-closed", status: "resolved", commentCount: 1, message: "Source says resolved", updatedAt: "2026-01-05T00:00:00Z" }
+            ]
+          };
+        }
+        if (name === "plex_issue_details") {
+          throw new Error("media-mcp unavailable");
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    });
+    const result = await agent.pollOnce();
+    assert.equal(result.issueCount, 3);
+    assert.equal(result.openIssueCount, 1);
+    assert.equal(result.closedIssueCount, 2);
+    assert.equal(result.detailFailureCount, 3);
+    const latest = agent.latestWithEntries();
+    assert.deepEqual(latest.entries.map(entry => [entry.issueId, entry.status, entry.jobState]), [
+      ["plex-open", "open", "detected"],
+      ["plex-explicit-closed", "closed", "closed"],
+      ["plex-transient-closed", "closed", "closed"]
+    ]);
+    const closedEntry = latest.entries.find(entry => entry.issueId === "plex-transient-closed");
+    assert.equal(closedEntry.raw.detailUnavailable, true);
+    assert.equal(closedEntry.raw.detailLifecyclePreserved, true);
+    assert.equal(closedEntry.raw.lifecycle, "closed");
+    const diagnosticLines = (await readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(diagnosticLines.some(line => line.event === "poll_issue_detail_lifecycle_preserved" && line.payload.count === 1), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testPollOnceSendsPushoverForNewOpenIssuesOnly() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const logPath = path.join(dir, "agent.log");
+  let sourceStatus = "open";
+  const pushoverCalls = [];
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      logPath,
+      suppressInitLog: true,
+      recoverStaleRunSeconds: 300,
+      issueSnapshotRetention: 10,
+      pushoverAppToken: "app-token-fixture",
+      pushoverUserKey: "user-key-fixture"
+    }, {
+      async callTool(name) {
+        if (name === "plex_reported_issues") {
+          return {
+            records: [{
+              source: "plex",
+              id: "plex-new-open",
+              status: sourceStatus,
+              commentCount: 0,
+              comments: [],
+              message: "New open issue",
+              mediaTitle: "Fixture Media",
+              reporter: "Fixture Reporter",
+              updatedAt: "2026-01-04T00:00:00Z"
+            }]
+          };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    }, {
+      async fetch(url, options) {
+        pushoverCalls.push({
+          url,
+          body: Object.fromEntries(new URLSearchParams(String(options.body)))
+        });
+        return { ok: true, status: 200, async text() { return "{}"; } };
+      }
+    });
+
+    let result = await agent.pollOnce();
+    assert.equal(result.openIssueCount, 1);
+    assert.equal(pushoverCalls.length, 1);
+    assert.equal(pushoverCalls[0].body.token, "app-token-fixture");
+    assert.equal(pushoverCalls[0].body.user, "user-key-fixture");
+    assert.match(pushoverCalls[0].body.message, /Fixture Media/);
+    assert.deepEqual(Object.keys(pushoverCalls[0].body).sort(), ["message", "title", "token", "user"]);
+
+    result = await agent.pollOnce();
+    assert.equal(result.openIssueCount, 1);
+    assert.equal(pushoverCalls.length, 1);
+
+    sourceStatus = "resolved";
+    result = await agent.pollOnce();
+    assert.equal(result.openIssueCount, 0);
+    assert.equal(pushoverCalls.length, 1);
+
+    sourceStatus = "open";
+    result = await agent.pollOnce();
+    assert.equal(result.openIssueCount, 1);
+    assert.equal(pushoverCalls.length, 2);
+
+    const diagnosticLines = (await readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(diagnosticLines.filter(line => line.event === "new_open_issue_notification_sent").length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testPushoverFailureDoesNotFailPolling() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const logPath = path.join(dir, "agent.log");
+  try {
+    const agent = new MediaIssueAgent({
+      dbPath,
+      logPath,
+      suppressInitLog: true,
+      recoverStaleRunSeconds: 300,
+      issueSnapshotRetention: 10,
+      pushoverAppToken: "app-token-fixture",
+      pushoverUserKey: "user-key-fixture"
+    }, {
+      async callTool(name) {
+        if (name === "plex_reported_issues") {
+          return {
+            records: [{
+              source: "plex",
+              id: "plex-notify-failure",
+              status: "open",
+              commentCount: 0,
+              message: "Open issue",
+              mediaTitle: "Fixture Media",
+              reporter: "Fixture Reporter",
+              updatedAt: "2026-01-04T00:00:00Z"
+            }]
+          };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    }, {
+      async fetch() {
+        return {
+          ok: false,
+          status: 500,
+          async text() {
+            return "token=fixture-secret https://pushover.example.invalid";
+          }
+        };
+      }
+    });
+    const result = await agent.pollOnce();
+    assert.equal(result.openIssueCount, 1);
+    const diagnosticLines = (await readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const failure = diagnosticLines.find(line => line.event === "new_open_issue_notification_failed");
+    assert.equal(Boolean(failure), true);
+    assert.doesNotMatch(failure.payload.error, /fixture-secret|pushover\.example/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testDiagnosticLogRotationStreamsRotatedFiles() {
+  const dir = await tempDir();
+  const logPath = path.join(dir, "agent.log");
+  try {
+    appendDiagnosticLog(logPath, "info", "old_event", { message: "old" }, {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      maxBytes: 180,
+      rotatedFiles: 2
+    });
+    rotateDiagnosticLogIfNeeded(logPath, 10_000, { maxBytes: 180, rotatedFiles: 2 });
+    appendDiagnosticLog(logPath, "info", "new_event", { message: "new" }, {
+      timestamp: "2026-01-01T00:01:00.000Z",
+      maxBytes: 180,
+      rotatedFiles: 2
+    });
+    const text = await readDiagnosticLog(logPath);
+    assert.match(text, /old_event/);
+    assert.match(text, /new_event/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testIssueDiagnosticLogsPersistByIssue() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const logPath = path.join(dir, "agent.log");
+  try {
+    await initDb(dbPath);
+    const entries = [{
+      source: "plex",
+      issueId: "plex-log-fixture",
+      date: "2026-01-01T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Fixture Media",
+      status: "open",
+      description: "Needs logs.",
+      raw: { source: "plex", id: "plex-log-fixture", status: "open", comments: [] }
+    }];
+    const snapshot = insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+    const job = ensureJob(dbPath, "plex", "plex-log-fixture");
+    const agent = new MediaIssueAgent({
+      dbPath,
+      logPath,
+      suppressInitLog: true,
+      recoverStaleRunSeconds: 300
+    }, {
+      async callTool(name) {
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    });
+    await agent.init();
+    agent.diagnostic("info", "fixture_job_event", {
+      jobId: job.id,
+      message: "Relevant job log"
+    });
+    agent.diagnostic("warn", "fixture_issue_event", {
+      failures: [{ source: "plex", issueId: "plex-log-fixture", error: "Relevant issue log" }]
+    });
+    agent.diagnostic("info", "fixture_other_event", {
+      source: "plex",
+      issueId: "other-issue",
+      message: "Not relevant"
+    });
+
+    const result = await agent.issueLogs(snapshot.id, 1);
+    assert.equal(result.source, "plex");
+    assert.equal(result.issueId, "plex-log-fixture");
+    assert.deepEqual(result.records.map(record => record.event), ["fixture_job_event", "fixture_issue_event"]);
+    assert.equal(result.records.some(record => JSON.stringify(record).includes("Not relevant")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testIssueDiagnosticLogRetentionCanPruneOldRows() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    for (let index = 1; index <= 4; index += 1) {
+      recordIssueLogEvent(dbPath, {
+        source: "plex",
+        issueId: "plex-retention-fixture",
+        record: {
+          timestamp: `2026-01-01T00:00:0${index}.000Z`,
+          level: "info",
+          event: `retention_event_${index}`,
+          payload: { source: "plex", issueId: "plex-retention-fixture" }
+        }
+      });
+    }
+    pruneIssueLogEvents(dbPath, 2);
+    assert.deepEqual(
+      issueLogRecords(dbPath, "plex", "plex-retention-fixture").map(record => record.event),
+      ["retention_event_3", "retention_event_4"]
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function testPollLoopSchedulesStartupFollowUp() {
+  assert.equal(pollLoopDelaySecondsAfterAttempt(1, 300), STARTUP_FOLLOW_UP_POLL_SECONDS);
+  assert.equal(pollLoopDelaySecondsAfterAttempt(2, 300), 300);
+  assert.equal(pollLoopDelaySecondsAfterAttempt(1, 30), 30);
 }
 
 async function testTableAndSnapshotMapping() {
@@ -374,7 +706,7 @@ async function testSubtitleServerActionPlanExecutesRepair() {
     "args=\"$*\"",
     "prompt=\"$(cat)\"",
     "case \"$args:$prompt\" in",
-    "  *\"--json\"*)",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"mcp_tool_call\",\"name\":\"media.bazarr_download_movie_subtitles_for_plex\",\"status\":\"completed\"}}'",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"mcp_tool_call\",\"name\":\"media.plex_verify_subtitle_track\",\"status\":\"completed\"}}'",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"fixed\\\",\\\"summary\\\":\\\"Downloaded Korean subtitles, refreshed Plex, and verified the Korean subtitle track is visible.\\\",\\\"actionsTaken\\\":[\\\"Downloaded Korean subtitles through media-mcp.\\\",\\\"Refreshed Plex metadata for rating key 900001.\\\",\\\"Verified a Korean subtitle track is present.\\\"],\\\"verification\\\":{\\\"status\\\":\\\"passed\\\",\\\"details\\\":\\\"Korean subtitle track found on Plex item 900001.\\\"},\\\"draftComment\\\":\\\"Added Korean subtitles and verified they are available in Plex. Please restart playback if they do not appear immediately. Automated response from Codex.\\\",\\\"closeRecommended\\\":true}\"}}'",
@@ -560,9 +892,9 @@ async function testSuccessfulRepairRecoversStaleRetryableState() {
     "#!/usr/bin/env node",
     "import { spawnSync } from 'node:child_process';",
     "import { readFileSync } from 'node:fs';",
-    "readFileSync(0, 'utf8');",
+    "const prompt = readFileSync(0, 'utf8');",
     `const dbPath = ${JSON.stringify(dbPath)};`,
-    "if (process.argv.includes('--json')) {",
+    "if (prompt.includes('Autonomous approved media repair execution')) {",
     "  const update = spawnSync('sqlite3', [dbPath, \"UPDATE jobs SET state = 'failed_retryable', last_error = 'stale retry marker' WHERE state = 'executing';\"], { encoding: 'utf8' });",
     "  if (update.status !== 0) {",
     "    process.stderr.write(update.stderr || update.stdout || 'sqlite update failed');",
@@ -648,7 +980,7 @@ async function testRepairRunnerRejectsOwnerDelegation() {
     "args=\"$*\"",
     "prompt=\"$(cat)\"",
     "case \"$args:$prompt\" in",
-    "  *\"--json\"*)",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"fixed\\\",\\\"summary\\\":\\\"Server owner should replace the episode manually.\\\",\\\"actionsTaken\\\":[\\\"Inspected the bad file but did not repair it.\\\"],\\\"verification\\\":{\\\"status\\\":\\\"passed\\\",\\\"details\\\":\\\"The bad file was identified.\\\"},\\\"draftComment\\\":\\\"Server owner: replace this file manually. Automated response from Codex.\\\",\\\"closeRecommended\\\":true}\"}}'",
     "    ;;",
     "  *)",
@@ -730,7 +1062,7 @@ async function testRepairRunnerInvalidJsonFailsWithoutResolution() {
     "args=\"$*\"",
     "prompt=\"$(cat)\"",
     "case \"$args:$prompt\" in",
-    "  *\"--json\"*)",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"not json\"}}'",
     "    ;;",
     "  *)",
@@ -823,9 +1155,9 @@ async function testRepairRunnerRecordsMissingMcpItems() {
   await writeFile(codexBin, [
     "#!/bin/sh",
     "args=\"$*\"",
-    "cat >/dev/null",
-    "case \"$args\" in",
-    "  *\"--json\"*)",
+    "prompt=\"$(cat)\"",
+    "case \"$args:$prompt\" in",
+    "  *\"Autonomous approved media repair execution\"*)",
     `    printf '%s\\n' ${JSON.stringify(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(finalResult) } }))}`,
     "    ;;",
     "  *)",
@@ -1202,10 +1534,10 @@ async function testRepairRunnerNeedsOperatorDecisionCanRetryWithNote() {
     "args=\"$*\"",
     "prompt=\"$(cat)\"",
     "case \"$args:$prompt\" in",
-    "  *\"--json\"*\"Use replacement option\"*)",
+    "  *\"Autonomous approved media repair execution\"*\"Use replacement option\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"fixed\\\",\\\"summary\\\":\\\"Replaced the bad episode and verified playback metadata.\\\",\\\"actionsTaken\\\":[\\\"Replaced the bad episode using media-mcp.\\\",\\\"Refreshed Plex metadata.\\\"],\\\"verification\\\":{\\\"status\\\":\\\"passed\\\",\\\"details\\\":\\\"Replacement is visible and metadata refreshed.\\\"},\\\"draftComment\\\":\\\"Replaced the bad episode copy and refreshed Plex. Automated response from Codex.\\\",\\\"closeRecommended\\\":true}\"}}'",
     "    ;;",
-    "  *\"--json\"*)",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"needs_operator_decision\\\",\\\"summary\\\":\\\"Two risky repairs are valid; choose one before proceeding.\\\",\\\"actionsTaken\\\":[],\\\"verification\\\":{\\\"status\\\":\\\"not_applicable\\\",\\\"details\\\":\\\"No repair was run before operator choice.\\\"},\\\"draftComment\\\":\\\"\\\",\\\"closeRecommended\\\":false,\\\"proposedChoices\\\":[\\\"Replace episode\\\",\\\"Refresh only\\\"]}\"}}'",
     "    ;;",
     "  *)",
@@ -1569,7 +1901,7 @@ async function testRepairRunnerUnverifiedFixedFailsWithoutResolution() {
     "args=\"$*\"",
     "prompt=\"$(cat)\"",
     "case \"$args:$prompt\" in",
-    "  *\"--json\"*)",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"fixed\\\",\\\"summary\\\":\\\"Claimed a fix without verification.\\\",\\\"actionsTaken\\\":[\\\"Attempted a repair.\\\"],\\\"verification\\\":{\\\"status\\\":\\\"failed\\\",\\\"details\\\":\\\"Verification did not pass.\\\"},\\\"draftComment\\\":\\\"Fixed this fixture. Automated response from Codex.\\\",\\\"closeRecommended\\\":true}\"}}'",
     "    ;;",
     "  *)",
@@ -1644,9 +1976,9 @@ async function testRepairResultWithoutCloseRecommendationPostsCommentOnly() {
   await writeFile(codexBin, [
     "#!/bin/sh",
     "args=\"$*\"",
-    "cat >/dev/null",
-    "case \"$args\" in",
-    "  *\"--json\"*)",
+    "prompt=\"$(cat)\"",
+    "case \"$args:$prompt\" in",
+    "  *\"Autonomous approved media repair execution\"*)",
     "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"partially_fixed\\\",\\\"summary\\\":\\\"Applied a partial repair but more observation is needed.\\\",\\\"actionsTaken\\\":[\\\"Restarted the managed media workflow.\\\"],\\\"verification\\\":{\\\"status\\\":\\\"passed\\\",\\\"details\\\":\\\"Workflow accepted the request, but closure is not recommended yet.\\\"},\\\"draftComment\\\":\\\"Applied a partial repair and will keep this open for follow-up. Automated response from Codex.\\\",\\\"closeRecommended\\\":false}\"}}'",
     "    ;;",
     "  *)",
@@ -2216,6 +2548,63 @@ async function testStateTransitions() {
   await rm(dir, { recursive: true, force: true });
 }
 
+async function testCodexTokenUsageAggregation() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  await initDb(dbPath);
+  const job = ensureJob(dbPath, "plex", "token-fixture");
+  const run = createAgentRun(dbPath, job.id, "repair", "prompt", { model: "gpt-5.5" });
+  const usage = extractTokenUsageFromCodexEvent({
+    type: "turn.completed",
+    usage: {
+      input_tokens: 1200,
+      cached_input_tokens: 300,
+      output_tokens: 450,
+      reasoning_output_tokens: 125
+    }
+  });
+  assert.deepEqual(usage, {
+    inputTokens: 1200,
+    cachedInputTokens: 300,
+    outputTokens: 450,
+    reasoningOutputTokens: 125,
+    totalTokens: 1650,
+    raw: {
+      input_tokens: 1200,
+      cached_input_tokens: 300,
+      output_tokens: 450,
+      reasoning_output_tokens: 125
+    }
+  });
+  recordTokenUsageEvent(dbPath, {
+    jobId: job.id,
+    agentRunId: run.id,
+    source: "repair",
+    model: "gpt-5.5",
+    usage
+  });
+  recordTokenUsageEvent(dbPath, {
+    source: "mcp_capability_check",
+    model: "gpt-5.5",
+    usage: {
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      outputTokens: 50,
+      reasoningOutputTokens: 10,
+      totalTokens: 150,
+      raw: { input_tokens: 100, output_tokens: 50 }
+    }
+  });
+  const summary = statusSummary(dbPath);
+  assert.equal(summary.tokenUsage.totalTokens, 1800);
+  assert.equal(summary.tokenUsage.inputTokens, 1300);
+  assert.equal(summary.tokenUsage.cachedInputTokens, 320);
+  assert.equal(summary.tokenUsage.outputTokens, 500);
+  assert.equal(summary.tokenUsage.reasoningOutputTokens, 135);
+  assert.equal(summary.tokenUsage.eventCount, 2);
+  await rm(dir, { recursive: true, force: true });
+}
+
 async function testDbDirectoryWritablePreflight() {
   const dir = await tempDir();
   const lockedDir = path.join(dir, "locked");
@@ -2251,12 +2640,21 @@ function testRedaction() {
     apiKey: "[REDACTED]",
     nested: { password: "[REDACTED]" }
   });
+  assert.deepEqual(sanitizeValue({
+    tokenUsage: { totalTokens: 1234, inputTokens: 1000, outputTokens: 234 },
+    tokens: { access_token: "secret-token" }
+  }), {
+    tokenUsage: { totalTokens: 1234, inputTokens: 1000, outputTokens: 234 },
+    tokens: "[REDACTED]"
+  });
 }
 
 async function testWebAuthAndApi() {
+  const dir = await tempDir();
   const config = {
     webUsername: "operator",
-    webPassword: "fixture-password"
+    webPassword: "fixture-password",
+    logPath: path.join(dir, "agent.log")
   };
   let investigateRequest = null;
   let continueRequest = null;
@@ -2264,7 +2662,21 @@ async function testWebAuthAndApi() {
   let closeRequest = null;
   let reopenRequest = null;
   const agent = {
-    status: () => ({ snapshots: { count: 1, latestId: 7 }, jobs: [{ state: "approved_for_execution", count: 1 }], approvals: [] }),
+    diagnostic: (level, event, payload = {}) => appendDiagnosticLog(config.logPath, level, event, payload),
+    status: () => ({
+      snapshots: { count: 1, latestId: 7 },
+      jobs: [{ state: "approved_for_execution", count: 1 }],
+      approvals: [],
+      tokenUsage: {
+        day: "2026-01-01",
+        totalTokens: 1650,
+        inputTokens: 1200,
+        cachedInputTokens: 300,
+        outputTokens: 450,
+        reasoningOutputTokens: 125,
+        eventCount: 1
+      }
+    }),
     latestWithEntries: () => ({
       id: 7,
       generatedAt: "2026-01-01T00:00:00Z",
@@ -2318,6 +2730,18 @@ async function testWebAuthAndApi() {
       return { jobId, approvalId: 11, approvalKind: "action", summary: "Steered fixture summary" };
     },
     issueSummary: async (snapshotId, index) => ({ snapshotId, index, closed: true, summary: "Closed fixture summary" }),
+    issueLogs: async (snapshotId, index) => ({
+      snapshotId,
+      index,
+      source: "plex",
+      issueId: "fixture-issue",
+      records: [{
+        timestamp: "2026-01-01T00:00:00.000Z",
+        level: "info",
+        event: "fixture_issue_log",
+        payload: { source: "plex", issueId: "fixture-issue", message: "Fixture issue log" }
+      }]
+    }),
     closeIssue: async (snapshotId, index, comment, actor) => {
       closeRequest = { snapshotId, index, comment, actor };
       return { jobId: 9, status: "closed" };
@@ -2337,7 +2761,9 @@ async function testWebAuthAndApi() {
     assert.equal(denied.status, 401);
     const status = await fetch(`${baseUrl}/api/status`, { headers: { authorization: auth } });
     assert.equal(status.status, 200);
-    assert.equal((await status.json()).status.snapshots.latestId, 7);
+    const statusBody = await status.json();
+    assert.equal(statusBody.status.snapshots.latestId, 7);
+    assert.equal(statusBody.status.tokenUsage.totalTokens, 1650);
     const page = await fetch(`${baseUrl}/`, { headers: { authorization: auth } });
     assert.equal(page.status, 200);
     const pageText = await page.text();
@@ -2355,6 +2781,7 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="app-shell"/);
     assert.match(pageText, /id="activity-drawer-button"/);
     assert.match(pageText, /id="activity-close-button"/);
+    assert.match(pageText, /id="daily-token-usage"/);
     assert.match(pageText, /id="work-area"/);
     assert.match(pageText, /id="issue-cards"/);
     assert.match(pageText, /id="detail-band"/);
@@ -2367,11 +2794,15 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="steer-input" rows="1"/);
     assert.match(pageText, /id="close-dialog"/);
     assert.match(pageText, /id="mcp-gaps-check-button"/);
+    assert.match(pageText, /id="mcp-gaps-download-button"/);
     assert.match(pageText, /id="mcp-gap-detection-dialog"/);
     assert.match(pageText, /id="mcp-gap-detection-close-button"/);
     assert.match(pageText, /Check MCP Capabilities/);
     assert.match(pageText, /id="runner-settings-backdrop"/);
     assert.match(pageText, /id="activity-drawer-backdrop"/);
+    assert.match(pageText, /id="live-logs-open-button"/);
+    assert.match(pageText, /id="live-logs-dialog"/);
+    assert.match(pageText, /id="live-logs-output"/);
     const css = await fetch(`${baseUrl}/assets/app.css`, { headers: { authorization: auth } });
     assert.equal(css.status, 200);
     const cssText = await css.text();
@@ -2390,6 +2821,9 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /tbody tr\.issue-processing/);
     assert.match(cssText, /button\.job-row\.processing/);
     assert.match(cssText, /\.modal-backdrop/);
+    assert.match(cssText, /\.modal-panel\.live-logs-panel/);
+    assert.match(cssText, /\.live-logs-output/);
+    assert.match(cssText, /\.token-usage/);
     assert.match(cssText, /\.work-area\.detail-open/);
     assert.match(cssText, /\.detail-band\.processing::before/);
     assert.match(cssText, /\.runner-strip/);
@@ -2455,9 +2889,14 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /Issue repair/);
     assert.match(jsText, /function renderCodexSettings/);
     assert.match(jsText, /function saveCodexSettings/);
+    assert.match(jsText, /function formatTokenCount/);
+    assert.match(jsText, /function renderTokenUsage/);
     assert.match(jsText, /function setActivityDrawerOpen/);
     assert.match(jsText, /function setRunnerSettingsOpen/);
     assert.match(jsText, /function checkMcpCapabilities/);
+    assert.match(jsText, /function mcpGapReportMarkdown/);
+    assert.match(jsText, /function downloadMcpGapReport/);
+    assert.match(jsText, /UNTRUSTED_MCP_GAP_DATA_START/);
     assert.match(jsText, /\/api\/mcp-missing-items\/check-capabilities/);
     assert.match(jsText, /function issueCardHtml/);
     assert.match(jsText, /function mergeJobDetailState/);
@@ -2471,6 +2910,12 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /data-job-id/);
     assert.match(jsText, /data-close-issue/);
     assert.match(jsText, /data-issue-summary/);
+    assert.match(jsText, /data-issue-logs/);
+    assert.match(jsText, /function downloadIssueLogs/);
+    assert.match(jsText, /function openLiveLogsDialog/);
+    assert.match(jsText, /function fetchLiveLogs/);
+    assert.match(jsText, /function toggleLiveLogsPaused/);
+    assert.match(jsText, /\/api\/logs\/records/);
     assert.match(jsText, /force/);
     const authStatus = await fetch(`${baseUrl}/api/auth`, { headers: { authorization: auth } });
     assert.equal(authStatus.status, 200);
@@ -2515,6 +2960,14 @@ async function testWebAuthAndApi() {
     assert.deepEqual(steerRequest, { jobId: 9, message: "Client-side issue", actor: "web" });
     const summary = await fetch(`${baseUrl}/api/issues/7/1/summary`, { headers: { authorization: auth } });
     assert.equal((await summary.json()).summary, "Closed fixture summary");
+    agent.diagnostic("info", "fixture_live_log", { source: "plex", issueId: "fixture-issue", message: "Live log fixture" });
+    const logRecords = await fetch(`${baseUrl}/api/logs/records?limit=20`, { headers: { authorization: auth } });
+    assert.equal(logRecords.status, 200);
+    assert.equal((await logRecords.json()).records.some(record => record.event === "fixture_live_log"), true);
+    const issueLogs = await fetch(`${baseUrl}/api/issues/7/1/logs`, { headers: { authorization: auth } });
+    assert.equal(issueLogs.status, 200);
+    assert.equal(issueLogs.headers.get("content-disposition"), 'attachment; filename="media-issue-agent-plex-fixture-issue.log"');
+    assert.match(await issueLogs.text(), /fixture_issue_log/);
     const closed = await fetch(`${baseUrl}/api/issues/7/1/close`, {
       method: "POST",
       headers: { authorization: auth, "content-type": "application/json" },
@@ -2531,12 +2984,20 @@ async function testWebAuthAndApi() {
     assert.deepEqual(reopenRequest, { snapshotId: 7, index: 1, actor: "web" });
   } finally {
     await new Promise(resolve => server.close(resolve));
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
 async function run() {
   await testPlexClosedFilter();
   await testPollOnceRecordsPartialIssueDetailFailures();
+  await testPollOncePreservesClosedLifecycleOnTransientDetailFailure();
+  await testPollOnceSendsPushoverForNewOpenIssuesOnly();
+  await testPushoverFailureDoesNotFailPolling();
+  await testDiagnosticLogRotationStreamsRotatedFiles();
+  await testIssueDiagnosticLogsPersistByIssue();
+  await testIssueDiagnosticLogRetentionCanPruneOldRows();
+  testPollLoopSchedulesStartupFollowUp();
   await testTableAndSnapshotMapping();
   testCommentValidation();
   await testInvestigationCacheAndStaleApprovalSuperseding();
@@ -2568,6 +3029,7 @@ async function run() {
   await testDiagnosticLogWriteFailureIsReported();
   await testAuthConfig();
   await testStateTransitions();
+  await testCodexTokenUsageAggregation();
   await testDbDirectoryWritablePreflight();
   testRedaction();
   await testWebAuthAndApi();

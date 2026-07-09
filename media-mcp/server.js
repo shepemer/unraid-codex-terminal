@@ -278,8 +278,11 @@ async function plexApi(path = "", options = {}) {
   const cleanPath = path.replace(/^\/+/, "");
   const url = new URL(cleanPath ? `${service.url}/${cleanPath}` : `${service.url}/`);
   for (const [key, value] of Object.entries(options.query || {})) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
+    const values = Array.isArray(value) ? value : [value];
+    for (const entry of values) {
+      if (entry !== undefined && entry !== null && entry !== "") {
+        url.searchParams.append(key, String(entry));
+      }
     }
   }
   const headers = {
@@ -327,8 +330,11 @@ async function bazarrApi(path, options = {}) {
   const service = requireService("bazarr");
   const url = new URL(`${service.url}/api/${path.replace(/^\/+/, "")}`);
   for (const [key, value] of Object.entries(options.query || {})) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
+    const values = Array.isArray(value) ? value : [value];
+    for (const entry of values) {
+      if (entry !== undefined && entry !== null && entry !== "") {
+        url.searchParams.append(key, String(entry));
+      }
     }
   }
   const headers = {
@@ -1299,31 +1305,418 @@ function bazarrMovieSubtitleQuery(radarrId, language, forced = false, hi = false
   };
 }
 
-async function downloadBazarrMovieSubtitlesForPlex(input) {
+function bazarrEpisodeSubtitleQuery(seriesId, episodeId, language, forced = false, hi = false) {
+  return {
+    seriesid: Number(seriesId),
+    episodeid: Number(episodeId),
+    language,
+    forced: Boolean(forced),
+    hi: Boolean(hi)
+  };
+}
+
+function bazarrEndpointCallPath(path) {
+  return String(path || "").replace(/^\/?api\//, "");
+}
+
+function positiveIntOrUndefined(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : undefined;
+}
+
+function compactPositiveInts(values = []) {
+  return [...new Set(values.map(positiveIntOrUndefined).filter(Boolean))];
+}
+
+function bazarrDataRecords(body) {
+  if (Array.isArray(body)) {
+    return body;
+  }
+  if (Array.isArray(body?.data)) {
+    return body.data;
+  }
+  if (Array.isArray(body?.records)) {
+    return body.records;
+  }
+  return [];
+}
+
+function boolLike(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "yes", "1"].includes(normalized)) return true;
+    if (["false", "no", "0"].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+function expectedSubtitleFilename(mediaPath, language, forced, hi) {
+  const clean = cleanPath(mediaPath || "");
+  if (!clean || !language) {
+    return undefined;
+  }
+  const basename = nodePath.posix.basename(clean);
+  const extension = nodePath.posix.extname(basename);
+  const stem = extension ? basename.slice(0, -extension.length) : basename;
+  const suffixes = [
+    normalizeSubtitleLanguage(language),
+    forced ? "forced" : undefined,
+    hi ? "hi" : undefined
+  ].filter(Boolean);
+  return suffixes.length ? `${stem}.${suffixes.join(".")}.srt` : undefined;
+}
+
+function summarizeBazarrSubtitleState(record, language, forced, hi) {
+  return redactSensitiveObject(compactObject({
+    audioLanguage: record?.audio_language,
+    existingSubtitles: record?.subtitles,
+    missingSubtitles: record?.missing_subtitles,
+    expectedSidecarFilename: expectedSubtitleFilename(record?.path, language, forced, hi),
+    hasMediaPath: Boolean(record?.path)
+  }));
+}
+
+function summarizeBazarrEpisodeRecord(record, language, forced, hi) {
+  return compactObject({
+    episodeId: positiveIntOrUndefined(record?.sonarrEpisodeId ?? record?.episodeId),
+    seriesId: positiveIntOrUndefined(record?.sonarrSeriesId ?? record?.seriesId),
+    seasonNumber: Number.isInteger(Number(record?.season)) ? Number(record.season) : undefined,
+    episodeNumber: Number.isInteger(Number(record?.episode)) ? Number(record.episode) : undefined,
+    title: record?.title,
+    monitored: record?.monitored,
+    subtitleState: summarizeBazarrSubtitleState(record, language, forced, hi)
+  });
+}
+
+function summarizeBazarrMovieRecord(record, language, forced, hi) {
+  return compactObject({
+    radarrId: positiveIntOrUndefined(record?.radarrId ?? record?.radarrid ?? record?.movieId),
+    title: record?.title,
+    year: record?.year,
+    monitored: record?.monitored,
+    profileId: record?.profileId,
+    subtitleState: summarizeBazarrSubtitleState(record, language, forced, hi)
+  });
+}
+
+function summarizeBazarrCandidate(record, downloadArguments) {
+  const forced = boolLike(record?.forced);
+  const hi = boolLike(record?.hearing_impaired ?? record?.hi);
+  return redactSensitiveObject(compactObject({
+    provider: record?.provider,
+    language: record?.language,
+    forced,
+    hearingImpaired: hi,
+    score: record?.score,
+    originalScore: record?.orig_score,
+    scoreWithoutHash: record?.score_without_hash,
+    matches: record?.matches,
+    rejectionOrNoMatchReasons: record?.dont_matches,
+    releaseInfo: record?.release_info,
+    uploader: record?.uploader,
+    subtitle: record?.subtitle,
+    originalFormat: record?.original_format,
+    url: record?.url,
+    downloadArguments: record?.provider && record?.subtitle
+      ? {
+        ...downloadArguments,
+        language: downloadArguments.language ?? record.language,
+        provider: record.provider,
+        subtitle: record.subtitle,
+        forced: forced ?? downloadArguments.forced,
+        hi: hi ?? downloadArguments.hi,
+        originalFormat: boolLike(record?.original_format) ?? downloadArguments.originalFormat ?? false,
+        dryRun: false
+      }
+      : undefined
+  }));
+}
+
+function candidateMatchesSubtitleRequest(candidate, input) {
+  if (input.language && normalizeSubtitleLanguage(candidate.language) !== normalizeSubtitleLanguage(input.language)) {
+    return false;
+  }
+  if (input.forced !== undefined && boolLike(candidate.forced) !== Boolean(input.forced)) {
+    return false;
+  }
+  if (input.hi !== undefined && boolLike(candidate.hearing_impaired ?? candidate.hi) !== Boolean(input.hi)) {
+    return false;
+  }
+  return true;
+}
+
+async function bazarrEpisodeRecordsByIds(episodeIds) {
+  if (!episodeIds.length) {
+    return [];
+  }
+  return bazarrDataRecords(await bazarrApi("episodes", { query: { "episodeid[]": episodeIds } }));
+}
+
+async function bazarrEpisodeRecordsBySeries(seriesId) {
+  return bazarrDataRecords(await bazarrApi("episodes", { query: { "seriesid[]": [seriesId] } }));
+}
+
+async function resolveBazarrEpisodeTargets(input) {
+  const explicitEpisodeIds = compactPositiveInts([
+    input.episodeId,
+    input.sonarrEpisodeId,
+    ...(input.episodeIds || []),
+    ...(input.sonarrEpisodeIds || [])
+  ]);
+  const explicitSeriesId = positiveIntOrUndefined(input.seriesId ?? input.sonarrSeriesId);
+  let records = [];
+  if (explicitEpisodeIds.length) {
+    records = await bazarrEpisodeRecordsByIds(explicitEpisodeIds).catch(() => []);
+  } else if (explicitSeriesId) {
+    records = await bazarrEpisodeRecordsBySeries(explicitSeriesId).catch(() => []);
+  }
+
+  const seasonNumber = input.seasonNumber !== undefined ? Number(input.seasonNumber) : undefined;
+  const filteredRecords = records.filter(record => {
+    const episodeId = positiveIntOrUndefined(record?.sonarrEpisodeId ?? record?.episodeId);
+    const seriesId = positiveIntOrUndefined(record?.sonarrSeriesId ?? record?.seriesId);
+    if (explicitEpisodeIds.length && !explicitEpisodeIds.includes(episodeId)) return false;
+    if (explicitSeriesId && seriesId && seriesId !== explicitSeriesId) return false;
+    if (Number.isInteger(seasonNumber) && Number(record?.season) !== seasonNumber) return false;
+    return true;
+  });
+  const targets = filteredRecords.map(record => ({
+    episodeId: positiveIntOrUndefined(record?.sonarrEpisodeId ?? record?.episodeId),
+    seriesId: positiveIntOrUndefined(record?.sonarrSeriesId ?? record?.seriesId) || explicitSeriesId,
+    seasonNumber: Number.isInteger(Number(record?.season)) ? Number(record.season) : undefined,
+    episodeNumber: Number.isInteger(Number(record?.episode)) ? Number(record.episode) : undefined,
+    record
+  })).filter(target => target.episodeId);
+
+  for (const episodeId of explicitEpisodeIds) {
+    if (!targets.some(target => target.episodeId === episodeId)) {
+      targets.push({ episodeId, seriesId: explicitSeriesId });
+    }
+  }
+  if (!targets.length) {
+    throw new Error("No Bazarr episode targets matched the requested episodeIds or series/season.");
+  }
+  return targets;
+}
+
+async function bazarrEpisodeSubtitleSearchCandidates(input) {
+  const targets = (await resolveBazarrEpisodeTargets(input)).slice(0, input.maxEpisodes);
+  const records = [];
+  for (const target of targets) {
+    const metadata = target.record || (await bazarrEpisodeRecordsByIds([target.episodeId]).catch(() => []))[0];
+    const providerBody = await bazarrApi("providers/episodes", {
+      query: { episodeid: target.episodeId }
+    }).catch(error => ({ error: error.message }));
+    const rawCandidates = providerBody.error ? [] : bazarrDataRecords(providerBody);
+    const candidates = rawCandidates
+      .filter(candidate => candidateMatchesSubtitleRequest(candidate, input))
+      .slice(0, input.limit)
+      .map(candidate => summarizeBazarrCandidate(candidate, {
+        seriesId: target.seriesId,
+        episodeId: target.episodeId,
+        language: input.language,
+        forced: Boolean(input.forced),
+        hi: Boolean(input.hi),
+        originalFormat: false
+      }));
+    records.push(compactObject({
+      target: compactObject({
+        seriesId: target.seriesId,
+        episodeId: target.episodeId,
+        seasonNumber: target.seasonNumber,
+        episodeNumber: target.episodeNumber
+      }),
+      metadata: metadata ? summarizeBazarrEpisodeRecord(metadata, input.language, input.forced, input.hi) : undefined,
+      candidateCount: rawCandidates.length,
+      returned: candidates.length,
+      candidates,
+      error: providerBody.error ? redactText(providerBody.error) : undefined
+    }));
+  }
+  return {
+    mediaType: "episode",
+    language: input.language ? normalizeSubtitleLanguage(input.language) : undefined,
+    forced: input.forced,
+    hi: input.hi,
+    targets: records.length,
+    records,
+    note: "Use a returned candidate's downloadArguments with bazarr_download_episode_subtitles to download that exact provider result, or call bazarr_download_episode_subtitles without provider/subtitle for Bazarr's automatic choice."
+  };
+}
+
+async function downloadBazarrEpisodeSubtitles(input) {
   const language = String(input.language || "").trim();
   if (!language) {
     throw new Error("language is required");
   }
-  const resolved = await resolveRadarrMovieForPlex(input);
-  const query = bazarrMovieSubtitleQuery(resolved.radarrMovie.id, language, input.forced, input.hi);
-  const endpoint = { method: "PATCH", path: "/api/movies/subtitles", query };
+  const targets = await resolveBazarrEpisodeTargets(input);
+  const exactCandidate = Boolean(input.provider && input.subtitle);
+  if (exactCandidate && targets.length !== 1) {
+    throw new Error("Exact provider/subtitle downloads require exactly one episode target.");
+  }
+  const endpoints = targets.map(target => {
+    if (!target.seriesId) {
+      throw new Error(`seriesId is required for Bazarr episode ${target.episodeId}; provide seriesId or use a Bazarr metadata-resolvable episode ID.`);
+    }
+    const query = exactCandidate
+      ? {
+        seriesid: target.seriesId,
+        episodeid: target.episodeId,
+        hi: Boolean(input.hi),
+        forced: Boolean(input.forced),
+        original_format: Boolean(input.originalFormat),
+        provider: input.provider,
+        subtitle: input.subtitle
+      }
+      : bazarrEpisodeSubtitleQuery(target.seriesId, target.episodeId, language, input.forced, input.hi);
+    return {
+      target,
+      endpoint: {
+        method: exactCandidate ? "POST" : "PATCH",
+        path: exactCandidate ? "/api/providers/episodes" : "/api/episodes/subtitles",
+        query
+      }
+    };
+  });
   if (input.dryRun) {
     return {
       dryRun: true,
-      ...resolved,
+      mode: exactCandidate ? "exact_candidate" : "automatic",
       language,
+      forced: Boolean(input.forced),
+      hi: Boolean(input.hi),
+      targets: endpoints.map(entry => compactObject({
+        seriesId: entry.target.seriesId,
+        episodeId: entry.target.episodeId,
+        endpoint: entry.endpoint
+      })),
+      note: "Set dryRun to false to ask Bazarr to download subtitles for these exact episode targets."
+    };
+  }
+  const results = [];
+  for (const entry of endpoints) {
+    const result = await bazarrApi(bazarrEndpointCallPath(entry.endpoint.path), {
+      method: entry.endpoint.method,
+      query: entry.endpoint.query
+    });
+    results.push(compactObject({
+      seriesId: entry.target.seriesId,
+      episodeId: entry.target.episodeId,
+      endpoint: entry.endpoint,
+      result
+    }));
+  }
+  return {
+    dryRun: false,
+    mode: exactCandidate ? "exact_candidate" : "automatic",
+    language,
+    forced: Boolean(input.forced),
+    hi: Boolean(input.hi),
+    results
+  };
+}
+
+async function resolveBazarrMovieTarget(input) {
+  const directRadarrId = positiveIntOrUndefined(input.radarrId ?? input.radarrMovieId ?? input.movieId);
+  if (directRadarrId) {
+    return { radarrId: directRadarrId };
+  }
+  const resolved = await resolveRadarrMovieForPlex(input);
+  return {
+    ...resolved,
+    radarrId: resolved.radarrMovie.id
+  };
+}
+
+async function bazarrMovieRecord(radarrId) {
+  return bazarrDataRecords(await bazarrApi("movies", { query: { "radarrid[]": [radarrId] } }))[0];
+}
+
+async function bazarrMovieSubtitleSearchCandidates(input) {
+  const target = await resolveBazarrMovieTarget(input);
+  const metadata = await bazarrMovieRecord(target.radarrId).catch(() => undefined);
+  const providerBody = await bazarrApi("providers/movies", {
+    query: { radarrid: target.radarrId }
+  }).catch(error => ({ error: error.message }));
+  const rawCandidates = providerBody.error ? [] : bazarrDataRecords(providerBody);
+  const candidates = rawCandidates
+    .filter(candidate => candidateMatchesSubtitleRequest(candidate, input))
+    .slice(0, input.limit)
+    .map(candidate => summarizeBazarrCandidate(candidate, {
+      radarrId: target.radarrId,
+      language: input.language,
+      forced: Boolean(input.forced),
+      hi: Boolean(input.hi),
+      originalFormat: false
+    }));
+  return {
+    mediaType: "movie",
+    language: input.language ? normalizeSubtitleLanguage(input.language) : undefined,
+    forced: input.forced,
+    hi: input.hi,
+    target: compactObject({
+      radarrId: target.radarrId,
+      plexRatingKey: target.plexRatingKey,
+      plexMetadata: target.plexMetadata,
+      radarrMovie: target.radarrMovie,
+      bazarrMovie: metadata ? summarizeBazarrMovieRecord(metadata, input.language, input.forced, input.hi) : undefined
+    }),
+    candidateCount: rawCandidates.length,
+    returned: candidates.length,
+    candidates,
+    error: providerBody.error ? redactText(providerBody.error) : undefined,
+    note: "Use a returned candidate's downloadArguments with bazarr_download_movie_subtitles to download that exact provider result, or call bazarr_download_movie_subtitles without provider/subtitle for Bazarr's automatic choice."
+  };
+}
+
+async function downloadBazarrMovieSubtitles(input) {
+  const language = String(input.language || "").trim();
+  if (!language) {
+    throw new Error("language is required");
+  }
+  const target = await resolveBazarrMovieTarget(input);
+  const exactCandidate = Boolean(input.provider && input.subtitle);
+  const query = exactCandidate
+    ? {
+      radarrid: target.radarrId,
+      hi: Boolean(input.hi),
+      forced: Boolean(input.forced),
+      original_format: Boolean(input.originalFormat),
+      provider: input.provider,
+      subtitle: input.subtitle
+    }
+    : bazarrMovieSubtitleQuery(target.radarrId, language, input.forced, input.hi);
+  const endpoint = {
+    method: exactCandidate ? "POST" : "PATCH",
+    path: exactCandidate ? "/api/providers/movies" : "/api/movies/subtitles",
+    query
+  };
+  if (input.dryRun) {
+    return {
+      dryRun: true,
+      ...target,
+      language,
+      mode: exactCandidate ? "exact_candidate" : "automatic",
       endpoint,
       note: "Set dryRun to false to ask Bazarr to download the exact movie subtitle."
     };
   }
-  const result = await bazarrApi("movies/subtitles", { method: "PATCH", query });
+  const result = await bazarrApi(bazarrEndpointCallPath(endpoint.path), { method: endpoint.method, query });
   return {
     dryRun: false,
-    ...resolved,
+    ...target,
     language,
+    mode: exactCandidate ? "exact_candidate" : "automatic",
     endpoint,
     result
   };
+}
+
+async function downloadBazarrMovieSubtitlesForPlex(input) {
+  return downloadBazarrMovieSubtitles(input);
 }
 
 async function plexMetadataMaintenance(ratingKey, operation, dryRun) {
@@ -9066,6 +9459,87 @@ function createServer() {
     title: "Bazarr Status",
     description: "Get Bazarr system status."
   }, async () => jsonText(await bazarrApi("system/status")));
+
+  server.registerTool("bazarr_episode_subtitle_search_candidates", {
+    title: "Bazarr Subtitle Candidate Results",
+    description: "Search Bazarr provider candidates for exact Sonarr episode IDs or one Sonarr series/season, returning provider, score, language, HI/forced flags, no-match reasons, expected sidecar filename, and ready-to-use download arguments.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      episodeId: z.number().int().positive().optional(),
+      episodeIds: z.array(z.number().int().positive()).max(50).optional(),
+      sonarrEpisodeId: z.number().int().positive().optional(),
+      sonarrEpisodeIds: z.array(z.number().int().positive()).max(50).optional(),
+      seriesId: z.number().int().positive().optional(),
+      sonarrSeriesId: z.number().int().positive().optional(),
+      seasonNumber: z.number().int().min(0).optional(),
+      language: z.string().min(1).optional(),
+      forced: z.boolean().optional(),
+      hi: z.boolean().optional(),
+      maxEpisodes: z.number().int().min(1).max(50).default(20),
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async (input) => jsonText(await bazarrEpisodeSubtitleSearchCandidates(input)));
+
+  server.registerTool("bazarr_download_episode_subtitles", {
+    title: "Bazarr TV Subtitle Download",
+    description: "Ask Bazarr to download subtitles for exact Sonarr episode IDs or one series/season. By default Bazarr chooses the best provider result; provide provider and subtitle from candidate search for an exact candidate download. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      episodeId: z.number().int().positive().optional(),
+      episodeIds: z.array(z.number().int().positive()).max(50).optional(),
+      sonarrEpisodeId: z.number().int().positive().optional(),
+      sonarrEpisodeIds: z.array(z.number().int().positive()).max(50).optional(),
+      seriesId: z.number().int().positive().optional(),
+      sonarrSeriesId: z.number().int().positive().optional(),
+      seasonNumber: z.number().int().min(0).optional(),
+      language: z.string().min(1),
+      forced: z.boolean().default(false),
+      hi: z.boolean().default(false),
+      provider: z.string().min(1).optional(),
+      subtitle: z.string().min(1).optional(),
+      originalFormat: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await downloadBazarrEpisodeSubtitles(input)));
+
+  server.registerTool("bazarr_movie_subtitle_search_candidates", {
+    title: "Bazarr Movie Subtitle Candidate Results",
+    description: "Search Bazarr provider candidates for one exact Radarr movie ID or Plex movie rating key, returning provider, score, language, HI/forced flags, no-match reasons, expected sidecar filename, and ready-to-use download arguments.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      radarrId: z.number().int().positive().optional(),
+      radarrMovieId: z.number().int().positive().optional(),
+      movieId: z.number().int().positive().optional(),
+      plexRatingKey: z.union([z.string(), z.number()]).optional(),
+      language: z.string().min(1).optional(),
+      forced: z.boolean().optional(),
+      hi: z.boolean().optional(),
+      title: z.string().optional(),
+      year: z.number().int().positive().optional(),
+      limit: z.number().int().min(1).max(100).default(25)
+    }
+  }, async (input) => jsonText(await bazarrMovieSubtitleSearchCandidates(input)));
+
+  server.registerTool("bazarr_download_movie_subtitles", {
+    title: "Bazarr Movie Subtitle Download",
+    description: "Ask Bazarr to download subtitles for one exact Radarr movie ID or Plex movie rating key. By default Bazarr chooses the best provider result; provide provider and subtitle from candidate search for an exact candidate download. Dry-run is enabled by default.",
+    annotations: { destructiveHint: false, idempotentHint: false },
+    inputSchema: {
+      radarrId: z.number().int().positive().optional(),
+      radarrMovieId: z.number().int().positive().optional(),
+      movieId: z.number().int().positive().optional(),
+      plexRatingKey: z.union([z.string(), z.number()]).optional(),
+      language: z.string().min(1),
+      title: z.string().optional(),
+      year: z.number().int().positive().optional(),
+      forced: z.boolean().default(false),
+      hi: z.boolean().default(false),
+      provider: z.string().min(1).optional(),
+      subtitle: z.string().min(1).optional(),
+      originalFormat: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await downloadBazarrMovieSubtitles(input)));
 
   server.registerTool("bazarr_download_movie_subtitles_for_plex", {
     title: "Bazarr Download Movie Subtitles For Plex",

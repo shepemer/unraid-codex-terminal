@@ -47,6 +47,7 @@ async function run() {
       method: req.method,
       path: url.pathname,
       query: Object.fromEntries(url.searchParams),
+      searchParams: new URLSearchParams(url.searchParams),
       body,
       headers: req.headers
     });
@@ -98,6 +99,161 @@ async function run() {
         hasFile: true,
         path: "/movies/fixture-private-path"
       }]);
+    }
+    if (req.method === "GET" && url.pathname === "/bazarr/api/episodes") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      const episodeIds = url.searchParams.getAll("episodeid[]");
+      const seriesIds = url.searchParams.getAll("seriesid[]");
+      if (episodeIds.includes("701") && episodeIds.includes("702")) {
+        return sendJson(res, 200, {
+          data: [{
+            sonarrEpisodeId: 701,
+            sonarrSeriesId: 77,
+            season: 1,
+            episode: 1,
+            title: "Pilot",
+            monitored: true,
+            path: "/series/Fixture Show/Fixture.Show.S01E01.mkv",
+            audio_language: { code2: "ja", name: "Japanese" },
+            subtitles: [],
+            missing_subtitles: [{ code2: "en", name: "English" }]
+          }, {
+            sonarrEpisodeId: 702,
+            sonarrSeriesId: 77,
+            season: 1,
+            episode: 2,
+            title: "Second",
+            monitored: true,
+            path: "/series/Fixture Show/Fixture.Show.S01E02.mkv",
+            audio_language: { code2: "ja", name: "Japanese" },
+            subtitles: [],
+            missing_subtitles: [{ code2: "en", name: "English" }]
+          }]
+        });
+      }
+      if (episodeIds.includes("701") || seriesIds.includes("77")) {
+        return sendJson(res, 200, {
+          data: [{
+            sonarrEpisodeId: 701,
+            sonarrSeriesId: 77,
+            season: 1,
+            episode: 1,
+            title: "Pilot",
+            monitored: true,
+            path: "/series/Fixture Show/Fixture.Show.S01E01.mkv",
+            audio_language: { code2: "ja", name: "Japanese" },
+            subtitles: [],
+            missing_subtitles: [{ code2: "en", name: "English" }]
+          }]
+        });
+      }
+      return sendJson(res, 200, { data: [] });
+    }
+    if (req.method === "GET" && url.pathname === "/bazarr/api/providers/episodes") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.equal(url.searchParams.get("episodeid"), "701");
+      return sendJson(res, 200, {
+        data: [
+          {
+            provider: "fixture-provider",
+            language: "English",
+            forced: "False",
+            hearing_impaired: "False",
+            score: 97.5,
+            orig_score: 356,
+            score_without_hash: 335,
+            matches: ["series", "season", "episode"],
+            dont_matches: ["hash"],
+            release_info: ["Fixture.Show.S01E01.1080p"],
+            subtitle: "subtitle-cache-id",
+            original_format: "False",
+            url: "https://subtitle.invalid/private-result"
+          },
+          {
+            provider: "fixture-provider",
+            language: "Spanish",
+            forced: "False",
+            hearing_impaired: "False",
+            score: 80,
+            subtitle: "spanish-cache-id"
+          }
+        ]
+      });
+    }
+    if (req.method === "PATCH" && url.pathname === "/bazarr/api/episodes/subtitles") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.deepEqual(Object.fromEntries(url.searchParams), {
+        seriesid: "77",
+        episodeid: "701",
+        language: "en",
+        forced: "false",
+        hi: "false"
+      });
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/bazarr/api/providers/episodes") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.deepEqual(Object.fromEntries(url.searchParams), {
+        seriesid: "77",
+        episodeid: "701",
+        hi: "false",
+        forced: "false",
+        original_format: "false",
+        provider: "fixture-provider",
+        subtitle: "subtitle-cache-id"
+      });
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/bazarr/api/movies") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.equal(url.searchParams.get("radarrid[]"), "44");
+      return sendJson(res, 200, {
+        data: [{
+          radarrId: 44,
+          title: "Fixture Movie",
+          year: 2026,
+          monitored: true,
+          path: "/movies/Fixture Movie (2026)/Fixture Movie (2026).mkv",
+          subtitles: [],
+          missing_subtitles: [{ code2: "ko", name: "Korean" }]
+        }]
+      });
+    }
+    if (req.method === "GET" && url.pathname === "/bazarr/api/providers/movies") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.equal(url.searchParams.get("radarrid"), "44");
+      return sendJson(res, 200, {
+        data: [{
+          provider: "movie-provider",
+          language: "Korean",
+          forced: "False",
+          hearing_impaired: "False",
+          score: 93,
+          matches: ["title", "year"],
+          dont_matches: ["hash"],
+          release_info: ["Fixture.Movie.2026.1080p"],
+          subtitle: "movie-subtitle-cache-id",
+          original_format: "False"
+        }]
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/bazarr/api/providers/movies") {
+      assert.equal(req.headers["x-api-key"], "bazarr-key");
+      assert.deepEqual(Object.fromEntries(url.searchParams), {
+        radarrid: "44",
+        hi: "false",
+        forced: "false",
+        original_format: "false",
+        provider: "movie-provider",
+        subtitle: "movie-subtitle-cache-id"
+      });
+      res.writeHead(204);
+      res.end();
+      return;
     }
     if (req.method === "PATCH" && url.pathname === "/bazarr/api/movies/subtitles") {
       assert.equal(req.headers["x-api-key"], "bazarr-key");
@@ -194,9 +350,77 @@ async function run() {
     const tools = await rpc("tools/list");
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("bazarr_download_movie_subtitles_for_plex"));
+    assert.ok(toolNames.has("bazarr_episode_subtitle_search_candidates"));
+    assert.ok(toolNames.has("bazarr_download_episode_subtitles"));
+    assert.ok(toolNames.has("bazarr_movie_subtitle_search_candidates"));
+    assert.ok(toolNames.has("bazarr_download_movie_subtitles"));
     assert.ok(toolNames.has("plex_refresh_metadata"));
     assert.ok(toolNames.has("plex_analyze_metadata"));
     assert.ok(toolNames.has("plex_verify_subtitle_track"));
+
+    const episodeCandidates = await tool("bazarr_episode_subtitle_search_candidates", {
+      seriesId: 77,
+      seasonNumber: 1,
+      language: "en",
+      limit: 10
+    });
+    assert.equal(episodeCandidates.records.length, 1);
+    assert.equal(episodeCandidates.records[0].target.episodeId, 701);
+    assert.equal(episodeCandidates.records[0].metadata.subtitleState.expectedSidecarFilename, "Fixture.Show.S01E01.en.srt");
+    assert.equal(episodeCandidates.records[0].candidates.length, 1);
+    assert.equal(episodeCandidates.records[0].candidates[0].provider, "fixture-provider");
+    assert.equal(episodeCandidates.records[0].candidates[0].downloadArguments.subtitle, "subtitle-cache-id");
+    assert.equal(episodeCandidates.records[0].candidates[0].url, "[redacted]");
+
+    const episodeDryRun = await tool("bazarr_download_episode_subtitles", {
+      seriesId: 77,
+      seasonNumber: 1,
+      language: "en",
+      dryRun: true
+    });
+    assert.equal(episodeDryRun.dryRun, true);
+    assert.equal(episodeDryRun.targets[0].endpoint.query.episodeid, 701);
+    assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/episodes/subtitles").length, 0);
+
+    const episodeDownloaded = await tool("bazarr_download_episode_subtitles", {
+      episodeIds: [701],
+      language: "en",
+      dryRun: false
+    });
+    assert.equal(episodeDownloaded.dryRun, false);
+    assert.equal(episodeDownloaded.results[0].episodeId, 701);
+    assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/episodes/subtitles").length, 1);
+
+    const multiEpisodeDryRun = await tool("bazarr_download_episode_subtitles", {
+      episodeIds: [701, 702],
+      language: "en",
+      dryRun: true
+    });
+    assert.equal(multiEpisodeDryRun.targets.length, 2);
+    const multiEpisodeLookup = calls.find(call => call.method === "GET"
+      && call.path === "/bazarr/api/episodes"
+      && call.searchParams.getAll("episodeid[]").includes("702"));
+    assert.deepEqual(multiEpisodeLookup.searchParams.getAll("episodeid[]"), ["701", "702"]);
+
+    const exactEpisodeDownloaded = await tool("bazarr_download_episode_subtitles", {
+      ...episodeCandidates.records[0].candidates[0].downloadArguments
+    });
+    assert.equal(exactEpisodeDownloaded.mode, "exact_candidate");
+    assert.equal(calls.filter(call => call.method === "POST" && call.path === "/bazarr/api/providers/episodes").length, 1);
+
+    const movieCandidates = await tool("bazarr_movie_subtitle_search_candidates", {
+      radarrId: 44,
+      language: "ko"
+    });
+    assert.equal(movieCandidates.target.bazarrMovie.subtitleState.expectedSidecarFilename, "Fixture Movie (2026).ko.srt");
+    assert.equal(movieCandidates.candidates.length, 1);
+    assert.equal(movieCandidates.candidates[0].downloadArguments.provider, "movie-provider");
+
+    const exactMovieDownloaded = await tool("bazarr_download_movie_subtitles", {
+      ...movieCandidates.candidates[0].downloadArguments
+    });
+    assert.equal(exactMovieDownloaded.mode, "exact_candidate");
+    assert.equal(calls.filter(call => call.method === "POST" && call.path === "/bazarr/api/providers/movies").length, 1);
 
     const dryRun = await tool("bazarr_download_movie_subtitles_for_plex", {
       plexRatingKey: "900001",

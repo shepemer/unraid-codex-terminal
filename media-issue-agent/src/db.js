@@ -2,6 +2,10 @@ import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { ensureDbDir, sql, sqliteExec } from "./sqlite.js";
 
+export const ISSUE_LOG_EVENT_RETENTION_ROWS = 200000;
+const ISSUE_LOG_PRUNE_INTERVAL_WRITES = 100;
+let issueLogWritesSincePrune = 0;
+
 export const JOB_STATES = new Set([
   "detected",
   "queued_for_investigation",
@@ -182,6 +186,42 @@ CREATE TABLE IF NOT EXISTS missing_mcp_items (
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   dismissed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS issue_log_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+  source TEXT NOT NULL,
+  issue_id TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  level TEXT NOT NULL,
+  event TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS token_usage_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+  agent_run_id INTEGER REFERENCES agent_runs(id) ON DELETE SET NULL,
+  source TEXT NOT NULL,
+  model TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_log_events_issue
+ON issue_log_events(source, issue_id, timestamp, id);
+
+CREATE INDEX IF NOT EXISTS idx_issue_log_events_job
+ON issue_log_events(job_id, timestamp, id);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_events_created
+ON token_usage_events(created_at, source);
 `);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
   ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
@@ -645,6 +685,74 @@ COMMIT;
 `);
 }
 
+function tokenCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+}
+
+export function extractTokenUsageFromCodexEvent(event) {
+  const usage = event?.usage || event?.response?.usage || event?.item?.usage || null;
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  const inputTokens = tokenCount(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens);
+  const cachedInputTokens = tokenCount(usage.cached_input_tokens ?? usage.cachedInputTokens);
+  const outputTokens = tokenCount(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens);
+  const reasoningOutputTokens = tokenCount(usage.reasoning_output_tokens ?? usage.reasoningOutputTokens);
+  const totalTokens = tokenCount(usage.total_tokens ?? usage.totalTokens) || inputTokens + outputTokens;
+  if (!inputTokens && !cachedInputTokens && !outputTokens && !reasoningOutputTokens && !totalTokens) {
+    return null;
+  }
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens,
+    raw: usage
+  };
+}
+
+export function recordTokenUsageEvent(dbPath, { jobId = null, agentRunId = null, source = "codex", model = "", usage }) {
+  if (!usage) {
+    return null;
+  }
+  const inputTokens = tokenCount(usage.inputTokens);
+  const cachedInputTokens = tokenCount(usage.cachedInputTokens);
+  const outputTokens = tokenCount(usage.outputTokens);
+  const reasoningOutputTokens = tokenCount(usage.reasoningOutputTokens);
+  const row = {
+    jobId: Number.isInteger(Number(jobId)) && Number(jobId) > 0 ? Number(jobId) : null,
+    agentRunId: Number.isInteger(Number(agentRunId)) && Number(agentRunId) > 0 ? Number(agentRunId) : null,
+    source: String(source || "codex"),
+    model: String(model || ""),
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens: tokenCount(usage.totalTokens) || inputTokens + outputTokens,
+    raw: usage.raw || {}
+  };
+  sqliteExec(dbPath, sql`
+INSERT INTO token_usage_events (
+  job_id, agent_run_id, source, model, input_tokens, cached_input_tokens,
+  output_tokens, reasoning_output_tokens, total_tokens, usage_json
+) VALUES (
+  ${row.jobId},
+  ${row.agentRunId},
+  ${row.source},
+  ${row.model},
+  ${row.inputTokens},
+  ${row.cachedInputTokens},
+  ${row.outputTokens},
+  ${row.reasoningOutputTokens},
+  ${row.totalTokens},
+  ${JSON.stringify(row.raw)}
+);
+`);
+  return row;
+}
+
 function normalizeMissingMcpDbItem(item) {
   const title = String(item?.title || item?.capability || item?.suggestedToolName || "").trim();
   const description = String(item?.description || item?.reason || title || "").trim();
@@ -998,6 +1106,51 @@ VALUES (${jobId}, ${eventType}, ${JSON.stringify(payload)});
 `);
 }
 
+export function recordIssueLogEvent(dbPath, { jobId = null, source, issueId, record }) {
+  if (!source || issueId === undefined || issueId === null || !record) {
+    return;
+  }
+  sqliteExec(dbPath, sql`
+INSERT INTO issue_log_events (job_id, source, issue_id, timestamp, level, event, record_json)
+VALUES (
+  ${jobId},
+  ${String(source)},
+  ${String(issueId)},
+  ${record.timestamp || new Date().toISOString()},
+  ${record.level || "info"},
+  ${record.event || "event"},
+  ${JSON.stringify(record)}
+);
+`);
+  issueLogWritesSincePrune += 1;
+  if (issueLogWritesSincePrune >= ISSUE_LOG_PRUNE_INTERVAL_WRITES) {
+    issueLogWritesSincePrune = 0;
+    pruneIssueLogEvents(dbPath);
+  }
+}
+
+export function pruneIssueLogEvents(dbPath, maxRows = ISSUE_LOG_EVENT_RETENTION_ROWS) {
+  const limit = Math.max(1, Number(maxRows) || ISSUE_LOG_EVENT_RETENTION_ROWS);
+  sqliteExec(dbPath, sql`
+DELETE FROM issue_log_events
+WHERE id NOT IN (
+  SELECT id
+  FROM issue_log_events
+  ORDER BY id DESC
+  LIMIT ${limit}
+);
+`);
+}
+
+export function issueLogRecords(dbPath, source, issueId) {
+  return sqliteExec(dbPath, sql`
+SELECT record_json AS recordJson
+FROM issue_log_events
+WHERE source = ${String(source)} AND issue_id = ${String(issueId)}
+ORDER BY timestamp ASC, id ASC;
+`, { json: true }).map(row => parseJson(row.recordJson, null)).filter(Boolean);
+}
+
 export function statusSummary(dbPath) {
   const jobs = sqliteExec(dbPath, `
 SELECT state, COUNT(*) AS count
@@ -1015,7 +1168,27 @@ FROM approvals
 GROUP BY status
 ORDER BY status;
 `, { json: true });
-  return { snapshots, jobs, approvals };
+  const tokenUsage = sqliteExec(dbPath, `
+SELECT
+  date('now', 'localtime') AS day,
+  COALESCE(SUM(total_tokens), 0) AS totalTokens,
+  COALESCE(SUM(input_tokens), 0) AS inputTokens,
+  COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens,
+  COALESCE(SUM(output_tokens), 0) AS outputTokens,
+  COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens,
+  COUNT(*) AS eventCount
+FROM token_usage_events
+WHERE date(created_at, 'localtime') = date('now', 'localtime');
+`, { json: true })[0] || {
+    day: null,
+    totalTokens: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    eventCount: 0
+  };
+  return { snapshots, jobs, approvals, tokenUsage };
 }
 
 export function listJobs(dbPath, limit = 50) {

@@ -1,4 +1,6 @@
 const SECRET_KEY_PATTERN = /(authorization|bearer|token|api[_-]?key|password|passwd|secret|cookie|session)/i;
+const NON_SECRET_CONTAINER_KEYS = new Set(["tokenUsage"]);
+const NON_SECRET_TOKEN_COUNT_KEY_PATTERN = /^(inputTokens|cachedInputTokens|outputTokens|reasoningOutputTokens|totalTokens|input_tokens|cached_input_tokens|output_tokens|reasoning_output_tokens|total_tokens)$/;
 const PATH_ROOT_PATTERN = String.raw`(?:\/Users|\/home|\/mnt\/user|\/mnt\/unraid|\/config|\/codex-home|\/boot|\/var\/run|\/data|\/tv|\/movies|\/movie|\/downloads|\/download|\/music|\/photos|\/media)`;
 const MEDIA_PATH_PATTERN = new RegExp(`${PATH_ROOT_PATTERN}\\/.+?(?=(?:,\\s*[A-Za-z][A-Za-z0-9_-]*=)|["'<>\\r\\n]|$)`, "g");
 
@@ -23,7 +25,11 @@ export function sanitizeValue(value, key = "") {
   if (value === null || value === undefined) {
     return value;
   }
-  if (SECRET_KEY_PATTERN.test(key)) {
+  if (
+    SECRET_KEY_PATTERN.test(key)
+    && !NON_SECRET_CONTAINER_KEYS.has(key)
+    && !(NON_SECRET_TOKEN_COUNT_KEY_PATTERN.test(key) && typeof value === "number")
+  ) {
     return "[REDACTED]";
   }
   if (typeof value === "string") {
