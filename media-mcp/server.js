@@ -254,9 +254,10 @@ function limitPlexContainer(value, limit) {
 }
 
 async function fetchJson(url, options = {}) {
+  const { timeoutMs, ...fetchOptions } = options;
   const response = await fetch(url, {
-    ...options,
-    signal: AbortSignal.timeout(requestTimeoutMs)
+    ...fetchOptions,
+    signal: options.signal || AbortSignal.timeout(timeoutMs || requestTimeoutMs)
   });
   const text = await response.text();
   let body = null;
@@ -269,6 +270,9 @@ async function fetchJson(url, options = {}) {
   }
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}: ${typeof body === "string" ? body : JSON.stringify(body)}`);
+  }
+  if (text === "") {
+    return { ok: true };
   }
   return body;
 }
@@ -689,6 +693,20 @@ function uniquePositiveIds(ids) {
 
 function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
+}
+
+async function mapConcurrent(items, concurrency, mapper) {
+  const limit = Math.max(1, Math.min(Number(concurrency || 1), items.length || 1));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: limit }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
 }
 
 function decodeHtmlEntities(value) {
@@ -1504,11 +1522,13 @@ async function resolveBazarrEpisodeTargets(input) {
 
 async function bazarrEpisodeSubtitleSearchCandidates(input) {
   const targets = (await resolveBazarrEpisodeTargets(input)).slice(0, input.maxEpisodes);
-  const records = [];
-  for (const target of targets) {
+  const concurrency = input.concurrency || 8;
+  const providerTimeoutMs = input.providerTimeoutMs || Math.min(requestTimeoutMs, 10000);
+  const records = await mapConcurrent(targets, concurrency, async target => {
     const metadata = target.record || (await bazarrEpisodeRecordsByIds([target.episodeId]).catch(() => []))[0];
     const providerBody = await bazarrApi("providers/episodes", {
-      query: { episodeid: target.episodeId }
+      query: { episodeid: target.episodeId },
+      timeoutMs: providerTimeoutMs
     }).catch(error => ({ error: error.message }));
     const rawCandidates = providerBody.error ? [] : bazarrDataRecords(providerBody);
     const candidates = rawCandidates
@@ -1522,7 +1542,7 @@ async function bazarrEpisodeSubtitleSearchCandidates(input) {
         hi: Boolean(input.hi),
         originalFormat: false
       }));
-    records.push(compactObject({
+    return compactObject({
       target: compactObject({
         seriesId: target.seriesId,
         episodeId: target.episodeId,
@@ -1534,14 +1554,16 @@ async function bazarrEpisodeSubtitleSearchCandidates(input) {
       returned: candidates.length,
       candidates,
       error: providerBody.error ? redactText(providerBody.error) : undefined
-    }));
-  }
+    });
+  });
   return {
     mediaType: "episode",
     language: input.language ? normalizeSubtitleLanguage(input.language) : undefined,
     forced: input.forced,
     hi: input.hi,
     targets: records.length,
+    concurrency,
+    providerTimeoutMs,
     records,
     note: "Use a returned candidate's downloadArguments with bazarr_download_episode_subtitles to download that exact provider result, or call bazarr_download_episode_subtitles without provider/subtitle for Bazarr's automatic choice."
   };
@@ -7962,6 +7984,135 @@ function summarizeArrReleaseCandidate(record) {
   });
 }
 
+function releaseRejectionTexts(record) {
+  const values = Array.isArray(record?.rejections)
+    ? record.rejections
+    : Array.isArray(record?.rejectionReasons)
+      ? record.rejectionReasons
+      : [];
+  return values
+    .map(rejection => {
+      if (typeof rejection === "string") {
+        return rejection;
+      }
+      return rejection?.reason || rejection?.message || rejection?.type || JSON.stringify(rejection);
+    })
+    .filter(Boolean)
+    .map(value => String(value));
+}
+
+function languageNames(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return values
+    .map(entry => {
+      if (typeof entry === "string") {
+        return entry;
+      }
+      return entry?.name || entry?.language || entry?.title || entry?.code;
+    })
+    .filter(Boolean)
+    .map(entry => String(entry));
+}
+
+function requiredLanguageAliases(requiredLanguage) {
+  const normalized = String(requiredLanguage || "English").trim().toLowerCase();
+  if (!normalized || normalized === "english" || normalized === "en" || normalized === "eng") {
+    return ["english", "eng", "en"];
+  }
+  return [normalized];
+}
+
+function subtitleSignalForRelease(record, requiredLanguage) {
+  const aliases = requiredLanguageAliases(requiredLanguage);
+  const title = String(record?.title || record?.sortTitle || "").toLowerCase();
+  const languages = languageNames(record?.languages).map(language => language.toLowerCase());
+  const titleSignals = [];
+  if (/\b(subs?|subtitles?|vostfr|multi[- ._]?subs?|multi[- ._]?subtitles?|eng[- ._]?subs?|english[- ._]?subs?)\b/i.test(title)) {
+    titleSignals.push("release title advertises subtitles");
+  }
+  if (/\b(multi|dual[- ._]?audio|dubbed)\b/i.test(title)) {
+    titleSignals.push("release title advertises alternate audio/subtitle packaging");
+  }
+  for (const alias of aliases) {
+    if (alias && title.includes(alias) && /\b(subs?|subtitles?)\b/i.test(title)) {
+      titleSignals.push(`release title mentions ${requiredLanguage} subtitles`);
+      break;
+    }
+  }
+  const languageSignals = languages.some(language => aliases.some(alias => language === alias || language.includes(alias)))
+    ? [`release metadata includes ${requiredLanguage}`]
+    : [];
+  return {
+    requiredLanguage: requiredLanguage || "English",
+    titleSignals: [...new Set(titleSignals)],
+    languageSignals,
+    hasTitleSubtitleSignal: titleSignals.length > 0,
+    hasLanguageSignal: languageSignals.length > 0
+  };
+}
+
+function classifySubtitleReplacementRejection(reason) {
+  const text = String(reason || "").toLowerCase();
+  if (/equal or higher|same or higher|not an upgrade|not a upgrade|quality cutoff|cutoff has been met|custom format score|preferred word score|existing file.*custom format|existing file.*quality|existing file on disk/.test(text)) {
+    return "soft_existing_file_preferred";
+  }
+  if (/wrong series|series.*mismatch|episode.*not.*requested|not.*requested.*episode|wrong episode|wrong season|season.*not.*requested|full season pack|not wanted|unmonitored|too small|minimum size|blacklist|blacklisted|already.*queue|already.*download|indexer.*disabled|failed download|invalid/.test(text)) {
+    return "hard";
+  }
+  return "hard";
+}
+
+function subtitleReplacementAssessment(record, input = {}) {
+  const requiredLanguage = input.requiredSubtitleLanguage || "English";
+  const signals = subtitleSignalForRelease(record, requiredLanguage);
+  const rejections = releaseRejectionTexts(record);
+  const blockers = rejections.map(reason => ({
+    reason,
+    classification: classifySubtitleReplacementRejection(reason)
+  }));
+  const softBlockers = blockers.filter(blocker => blocker.classification !== "hard").map(blocker => blocker.reason);
+  const hardBlockers = blockers.filter(blocker => blocker.classification === "hard").map(blocker => blocker.reason);
+  const hasRequiredSubtitleSignal = signals.hasTitleSubtitleSignal || (input.allowLanguageOnlySignal === true && signals.hasLanguageSignal);
+  const onlySoftRejections = rejections.length > 0 && hardBlockers.length === 0;
+  const alreadyDownloadable = record?.downloadAllowed === true && record?.rejected !== true;
+  const eligibleWithoutOverride = alreadyDownloadable && hasRequiredSubtitleSignal && !hardBlockers.length;
+  const eligibleIfOverrideEqualOrHigherExisting = hasRequiredSubtitleSignal && !hardBlockers.length && (alreadyDownloadable || onlySoftRejections);
+  const overrideRequired = !eligibleWithoutOverride && eligibleIfOverrideEqualOrHigherExisting;
+  return compactObject({
+    requiredLanguage,
+    hasRequiredSubtitleSignal,
+    signals,
+    softBlockers,
+    hardBlockers,
+    overrideRequired,
+    eligibleWithoutOverride,
+    eligibleIfOverrideEqualOrHigherExisting,
+    eligibleForSubtitleReplacement: input.overrideEqualOrHigherExisting === true
+      ? eligibleIfOverrideEqualOrHigherExisting
+      : eligibleWithoutOverride,
+    note: hasRequiredSubtitleSignal
+      ? "Subtitle-related replacement is eligible only for exact releases with no hard Sonarr/Radarr rejection reasons."
+      : "No subtitle signal was found in the release title; set allowLanguageOnlySignal only when language metadata is known to represent subtitle availability."
+  });
+}
+
+function summarizeSubtitleReplacementCandidate(record, input = {}) {
+  const release = summarizeArrReleaseCandidate(record);
+  const subtitleReplacement = subtitleReplacementAssessment(record, input);
+  return compactObject({
+    ...release,
+    subtitleReplacement,
+    replacementGrab: compactObject({
+      ...release.grab,
+      episodeId: input.episodeId,
+      movieId: input.movieId,
+      requiredSubtitleLanguage: input.requiredSubtitleLanguage || "English",
+      overrideEqualOrHigherExisting: subtitleReplacement.overrideRequired || undefined,
+      dryRun: true
+    })
+  });
+}
+
 async function arrInteractiveSearch(serviceName, query, limit) {
   const body = await arrApi(serviceName, "v3", "release", { query });
   const records = Array.isArray(body) ? body : [];
@@ -7972,6 +8123,61 @@ async function arrInteractiveSearch(serviceName, query, limit) {
     returned: Math.min(records.length, limit),
     records: records.slice(0, limit).map(summarizeArrReleaseCandidate),
     note: "Use the exact guid and indexerId from a candidate with the matching grab object when calling the grab tool. Full release objects are accepted when needed, but raw download URLs are not returned here."
+  };
+}
+
+async function arrSubtitleReplacementSearch(serviceName, query, input) {
+  const limit = Number(input.limit || 50);
+  const body = await arrApi(serviceName, "v3", "release", { query });
+  const records = Array.isArray(body) ? body : [];
+  const mapped = records.slice(0, limit).map(record => summarizeSubtitleReplacementCandidate(record, {
+    ...input,
+    ...query
+  }));
+  return {
+    service: serviceName,
+    query,
+    requiredSubtitleLanguage: input.requiredSubtitleLanguage || "English",
+    total: records.length,
+    returned: mapped.length,
+    eligibleCount: mapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting).length,
+    records: input.includeIneligible === false
+      ? mapped.filter(record => record.subtitleReplacement?.eligibleIfOverrideEqualOrHigherExisting)
+      : mapped
+  };
+}
+
+async function sonarrSubtitleReplacementCandidates(input) {
+  const episodeIds = uniquePositiveIds([...(input.episodeIds || []), input.episodeId].filter(Boolean)).filter(id => id > 0);
+  if (!episodeIds.length) {
+    throw new Error("provide episodeId or episodeIds");
+  }
+  const episodeResults = await mapConcurrent(episodeIds, input.concurrency, episodeId =>
+    arrSubtitleReplacementSearch("sonarr", { episodeId }, input)
+  );
+  return {
+    service: "sonarr",
+    requiredSubtitleLanguage: input.requiredSubtitleLanguage || "English",
+    episodeResults,
+    records: episodeResults.flatMap(result => result.records),
+    note: "For subtitle repairs, equal-or-higher existing quality/custom-format rejections are soft blockers only when a candidate has a subtitle signal and no hard rejection reasons. Use sonarr_replace_episode_for_subtitles with overrideEqualOrHigherExisting for eligible soft-blocked candidates."
+  };
+}
+
+async function radarrSubtitleReplacementCandidates(input) {
+  const movieIds = uniquePositiveIds([...(input.movieIds || []), input.movieId].filter(Boolean)).filter(id => id > 0);
+  if (!movieIds.length) {
+    throw new Error("provide movieId or movieIds");
+  }
+  const movieResults = await mapConcurrent(movieIds, input.concurrency, movieId =>
+    arrSubtitleReplacementSearch("radarr", { movieId }, input)
+  );
+  return {
+    service: "radarr",
+    requiredSubtitleLanguage: input.requiredSubtitleLanguage || "English",
+    movieResults,
+    records: movieResults.flatMap(result => result.records),
+    note: "For subtitle repairs, equal-or-higher existing quality/custom-format rejections are soft blockers only when a candidate has a subtitle signal and no hard rejection reasons. Use radarr_replace_movie_for_subtitles with overrideEqualOrHigherExisting for eligible soft-blocked candidates."
   };
 }
 
@@ -8008,6 +8214,77 @@ function buildArrReleasePayload(input) {
     throw new Error("grab release requires an exact guid and indexerId, or a release object containing both");
   }
   return payload;
+}
+
+async function resolveArrReleaseForSubtitleReplacement(serviceName, input, query) {
+  const requested = buildArrReleasePayload(input);
+  const records = Array.isArray(query)
+    ? []
+    : await arrApi(serviceName, "v3", "release", { query }).catch(() => []);
+  const match = records.find(record =>
+    String(record.guid || "") === String(requested.guid || "") &&
+    Number(record.indexerId) === Number(requested.indexerId)
+  );
+  return match || requested;
+}
+
+async function replaceArrForSubtitles(serviceName, input, query) {
+  const release = await resolveArrReleaseForSubtitleReplacement(serviceName, input, query);
+  const assessment = subtitleReplacementAssessment(release, input);
+  const blockers = [];
+  if (!assessment.hasRequiredSubtitleSignal) {
+    blockers.push("release does not advertise the required subtitles");
+  }
+  blockers.push(...(assessment.hardBlockers || []));
+  if (assessment.overrideRequired && input.overrideEqualOrHigherExisting !== true) {
+    blockers.push("overrideEqualOrHigherExisting is required because the only blockers are existing quality/custom-format preferences");
+  }
+  const response = {
+    dryRun: input.dryRun,
+    service: serviceName,
+    query,
+    release: summarizeArrReleaseCandidate(release),
+    subtitleReplacement: assessment,
+    eligible: blockers.length === 0,
+    blockers
+  };
+  if (blockers.length) {
+    return {
+      ...response,
+      grabbed: false,
+      note: "Release was not grabbed because it is not eligible for guarded subtitle replacement."
+    };
+  }
+  if (input.dryRun) {
+    return {
+      ...response,
+      grabbed: false,
+      note: `Set dryRun to false to ask ${serviceName} to grab this exact subtitle-bearing replacement release.`
+    };
+  }
+  const result = await arrApi(serviceName, "v3", "release", {
+    method: "POST",
+    body: buildArrReleasePayload({
+      guid: release.guid,
+      indexerId: release.indexerId,
+      title: release.title,
+      indexer: release.indexer
+    })
+  });
+  return {
+    ...response,
+    dryRun: false,
+    grabbed: true,
+    result: redactSensitiveObject(result)
+  };
+}
+
+async function sonarrReplaceEpisodeForSubtitles(input) {
+  return replaceArrForSubtitles("sonarr", input, { episodeId: input.episodeId });
+}
+
+async function radarrReplaceMovieForSubtitles(input) {
+  return replaceArrForSubtitles("radarr", input, { movieId: input.movieId });
 }
 
 async function grabArrRelease(serviceName, input) {
@@ -9476,6 +9753,8 @@ function createServer() {
       forced: z.boolean().optional(),
       hi: z.boolean().optional(),
       maxEpisodes: z.number().int().min(1).max(50).default(20),
+      concurrency: z.number().int().min(1).max(10).default(8),
+      providerTimeoutMs: z.number().int().min(1000).max(30000).default(10000),
       limit: z.number().int().min(1).max(100).default(25)
     }
   }, async (input) => jsonText(await bazarrEpisodeSubtitleSearchCandidates(input)));
@@ -9958,6 +10237,39 @@ function createServer() {
     }
   }, async ({ episodeId, limit }) => jsonText(await arrInteractiveSearch("sonarr", { episodeId }, limit)));
 
+  server.registerTool("sonarr_subtitle_replacement_candidates", {
+    title: "Sonarr Subtitle Replacement Candidates",
+    description: "List exact Sonarr episode release candidates for subtitle repairs, classifying hard blockers separately from soft equal-quality/custom-format blockers.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      episodeId: z.number().int().positive().optional(),
+      episodeIds: z.array(z.number().int().positive()).max(20).optional(),
+      requiredSubtitleLanguage: z.string().min(1).default("English"),
+      allowLanguageOnlySignal: z.boolean().default(false),
+      includeIneligible: z.boolean().default(true),
+      concurrency: z.number().int().min(1).max(4).default(2),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async (input) => jsonText(await sonarrSubtitleReplacementCandidates(input)));
+
+  server.registerTool("sonarr_replace_episode_for_subtitles", {
+    title: "Sonarr Replace Episode For Subtitles",
+    description: "Guarded exact-release Sonarr grab for subtitle repairs. It may override equal/higher existing quality only when the candidate advertises subtitles and has no hard rejection reasons. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      episodeId: z.number().int().positive(),
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      requiredSubtitleLanguage: z.string().min(1).default("English"),
+      allowLanguageOnlySignal: z.boolean().default(false),
+      overrideEqualOrHigherExisting: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await sonarrReplaceEpisodeForSubtitles(input)));
+
   server.registerTool("sonarr_interactive_search_season", {
     title: "Sonarr Season-Pack Interactive Search And Grab",
     description: "List Sonarr season-level interactive search candidates for one exact series/season. Use the returned grab object with sonarr_grab_release to grab an exact season-pack release from Sonarr's release cache.",
@@ -10306,6 +10618,39 @@ function createServer() {
       limit: z.number().int().min(1).max(250).default(50)
     }
   }, async ({ movieId, limit }) => jsonText(await arrInteractiveSearch("radarr", { movieId }, limit)));
+
+  server.registerTool("radarr_subtitle_replacement_candidates", {
+    title: "Radarr Subtitle Replacement Candidates",
+    description: "List exact Radarr movie release candidates for subtitle repairs, classifying hard blockers separately from soft equal-quality/custom-format blockers.",
+    annotations: { destructiveHint: false, readOnlyHint: true },
+    inputSchema: {
+      movieId: z.number().int().positive().optional(),
+      movieIds: z.array(z.number().int().positive()).max(20).optional(),
+      requiredSubtitleLanguage: z.string().min(1).default("English"),
+      allowLanguageOnlySignal: z.boolean().default(false),
+      includeIneligible: z.boolean().default(true),
+      concurrency: z.number().int().min(1).max(4).default(2),
+      limit: z.number().int().min(1).max(250).default(50)
+    }
+  }, async (input) => jsonText(await radarrSubtitleReplacementCandidates(input)));
+
+  server.registerTool("radarr_replace_movie_for_subtitles", {
+    title: "Radarr Replace Movie For Subtitles",
+    description: "Guarded exact-release Radarr grab for subtitle repairs. It may override equal/higher existing quality only when the candidate advertises subtitles and has no hard rejection reasons. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      movieId: z.number().int().positive(),
+      guid: z.string().min(1).optional(),
+      indexerId: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      release: z.object({}).catchall(z.any()).optional(),
+      requiredSubtitleLanguage: z.string().min(1).default("English"),
+      allowLanguageOnlySignal: z.boolean().default(false),
+      overrideEqualOrHigherExisting: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await radarrReplaceMovieForSubtitles(input)));
 
   server.registerTool("radarr_grab_release", {
     title: "Radarr Grab Release",

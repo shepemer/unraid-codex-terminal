@@ -871,6 +871,10 @@ async function testSubtitleServerActionPlanExecutesRepair() {
     assert.equal(details.agentRuns[0].status, "fixed");
     assert.match(details.agentRuns[0].prompt, /Current media MCP tool briefing/);
     assert.match(details.agentRuns[0].prompt, /bazarr_download_movie_subtitles_for_plex/);
+    assert.match(details.agentRuns[0].prompt, /For subtitle-only requests/);
+    assert.match(details.agentRuns[0].prompt, /sonarr_subtitle_replacement_candidates/);
+    assert.match(details.agentRuns[0].prompt, /radarr_replace_movie_for_subtitles/);
+    assert.match(details.agentRuns[0].prompt, /Equal-or-higher existing quality\/custom-format score is not a blocker/);
     assert.match(details.agentRuns[0].prompt, /Persistent scratch workspace/);
     assert.match(details.agentRuns[0].prompt, /Prefer Bazarr for subtitle repairs/);
     assert.match(details.agentRuns[0].prompt, /repair-workspaces\/job-/);
@@ -2258,6 +2262,60 @@ async function testRepairRunnerEarlyExitDoesNotCrashOnEpipe() {
   }
 }
 
+async function testRepairMcpProxyTimeoutReturnsRequestScopedError() {
+  const dir = await tempDir();
+  const slowServer = http.createServer((req, res) => {
+    req.resume();
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 123, result: { content: [{ type: "text", text: "{}" }] } }));
+    }, 1000);
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      slowServer.once("error", reject);
+      slowServer.listen(0, "127.0.0.1", resolve);
+    });
+    const codexBin = path.join(dir, "codex-proxy-timeout.mjs");
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "const urlArg = process.argv.find(arg => arg.startsWith('mcp_servers.media.url='));",
+      "const url = JSON.parse(urlArg.slice(urlArg.indexOf('=') + 1));",
+      "const response = await fetch(url, {",
+      "  method: 'POST',",
+      "  headers: { authorization: `Bearer ${process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN}`, 'content-type': 'application/json' },",
+      "  body: JSON.stringify({ jsonrpc: '2.0', id: 123, method: 'tools/call', params: { name: 'fixture_slow_tool', arguments: {} } })",
+      "});",
+      "const body = await response.json();",
+      "if (response.status !== 200 || body.id !== 123 || !body.error || !/timeout|aborted/i.test(body.error.message || '')) {",
+      "  console.error(JSON.stringify({ status: response.status, body }));",
+      "  process.exit(44);",
+      "}",
+      "const final = { status: 'failed_retryable', summary: 'Upstream MCP timed out cleanly.', actionsTaken: [], verification: { status: 'failed', details: 'timeout' }, draftComment: '', closeRecommended: false, missingMcpItems: [] };",
+      "process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(final) } })}\\n`);"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    const events = [];
+    const output = await runCodexRepair({
+      codexBin,
+      codexWorkspace: path.join(dir, "workspace"),
+      codexHome: path.join(dir, "codex-home"),
+      codexTimeoutMs: 5000,
+      codexRepairTimeoutMs: 5000,
+      mcpRequestTimeoutMs: 100,
+      mediaMcpUrl: `http://127.0.0.1:${slowServer.address().port}/mcp`,
+      mediaMcpBearerToken: "fixture-token"
+    }, "Autonomous approved media repair execution.", {}, {
+      onEvent: event => events.push(event)
+    });
+    assert.match(output.finalMessage, /Upstream MCP timed out cleanly/);
+    assert.ok(events.some(event => event.type === "repair_mcp_proxy_error" && /timeout|aborted/i.test(event.error || "")));
+  } finally {
+    await new Promise(resolve => slowServer.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function testStartupDoesNotRecoverFreshRunningRepairRun() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -3020,6 +3078,7 @@ async function run() {
   testCodexEnvAndPromptHardening();
   await testRepairRunnerUsesOutputLastMessageAndMinimalEnv();
   await testRepairRunnerEarlyExitDoesNotCrashOnEpipe();
+  await testRepairMcpProxyTimeoutReturnsRequestScopedError();
   await testStartupDoesNotRecoverFreshRunningRepairRun();
   await testStartupDoesNotRecoverLiveOwnerStaleRepairRun();
   await testStartupRecoversStaleInterruptedRepairRun();
