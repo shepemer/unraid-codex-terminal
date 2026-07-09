@@ -33,6 +33,8 @@ function parseSse(text) {
 async function run() {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), "media-mcp-subtitles-"));
   const calls = [];
+  let providerActive = 0;
+  let providerMaxActive = 0;
   const mock = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const body = await new Promise((resolve, reject) => {
@@ -151,33 +153,40 @@ async function run() {
     }
     if (req.method === "GET" && url.pathname === "/bazarr/api/providers/episodes") {
       assert.equal(req.headers["x-api-key"], "bazarr-key");
-      assert.equal(url.searchParams.get("episodeid"), "701");
+      const episodeId = url.searchParams.get("episodeid");
+      assert.ok(["701", "702"].includes(episodeId));
+      providerActive += 1;
+      providerMaxActive = Math.max(providerMaxActive, providerActive);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      providerActive -= 1;
       return sendJson(res, 200, {
-        data: [
-          {
-            provider: "fixture-provider",
-            language: "English",
-            forced: "False",
-            hearing_impaired: "False",
-            score: 97.5,
-            orig_score: 356,
-            score_without_hash: 335,
-            matches: ["series", "season", "episode"],
-            dont_matches: ["hash"],
-            release_info: ["Fixture.Show.S01E01.1080p"],
-            subtitle: "subtitle-cache-id",
-            original_format: "False",
-            url: "https://subtitle.invalid/private-result"
-          },
-          {
-            provider: "fixture-provider",
-            language: "Spanish",
-            forced: "False",
-            hearing_impaired: "False",
-            score: 80,
-            subtitle: "spanish-cache-id"
-          }
-        ]
+        data: episodeId === "701"
+          ? [
+            {
+              provider: "fixture-provider",
+              language: "English",
+              forced: "False",
+              hearing_impaired: "False",
+              score: 97.5,
+              orig_score: 356,
+              score_without_hash: 335,
+              matches: ["series", "season", "episode"],
+              dont_matches: ["hash"],
+              release_info: ["Fixture.Show.S01E01.1080p"],
+              subtitle: "subtitle-cache-id",
+              original_format: "False",
+              url: "https://subtitle.invalid/private-result"
+            },
+            {
+              provider: "fixture-provider",
+              language: "Spanish",
+              forced: "False",
+              hearing_impaired: "False",
+              score: 80,
+              subtitle: "spanish-cache-id"
+            }
+          ]
+          : []
       });
     }
     if (req.method === "PATCH" && url.pathname === "/bazarr/api/episodes/subtitles") {
@@ -372,6 +381,20 @@ async function run() {
     assert.equal(episodeCandidates.records[0].candidates[0].downloadArguments.subtitle, "subtitle-cache-id");
     assert.equal(episodeCandidates.records[0].candidates[0].url, "[redacted]");
 
+    providerMaxActive = 0;
+    const multiEpisodeCandidates = await tool("bazarr_episode_subtitle_search_candidates", {
+      episodeIds: [701, 702],
+      language: "en",
+      concurrency: 2,
+      providerTimeoutMs: 5000,
+      limit: 10
+    });
+    assert.equal(multiEpisodeCandidates.records.length, 2);
+    assert.equal(multiEpisodeCandidates.concurrency, 2);
+    assert.equal(multiEpisodeCandidates.providerTimeoutMs, 5000);
+    assert.deepEqual(multiEpisodeCandidates.records.map(record => record.target.episodeId), [701, 702]);
+    assert.equal(providerMaxActive, 2);
+
     const episodeDryRun = await tool("bazarr_download_episode_subtitles", {
       seriesId: 77,
       seasonNumber: 1,
@@ -389,6 +412,7 @@ async function run() {
     });
     assert.equal(episodeDownloaded.dryRun, false);
     assert.equal(episodeDownloaded.results[0].episodeId, 701);
+    assert.equal(episodeDownloaded.results[0].result.ok, true);
     assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/episodes/subtitles").length, 1);
 
     const multiEpisodeDryRun = await tool("bazarr_download_episode_subtitles", {
@@ -406,6 +430,7 @@ async function run() {
       ...episodeCandidates.records[0].candidates[0].downloadArguments
     });
     assert.equal(exactEpisodeDownloaded.mode, "exact_candidate");
+    assert.equal(exactEpisodeDownloaded.results[0].result.ok, true);
     assert.equal(calls.filter(call => call.method === "POST" && call.path === "/bazarr/api/providers/episodes").length, 1);
 
     const movieCandidates = await tool("bazarr_movie_subtitle_search_candidates", {
@@ -420,6 +445,7 @@ async function run() {
       ...movieCandidates.candidates[0].downloadArguments
     });
     assert.equal(exactMovieDownloaded.mode, "exact_candidate");
+    assert.equal(exactMovieDownloaded.result.ok, true);
     assert.equal(calls.filter(call => call.method === "POST" && call.path === "/bazarr/api/providers/movies").length, 1);
 
     const dryRun = await tool("bazarr_download_movie_subtitles_for_plex", {
@@ -440,6 +466,7 @@ async function run() {
     });
     assert.equal(downloaded.dryRun, false);
     assert.equal(downloaded.radarrMovie.id, 44);
+    assert.equal(downloaded.result.ok, true);
     assert.equal(calls.filter(call => call.method === "PATCH" && call.path === "/bazarr/api/movies/subtitles").length, 1);
 
     const refreshed = await tool("plex_refresh_metadata", { ratingKey: "900001", dryRun: false });

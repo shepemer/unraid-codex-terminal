@@ -570,6 +570,60 @@ async function run() {
           }
         ]);
       }
+      if (service === "sonarr" && query.episodeId === "301") {
+        return sendJson(res, 200, [
+          {
+            guid: "sonarr-subtitle-soft-guid",
+            indexerId: 11,
+            indexer: "Mock Indexer",
+            title: "Show.S03E01.1080p.WEB-DL.English.Subs-GRP",
+            releaseType: "singleEpisode",
+            downloadAllowed: false,
+            rejected: true,
+            languages: [{ name: "English" }],
+            rejections: [{ reason: "Existing file on disk has equal or higher custom format score" }],
+            downloadUrl: "https://example.invalid/download?apikey=secret"
+          },
+          {
+            guid: "sonarr-wrong-episode-guid",
+            indexerId: 11,
+            indexer: "Mock Indexer",
+            title: "Show.S02E01.1080p.WEB-DL.English.Subs-GRP",
+            releaseType: "singleEpisode",
+            downloadAllowed: false,
+            rejected: true,
+            languages: [{ name: "English" }],
+            rejections: [{ reason: "Episode wasn't requested: 2x01" }]
+          },
+          {
+            guid: "sonarr-no-subtitle-signal-guid",
+            indexerId: 11,
+            indexer: "Mock Indexer",
+            title: "Show.S03E01.1080p.WEB-DL-GRP",
+            releaseType: "singleEpisode",
+            downloadAllowed: false,
+            rejected: true,
+            languages: [{ name: "English" }],
+            rejections: [{ reason: "Existing file on disk has equal or higher quality" }]
+          }
+        ]);
+      }
+      if (service === "radarr" && query.movieId === "401") {
+        return sendJson(res, 200, [
+          {
+            guid: "radarr-subtitle-soft-guid",
+            indexerId: 22,
+            indexer: "Mock Indexer",
+            title: "Movie.2026.1080p.WEB-DL.English.Subtitles-GRP",
+            releaseType: "movie",
+            downloadAllowed: false,
+            rejected: true,
+            languages: [{ name: "English" }],
+            rejections: [{ reason: "Existing file on disk has equal or higher quality" }],
+            downloadUrl: "https://example.invalid/movie?apikey=secret"
+          }
+        ]);
+      }
       return sendJson(res, 200, [{
         guid: `${service}-guid`,
         indexerId: service === "sonarr" ? 11 : 22,
@@ -778,6 +832,8 @@ async function run() {
       "sonarr_queue_item_files",
       "sonarr_import_queue_item",
       "sonarr_interactive_search_episode",
+      "sonarr_subtitle_replacement_candidates",
+      "sonarr_replace_episode_for_subtitles",
       "sonarr_interactive_search_season",
       "sonarr_grab_release",
       "sonarr_blocklist_episode_file_source",
@@ -802,6 +858,8 @@ async function run() {
       "radarr_queue_item_files",
       "radarr_import_queue_item",
       "radarr_interactive_search_movie",
+      "radarr_subtitle_replacement_candidates",
+      "radarr_replace_movie_for_subtitles",
       "radarr_grab_release",
       "radarr_download_client_scan",
       "radarr_command_cancel",
@@ -1096,6 +1154,90 @@ async function run() {
     const grab = await tool("sonarr_grab_release", { guid: "sonarr-guid", indexerId: 11, dryRun: false });
     assert.deepEqual(lastCall().body, { guid: "sonarr-guid", indexerId: 11 });
     assert.equal(grab.result.downloadUrl, "[redacted]");
+
+    const subtitleCandidates = await tool("sonarr_subtitle_replacement_candidates", {
+      episodeIds: [301],
+      requiredSubtitleLanguage: "English",
+      limit: 5
+    });
+    assert.equal(subtitleCandidates.episodeResults.length, 1);
+    const softSubtitleCandidate = subtitleCandidates.records.find(record => record.guid === "sonarr-subtitle-soft-guid");
+    assert.equal(softSubtitleCandidate.downloadUrl, undefined);
+    assert.equal(softSubtitleCandidate.subtitleReplacement.eligibleWithoutOverride, false);
+    assert.equal(softSubtitleCandidate.subtitleReplacement.eligibleIfOverrideEqualOrHigherExisting, true);
+    assert.equal(softSubtitleCandidate.subtitleReplacement.overrideRequired, true);
+    assert.match(softSubtitleCandidate.subtitleReplacement.softBlockers[0], /equal or higher/i);
+    const hardSubtitleCandidate = subtitleCandidates.records.find(record => record.guid === "sonarr-wrong-episode-guid");
+    assert.equal(hardSubtitleCandidate.subtitleReplacement.eligibleIfOverrideEqualOrHigherExisting, false);
+    assert.match(hardSubtitleCandidate.subtitleReplacement.hardBlockers[0], /wasn't requested/i);
+    const noSubtitleSignalCandidate = subtitleCandidates.records.find(record => record.guid === "sonarr-no-subtitle-signal-guid");
+    assert.equal(noSubtitleSignalCandidate.subtitleReplacement.hasRequiredSubtitleSignal, false);
+    assert.equal(noSubtitleSignalCandidate.subtitleReplacement.eligibleIfOverrideEqualOrHigherExisting, false);
+
+    const blockedSubtitleReplacement = await tool("sonarr_replace_episode_for_subtitles", {
+      episodeId: 301,
+      guid: "sonarr-subtitle-soft-guid",
+      indexerId: 11,
+      requiredSubtitleLanguage: "English",
+      dryRun: true
+    });
+    assert.equal(blockedSubtitleReplacement.eligible, false);
+    assert.equal(blockedSubtitleReplacement.grabbed, false);
+    assert.match(blockedSubtitleReplacement.blockers.join("\n"), /overrideEqualOrHigherExisting/);
+    const beforeSubtitleDryGrab = postReleaseCallCount();
+    const drySubtitleReplacement = await tool("sonarr_replace_episode_for_subtitles", {
+      episodeId: 301,
+      guid: "sonarr-subtitle-soft-guid",
+      indexerId: 11,
+      requiredSubtitleLanguage: "English",
+      overrideEqualOrHigherExisting: true,
+      dryRun: true
+    });
+    assert.equal(drySubtitleReplacement.eligible, true);
+    assert.equal(drySubtitleReplacement.grabbed, false);
+    assert.equal(postReleaseCallCount(), beforeSubtitleDryGrab);
+    const hardBlockedReplacement = await tool("sonarr_replace_episode_for_subtitles", {
+      episodeId: 301,
+      guid: "sonarr-wrong-episode-guid",
+      indexerId: 11,
+      requiredSubtitleLanguage: "English",
+      overrideEqualOrHigherExisting: true,
+      dryRun: true
+    });
+    assert.equal(hardBlockedReplacement.eligible, false);
+    assert.match(hardBlockedReplacement.blockers.join("\n"), /wasn't requested/i);
+    const grabbedSubtitleReplacement = await tool("sonarr_replace_episode_for_subtitles", {
+      episodeId: 301,
+      guid: "sonarr-subtitle-soft-guid",
+      indexerId: 11,
+      requiredSubtitleLanguage: "English",
+      overrideEqualOrHigherExisting: true,
+      dryRun: false
+    });
+    assert.equal(grabbedSubtitleReplacement.grabbed, true);
+    assert.equal(lastCall().method, "POST");
+    assert.equal(lastCall().path, "release");
+    assert.equal(lastCall().body.guid, "sonarr-subtitle-soft-guid");
+    assert.equal(lastCall().body.downloadUrl, undefined);
+
+    const movieSubtitleCandidates = await tool("radarr_subtitle_replacement_candidates", {
+      movieIds: [401],
+      requiredSubtitleLanguage: "English",
+      limit: 5
+    });
+    assert.equal(movieSubtitleCandidates.movieResults.length, 1);
+    assert.equal(movieSubtitleCandidates.records[0].guid, "radarr-subtitle-soft-guid");
+    assert.equal(movieSubtitleCandidates.records[0].subtitleReplacement.eligibleIfOverrideEqualOrHigherExisting, true);
+    const dryMovieSubtitleReplacement = await tool("radarr_replace_movie_for_subtitles", {
+      movieId: 401,
+      guid: "radarr-subtitle-soft-guid",
+      indexerId: 22,
+      requiredSubtitleLanguage: "English",
+      overrideEqualOrHigherExisting: true,
+      dryRun: true
+    });
+    assert.equal(dryMovieSubtitleReplacement.eligible, true);
+    assert.equal(dryMovieSubtitleReplacement.grabbed, false);
 
     const beforeDryBlocklist = calls.length;
     const dryBlocklist = await tool("sonarr_blocklist_episode_file_source", {
