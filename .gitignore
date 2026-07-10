@@ -1,4 +1,5 @@
 node_modules/
+coverage/
 media-mcp/node_modules/
 utilities-mcp/node_modules/
 data/

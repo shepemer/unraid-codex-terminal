@@ -1,4 +1,3 @@
-import { once } from "node:events";
 import { appendFileSync, createReadStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
@@ -129,9 +128,26 @@ function shouldIncludeLine(line, from, to) {
 }
 
 async function writeChunk(writable, chunk) {
-  if (!writable.write(chunk)) {
-    await once(writable, "drain");
+  if (writable.destroyed || writable.writableEnded) {
+    return false;
   }
+  if (!writable.write(chunk)) {
+    const outcome = await new Promise(resolve => {
+      const finish = value => {
+        writable.removeListener("drain", onDrain);
+        writable.removeListener("close", onClose);
+        writable.removeListener("error", onClose);
+        resolve(value);
+      };
+      const onDrain = () => finish("drain");
+      const onClose = () => finish("close");
+      writable.once("drain", onDrain);
+      writable.once("close", onClose);
+      writable.once("error", onClose);
+    });
+    return outcome === "drain" && !writable.destroyed;
+  }
+  return true;
 }
 
 export async function streamDiagnosticLog(logPath, range = {}, writable) {
@@ -153,7 +169,10 @@ export async function streamDiagnosticLog(logPath, range = {}, writable) {
     const lines = readline.createInterface({ input, crlfDelay: Infinity });
     for await (const line of lines) {
       if (shouldIncludeLine(line, from, to)) {
-        await writeChunk(writable, `${line}\n`);
+        if (!await writeChunk(writable, `${line}\n`)) {
+          input.destroy();
+          return;
+        }
       }
     }
   }
@@ -171,19 +190,29 @@ export async function readDiagnosticLog(logPath, range = {}) {
 }
 
 export async function readDiagnosticLogRecords(logPath, range = {}, options = {}) {
-  const text = await readDiagnosticLog(logPath, range);
-  const records = text
-    .split("\n")
-    .filter(Boolean)
-    .map(line => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+  const { from, to } = normalizeDiagnosticLogRange(range);
   const limit = Math.max(1, Math.min(Number(options.limit || 500), 5000));
+  const records = [];
+  for (const file of diagnosticLogFiles(logPath)) {
+    if (!existsSync(file)) {
+      continue;
+    }
+    const input = createReadStream(file, { encoding: "utf8" });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!shouldIncludeLine(line, from, to)) {
+        continue;
+      }
+      try {
+        records.push(JSON.parse(line));
+        if (records.length > limit * 2) {
+          records.splice(0, records.length - limit);
+        }
+      } catch {
+        // A partial or malformed diagnostic line is ignored.
+      }
+    }
+  }
   return records.slice(-limit);
 }
 
@@ -198,15 +227,57 @@ function reportLogFailure(logPath, error) {
 
 export function createDiagnosticLogger(config = {}) {
   const logPath = config.logPath || defaultDiagnosticLogPath(config.dbPath);
+  const historyLimit = Math.max(100, Math.min(Number(config.liveLogHistoryLimit || 5000), 20000));
+  const history = [];
+  let cursor = 0;
+  let historyLoaded = false;
   return {
     logPath,
+    async loadHistory() {
+      if (historyLoaded) {
+        return;
+      }
+      try {
+        const records = await readDiagnosticLogRecords(logPath, {}, { limit: historyLimit });
+        for (const record of records) {
+          cursor += 1;
+          history.push({ cursor, record: sanitizeValue(record) });
+        }
+        historyLoaded = true;
+      } catch (error) {
+        reportLogFailure(logPath, error);
+      }
+    },
     log(level, event, payload = {}) {
       try {
-        return appendDiagnosticLog(logPath, level, event, payload);
+        const record = appendDiagnosticLog(logPath, level, event, payload);
+        if (record) {
+          cursor += 1;
+          history.push({ cursor, record });
+          if (history.length > historyLimit) {
+            history.splice(0, history.length - historyLimit);
+          }
+        }
+        return record;
       } catch (error) {
         reportLogFailure(logPath, error);
         return null;
       }
+    },
+    recent(options = {}) {
+      const afterCursor = Math.max(0, Number(options.afterCursor || 0));
+      const limit = Math.max(1, Math.min(Number(options.limit || 500), historyLimit));
+      const oldestCursor = history[0]?.cursor || cursor + 1;
+      const reset = afterCursor > 0 && afterCursor < oldestCursor - 1;
+      const available = afterCursor > 0 && !reset
+        ? history.filter(entry => entry.cursor > afterCursor)
+        : history;
+      const selected = available.slice(-limit);
+      return {
+        records: selected.map(entry => entry.record),
+        cursor: selected.at(-1)?.cursor || cursor,
+        reset
+      };
     }
   };
 }

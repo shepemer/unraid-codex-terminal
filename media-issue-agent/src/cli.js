@@ -56,9 +56,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     config.suppressInitLog = true;
   }
   const agent = new MediaIssueAgent(config);
-  if (command !== "status") {
-    await agent.init();
-  }
+  await agent.init();
 
   if (command === "serve") {
     await agent.serve();
@@ -126,7 +124,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {
-    console.error(redactText(error.stack || error.message));
+    for (const line of redactText(error.stack || error.message).split(/\r?\n/)) {
+      console.error(`${new Date().toISOString()} media-issue-agent: ${line}`);
+    }
     process.exit(1);
   });
 }

@@ -6,39 +6,80 @@ import os from "node:os";
 import path from "node:path";
 import { redactText, sanitizeValue } from "./redact.js";
 
+const MAX_CODEX_CAPTURE_CHARS = 2 * 1024 * 1024;
+
+function appendBounded(current, chunk, maxChars = MAX_CODEX_CAPTURE_CHARS) {
+  const combined = `${current}${chunk}`;
+  return combined.length <= maxChars ? combined : combined.slice(-maxChars);
+}
+
+function signalChildProcessGroup(child, signal) {
+  if (!child?.pid) {
+    return false;
+  }
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-child.pid, signal);
+      return true;
+    }
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+  }
+  try {
+    return child.kill(signal);
+  } catch {
+    return false;
+  }
+}
+
 function runProcess(command, args, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"]
     });
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let terminationError = null;
+    let killTimer = null;
     const rejectOnce = error => {
       clearTimeout(timeout);
+      clearTimeout(killTimer);
       if (!settled) {
         settled = true;
         reject(error);
       }
     };
+    const requestTermination = error => {
+      if (settled || terminationError) {
+        return;
+      }
+      terminationError = error;
+      signalChildProcessGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        signalChildProcessGroup(child, "SIGKILL");
+      }, Math.max(50, Number(options.terminationGraceMs || 5000)));
+      killTimer.unref?.();
+    };
     const handleStdinError = error => {
       if (["EPIPE", "EOF", "ERR_STREAM_DESTROYED"].includes(error?.code)) {
         return;
       }
-      child.kill("SIGTERM");
-      rejectOnce(error);
+      requestTermination(error);
     };
     const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
-      rejectOnce(new Error(`Codex timed out after ${options.timeoutMs}ms`));
+      requestTermination(new Error(`Codex timed out after ${options.timeoutMs}ms`));
     }, options.timeoutMs);
     child.stdout.on("data", chunk => {
-      stdout += chunk;
+      stdout = appendBounded(stdout, chunk);
     });
     child.stderr.on("data", chunk => {
-      stderr += chunk;
+      stderr = appendBounded(stderr, chunk);
     });
     child.on("error", error => {
       rejectOnce(error);
@@ -51,10 +92,15 @@ function runProcess(command, args, options) {
     }
     child.on("close", code => {
       clearTimeout(timeout);
+      clearTimeout(killTimer);
       if (settled) {
         return;
       }
       settled = true;
+      if (terminationError) {
+        reject(terminationError);
+        return;
+      }
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -109,7 +155,6 @@ export function buildCodexSubprocessEnv(config, extra = {}) {
   return env;
 }
 
-const UNTRUSTED_TEXT_KEY_PATTERN = /(message|description|comment|comments|report|reporter|title|subject|summary|note|notes|text|username|displayName|mediaTitle)/i;
 const UNTRUSTED_START = "[UNTRUSTED_USER_TEXT_START]";
 const UNTRUSTED_END = "[UNTRUSTED_USER_TEXT_END]";
 
@@ -119,18 +164,15 @@ function escapePromptSentinels(value) {
     .replaceAll(UNTRUSTED_END, "[ESCAPED_UNTRUSTED_USER_TEXT_END]");
 }
 
-function promptSafeString(value, key) {
+function promptSafeString(value) {
   const text = escapePromptSentinels(redactText(value));
-  if (!UNTRUSTED_TEXT_KEY_PATTERN.test(String(key || ""))) {
-    return text;
-  }
   return `${UNTRUSTED_START}\n${text}\n${UNTRUSTED_END}`;
 }
 
 function promptSafeValue(value, key = "") {
   const sanitized = sanitizeValue(value);
   if (typeof sanitized === "string") {
-    return promptSafeString(sanitized, key);
+    return promptSafeString(sanitized);
   }
   if (Array.isArray(sanitized)) {
     return sanitized.map(item => promptSafeValue(item, key));
@@ -196,7 +238,7 @@ export function repairExecutionPrompt(evidence, approvedPlan, context = {}) {
   if (context.scratchWorkspace) {
     contextSections.push(
       "Persistent scratch workspace for this job:",
-      redactText(context.scratchWorkspace)
+      String(context.scratchWorkspace)
     );
   }
   if (context.toolBriefing) {
@@ -206,15 +248,27 @@ export function repairExecutionPrompt(evidence, approvedPlan, context = {}) {
     );
   }
   if (context.retry) {
+    const operatorNote = redactText(String(context.retry.operatorNote || "").trim());
     contextSections.push(
-      "Trusted retry context:",
-      JSON.stringify(promptPayload(context.retry), null, 2)
+      "Trusted operator retry guidance:",
+      operatorNote || "No additional operator note was supplied.",
+      "Previous retry context with untrusted error/output text marked:",
+      JSON.stringify(promptPayload({
+        previousJobError: context.retry.previousJobError || "",
+        previousBlocker: context.retry.previousBlocker || ""
+      }), null, 2)
     );
   }
   if (context.previousRepairHistory) {
     contextSections.push(
       "Previous autonomous repair history:",
       JSON.stringify(promptPayload(context.previousRepairHistory), null, 2)
+    );
+  }
+  if (approvedPlan?.operatorMessage) {
+    contextSections.push(
+      "Trusted operator guidance approved for this repair:",
+      redactText(approvedPlan.operatorMessage)
     );
   }
   return [
@@ -249,10 +303,10 @@ export function repairExecutionPrompt(evidence, approvedPlan, context = {}) {
 export function mcpCapabilityCheckPrompt(items, tools) {
   return [
     "MCP capability gap audit.",
-    "You are Codex running inside media-issue-agent with access to the same media MCP server configuration used by autonomous repair runs.",
+    "You are Codex running inside media-issue-agent with a current metadata snapshot of the same media MCP tools available to autonomous repair runs.",
     "Your job is only to compare requested missing MCP capabilities against the current available media MCP tools.",
     "Your JSON is advisory comparison evidence. media-issue-agent applies a deterministic metadata policy to the final detected/not-detected result.",
-    "Do not repair media, do not call mutating tools, do not post comments, and do not close or reopen issues.",
+    "This audit runner has no media MCP connection. Do not repair media, post comments, or propose invoking tools during the audit.",
     "Reason from each request's title, description, category, reason, and surrounding context. The suggestedToolName field is only a historical hint and may be wrong or incomplete.",
     "Mark a request detected only when the available tools can satisfy the requested capability well enough for the repair runner to use it.",
     "Do not mark a capability detected merely because a suggested tool name appears; compare the request intent and context against tool names and descriptions.",
@@ -328,6 +382,37 @@ export function buildRepairCodexArgs(config, settings = {}, options = {}) {
   return { args, settings: effective };
 }
 
+export function buildAnalysisCodexArgs(config, settings = {}, options = {}) {
+  const effective = codexRepairSettings(config, settings);
+  const args = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--json"
+  ];
+  if (options.applySettings) {
+    if (effective.model) {
+      args.push("--model", effective.model);
+    }
+    if (effective.reasoningEffort) {
+      args.push("-c", `model_reasoning_effort=${tomlValue(effective.reasoningEffort)}`);
+    }
+    if (effective.fastMode) {
+      args.push("-c", "features.fast_mode=true");
+    }
+    if (effective.serviceTier) {
+      args.push("-c", `service_tier=${tomlValue(effective.serviceTier)}`);
+    }
+  }
+  if (options.outputLastMessagePath) {
+    args.push("--output-last-message", options.outputLastMessagePath);
+  }
+  args.push("-");
+  return { args, settings: effective };
+}
+
 export function steeredInvestigationPrompt(evidence, previousSummary, operatorMessage) {
   const safeOperatorMessage = redactText(String(operatorMessage || ""));
   return [
@@ -357,24 +442,19 @@ export async function runCodex(config, prompt, hooks = {}) {
   const outputLastMessagePath = path.join(outputDir, "last-message.txt");
   const env = buildCodexSubprocessEnv(config);
   try {
+    const { args } = buildAnalysisCodexArgs(config, hooks.settings || {}, {
+      outputLastMessagePath,
+      applySettings: Boolean(hooks.settings)
+    });
     const result = await runProcess(
       config.codexBin,
-      [
-        "exec",
-        "--sandbox",
-        "read-only",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--json",
-        "--output-last-message",
-        outputLastMessagePath,
-        "-"
-      ],
+      args,
       {
         cwd: config.codexWorkspace,
         env,
         input: prompt,
-        timeoutMs: config.codexTimeoutMs
+        timeoutMs: config.codexTimeoutMs,
+        terminationGraceMs: config.codexTerminationGraceMs
       }
     );
     let finalMessage = "";
@@ -524,6 +604,14 @@ function closeServer(server) {
 
 async function startRepairMcpProxy(config, hooks = {}) {
   const token = `repair-${randomBytes(24).toString("hex")}`;
+  const upstreamControllers = new Set();
+  const emitProxyEvent = event => {
+    try {
+      hooks.onEvent?.(sanitizeValue(event));
+    } catch (error) {
+      hooks.onEventError?.(error);
+    }
+  };
   const server = http.createServer(async (req, res) => {
     let payload = null;
     try {
@@ -540,17 +628,17 @@ async function startRepairMcpProxy(config, hooks = {}) {
       const bodyText = await readRequestBody(req);
       payload = bodyText ? JSON.parse(bodyText) : {};
       for (const toolCall of toolCallRequests(payload)) {
-        hooks.onEvent?.(sanitizeValue({
+        emitProxyEvent({
           type: "repair_mcp_tool_call",
           toolName: toolCall.params.name,
           arguments: toolCall.params.arguments || {}
-        }));
+        });
       }
       const blocked = blockedToolRequest(payload);
       if (blocked) {
         const toolName = blocked.params.name;
         const message = `Tool ${toolName} is blocked during autonomous repair; media-issue-agent handles issue comments and lifecycle changes after final human approval.`;
-        hooks.onEvent?.(sanitizeValue({ type: "repair_mcp_proxy_blocked", toolName, message }));
+        emitProxyEvent({ type: "repair_mcp_proxy_blocked", toolName, message });
         const errorPayload = Array.isArray(payload)
           ? requestsFromPayload(payload).map(request => repairProxyError(request?.id, message))
           : repairProxyError(blocked?.id, message);
@@ -558,24 +646,35 @@ async function startRepairMcpProxy(config, hooks = {}) {
         res.end(JSON.stringify(errorPayload));
         return;
       }
-      const upstream = await fetch(config.mediaMcpUrl, {
-        method: "POST",
-        signal: AbortSignal.timeout(config.mcpRequestTimeoutMs || 30000),
-        headers: {
-          authorization: `Bearer ${config.mediaMcpBearerToken || ""}`,
-          "content-type": req.headers["content-type"] || "application/json",
-          accept: req.headers.accept || "application/json, text/event-stream"
-        },
-        body: bodyText
-      });
-      const upstreamText = await upstream.text();
+      const upstreamController = new AbortController();
+      upstreamControllers.add(upstreamController);
+      let upstream;
+      let upstreamText;
+      try {
+        upstream = await fetch(config.mediaMcpUrl, {
+          method: "POST",
+          signal: AbortSignal.any([
+            upstreamController.signal,
+            AbortSignal.timeout(config.mcpRequestTimeoutMs || 30000)
+          ]),
+          headers: {
+            authorization: `Bearer ${config.mediaMcpBearerToken || ""}`,
+            "content-type": req.headers["content-type"] || "application/json",
+            accept: req.headers.accept || "application/json, text/event-stream"
+          },
+          body: bodyText
+        });
+        upstreamText = await upstream.text();
+      } finally {
+        upstreamControllers.delete(upstreamController);
+      }
       if (toolCallRequests(payload).length) {
-        hooks.onEvent?.(sanitizeValue({
+        emitProxyEvent({
           type: "repair_mcp_tool_result",
           calls: toolCallRequests(payload).map(call => ({ toolName: call.params.name })),
           status: upstream.status,
           result: summarizeMcpPayload(upstreamText)
-        }));
+        });
       }
       res.writeHead(upstream.status, {
         "content-type": upstream.headers.get("content-type") || "application/json"
@@ -583,7 +682,7 @@ async function startRepairMcpProxy(config, hooks = {}) {
       res.end(upstreamText);
     } catch (error) {
       const message = redactText(error.message);
-      hooks.onEvent?.(sanitizeValue({ type: "repair_mcp_proxy_error", error: error.message }));
+      emitProxyEvent({ type: "repair_mcp_proxy_error", error: error.message });
       if (!res.headersSent) {
         res.writeHead(payload ? 200 : 502, { "content-type": "application/json" });
         res.end(JSON.stringify(repairProxyErrorPayload(payload, message)));
@@ -597,7 +696,15 @@ async function startRepairMcpProxy(config, hooks = {}) {
   return {
     url: `http://127.0.0.1:${server.address().port}/mcp`,
     token,
-    close: () => closeServer(server)
+    async close() {
+      for (const controller of upstreamControllers) {
+        controller.abort("Repair MCP proxy is shutting down");
+      }
+      upstreamControllers.clear();
+      const closing = closeServer(server);
+      server.closeAllConnections?.();
+      await closing;
+    }
   };
 }
 
@@ -624,6 +731,7 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       const child = spawn(config.codexBin, args, {
         cwd: codexWorkspace,
         env,
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"]
       });
       hooks.onChild?.(child);
@@ -632,40 +740,55 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       let stdoutBuffer = "";
       let finalMessage = "";
       let settled = false;
-      let abortRequested = null;
-      let abortKillTimer = null;
+      let terminationError = null;
+      let terminationKillTimer = null;
       const rejectOnce = error => {
         clearTimeout(timeout);
-        clearTimeout(abortKillTimer);
+        clearTimeout(terminationKillTimer);
         if (!settled) {
           settled = true;
           reject(error);
         }
       };
+      const requestTermination = error => {
+        if (settled || terminationError) {
+          return;
+        }
+        terminationError = error;
+        signalChildProcessGroup(child, "SIGTERM");
+        terminationKillTimer = setTimeout(() => {
+          signalChildProcessGroup(child, "SIGKILL");
+        }, Math.max(50, Number(config.codexTerminationGraceMs || 5000)));
+        terminationKillTimer.unref?.();
+      };
       const handleStdinError = error => {
         if (["EPIPE", "EOF", "ERR_STREAM_DESTROYED"].includes(error?.code)) {
           return;
         }
-        child.kill("SIGTERM");
-        rejectOnce(error);
+        requestTermination(error);
       };
       const emit = event => {
-        hooks.onEvent?.(sanitizeValue(event));
+        try {
+          hooks.onEvent?.(sanitizeValue(event));
+        } catch (error) {
+          hooks.onEventError?.(error);
+        }
       };
       const timeout = setTimeout(() => {
-        child.kill("SIGTERM");
-        rejectOnce(new Error(`Codex repair timed out after ${config.codexRepairTimeoutMs || config.codexTimeoutMs}ms`));
+        requestTermination(new Error(`Codex repair timed out after ${config.codexRepairTimeoutMs || config.codexTimeoutMs}ms`));
       }, config.codexRepairTimeoutMs || config.codexTimeoutMs);
       const abortHandler = () => {
-        abortRequested = abortError(hooks.abortSignal?.reason || "Codex repair aborted by operator");
-        emit({ type: "repair_abort_requested", error: abortRequested.message });
-        child.kill("SIGTERM");
-        abortKillTimer = setTimeout(() => {
-          child.kill("SIGKILL");
-        }, 5000);
-        abortKillTimer.unref?.();
+        if (terminationError) {
+          return;
+        }
+        const error = abortError(hooks.abortSignal?.reason || "Codex repair aborted by operator");
+        emit({ type: "repair_abort_requested", error: error.message });
+        requestTermination(error);
       };
       hooks.abortSignal?.addEventListener("abort", abortHandler, { once: true });
+      if (hooks.abortSignal?.aborted) {
+        abortHandler();
+      }
       const handleStdoutLine = line => {
         const trimmed = line.trim();
         if (!trimmed) {
@@ -683,8 +806,8 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       };
       child.stdout.on("data", chunk => {
         const text = String(chunk);
-        stdout += text;
-        stdoutBuffer += text;
+        stdout = appendBounded(stdout, text);
+        stdoutBuffer = appendBounded(stdoutBuffer, text);
         const lines = stdoutBuffer.split(/\r?\n/);
         stdoutBuffer = lines.pop() || "";
         for (const line of lines) {
@@ -693,7 +816,7 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       });
       child.stderr.on("data", chunk => {
         const text = String(chunk);
-        stderr += text;
+        stderr = appendBounded(stderr, text);
         emit({ type: "stderr", text: redactText(text).slice(-4000) });
       });
       child.on("error", error => {
@@ -707,7 +830,7 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
       }
       child.on("close", async code => {
         clearTimeout(timeout);
-        clearTimeout(abortKillTimer);
+        clearTimeout(terminationKillTimer);
         hooks.abortSignal?.removeEventListener("abort", abortHandler);
         if (stdoutBuffer.trim()) {
           handleStdoutLine(stdoutBuffer);
@@ -716,8 +839,8 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
           return;
         }
         settled = true;
-        if (abortRequested) {
-          reject(abortRequested);
+        if (terminationError) {
+          reject(terminationError);
           return;
         }
         if (code !== 0) {
@@ -748,5 +871,13 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
 
 export async function runCodexMcpCapabilityCheck(config, items, tools, settings = {}, hooks = {}) {
   const prompt = mcpCapabilityCheckPrompt(items, tools);
-  return runCodexRepair(config, prompt, settings, hooks);
+  const effectiveSettings = codexRepairSettings(config, settings);
+  const finalMessage = await runCodex(config, prompt, {
+    ...hooks,
+    settings: effectiveSettings
+  });
+  return {
+    finalMessage,
+    settings: effectiveSettings
+  };
 }

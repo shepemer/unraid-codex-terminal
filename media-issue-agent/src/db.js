@@ -1,10 +1,6 @@
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
-import { ensureDbDir, sql, sqliteExec } from "./sqlite.js";
-
-export const ISSUE_LOG_EVENT_RETENTION_ROWS = 200000;
-const ISSUE_LOG_PRUNE_INTERVAL_WRITES = 100;
-let issueLogWritesSincePrune = 0;
+import { ensureDbDir, sql, sqliteExec, sqliteTransaction } from "./sqlite.js";
 
 export const JOB_STATES = new Set([
   "detected",
@@ -13,14 +9,11 @@ export const JOB_STATES = new Set([
   "awaiting_action_approval",
   "approved_for_execution",
   "executing",
-  "waiting_for_plex_verification",
   "drafting_comment",
-  "awaiting_comment_approval",
   "awaiting_resolution_approval",
-  "posting_comment",
   "closing_issue",
+  "reopening_issue",
   "closed",
-  "dry_run_complete",
   "blocked_needs_human",
   "failed_retryable",
   "failed_terminal"
@@ -222,6 +215,30 @@ ON issue_log_events(job_id, timestamp, id);
 
 CREATE INDEX IF NOT EXISTS idx_token_usage_events_created
 ON token_usage_events(created_at, source);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_state_updated
+ON jobs(state, updated_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_job_status_kind
+ON approvals(job_id, status, kind, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_planned_actions_job
+ON planned_actions(job_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_verification_checks_job
+ON verification_checks(job_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_job
+ON audit_events(job_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_job
+ON agent_runs(job_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_events_job
+ON agent_run_events(job_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_missing_mcp_items_job
+ON missing_mcp_items(job_id, dismissed_at, updated_at DESC);
 `);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
   ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
@@ -230,6 +247,11 @@ ON token_usage_events(created_at, source);
 UPDATE agent_runs
 SET heartbeat_at = COALESCE(heartbeat_at, started_at)
 WHERE heartbeat_at IS NULL;
+
+UPDATE jobs SET state = 'executing' WHERE state = 'waiting_for_plex_verification';
+UPDATE jobs SET state = 'awaiting_resolution_approval' WHERE state = 'awaiting_comment_approval';
+UPDATE jobs SET state = 'closing_issue' WHERE state = 'posting_comment';
+UPDATE jobs SET state = 'blocked_needs_human' WHERE state = 'dry_run_complete';
 `);
 }
 
@@ -285,17 +307,18 @@ export function insertSnapshot(dbPath, markdown, entries) {
     updatedAt: entry.updatedAt,
     createdAt: entry.createdAt
   })));
-  const [{ id }] = sqliteExec(dbPath, sql`
+  const id = sqliteTransaction(dbPath, database => {
+    const [{ id: snapshotId }] = database.prepare(sql`
 INSERT INTO issue_snapshots (markdown, source_hash)
 VALUES (${markdown}, ${sourceHash})
 RETURNING id;
-`, { json: true });
-
-  const rows = entries.map((entry, index) => sql`
+`).all();
+    for (const [index, entry] of entries.entries()) {
+      database.exec(sql`
 INSERT INTO issue_snapshot_entries (
   snapshot_id, idx, source, issue_id, date, reporter, media_title, status, description, raw_json
 ) VALUES (
-  ${id},
+  ${snapshotId},
   ${index + 1},
   ${entry.source},
   ${String(entry.issueId)},
@@ -306,8 +329,10 @@ INSERT INTO issue_snapshot_entries (
   ${entry.description || ""},
   ${JSON.stringify(entry.raw || entry)}
 );
-`).join("\n");
-  sqliteExec(dbPath, `BEGIN;\n${rows}\nCOMMIT;`);
+`);
+    }
+    return snapshotId;
+  });
   return { id, sourceHash };
 }
 
@@ -423,9 +448,6 @@ export function ensureJob(dbPath, source, issueId, state = "detected") {
   sqliteExec(dbPath, sql`
 INSERT OR IGNORE INTO jobs (source, issue_id, state)
 VALUES (${source}, ${String(issueId)}, ${state});
-UPDATE jobs
-SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE source = ${source} AND issue_id = ${String(issueId)};
 `);
   return sqliteExec(dbPath, sql`
 SELECT id, source, issue_id AS issueId, state, attempts, last_error AS lastError
@@ -439,29 +461,23 @@ export function transitionJob(dbPath, jobId, fromStates, toState, lastError = nu
   if (!JOB_STATES.has(toState)) {
     throw new Error(`Unknown job state ${toState}`);
   }
-  const allowed = new Set(Array.isArray(fromStates) ? fromStates : [fromStates]);
-  const current = sqliteExec(dbPath, sql`
-SELECT id, state FROM jobs WHERE id = ${jobId} LIMIT 1;
-`, { json: true })[0];
-  if (!current) {
-    throw new Error(`Job ${jobId} was not found`);
+  const allowed = [...new Set(Array.isArray(fromStates) ? fromStates : [fromStates])];
+  if (!allowed.length) {
+    throw new Error(`Job ${jobId} transition to ${toState} has no allowed source states`);
   }
-  if (!allowed.has(current.state)) {
-    throw new Error(`Cannot transition job ${jobId} from ${current.state} to ${toState}`);
-  }
-  sqliteExec(dbPath, sql`
+  const allowedSql = allowed.map(state => sql`${state}`).join(", ");
+  const updateSql = sql`
 UPDATE jobs
 SET state = ${toState},
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     last_error = ${lastError}
-WHERE id = ${jobId};
-`);
-  return { ...current, state: toState };
-}
-
-export function setJobState(dbPath, jobId, state, lastError = null) {
-  if (!JOB_STATES.has(state)) {
-    throw new Error(`Unknown job state ${state}`);
+WHERE id = ${jobId}
+  AND state IN (` + allowedSql + `)
+RETURNING id, state;
+`;
+  const updated = sqliteExec(dbPath, updateSql, { json: true })[0];
+  if (updated) {
+    return updated;
   }
   const current = sqliteExec(dbPath, sql`
 SELECT id, state FROM jobs WHERE id = ${jobId} LIMIT 1;
@@ -469,14 +485,40 @@ SELECT id, state FROM jobs WHERE id = ${jobId} LIMIT 1;
   if (!current) {
     throw new Error(`Job ${jobId} was not found`);
   }
-  sqliteExec(dbPath, sql`
-UPDATE jobs
-SET state = ${state},
-    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-    last_error = ${lastError}
-WHERE id = ${jobId};
-`);
-  return { ...current, state };
+  throw new Error(`Cannot transition job ${jobId} from ${current.state} to ${toState}`);
+}
+
+const LIFECYCLE_RECONCILIATION_BUSY_STATES = new Set([
+  "investigating",
+  "approved_for_execution",
+  "executing",
+  "drafting_comment",
+  "closing_issue",
+  "reopening_issue"
+]);
+
+export function reconcileJobLifecycle(dbPath, jobId, closed) {
+  const current = jobForId(dbPath, jobId);
+  if (!current) {
+    throw new Error(`Job ${jobId} was not found`);
+  }
+  if (LIFECYCLE_RECONCILIATION_BUSY_STATES.has(current.state)) {
+    return { job: current, changed: false, skippedBusy: true };
+  }
+  const targetState = closed ? "closed" : current.state === "closed" ? "detected" : current.state;
+  if (targetState === current.state) {
+    return { job: current, changed: false, skippedBusy: false };
+  }
+  try {
+    const updated = transitionJob(dbPath, jobId, [current.state], targetState);
+    return { job: { ...current, ...updated }, changed: true, skippedBusy: false };
+  } catch (error) {
+    const latest = jobForId(dbPath, jobId);
+    if (latest && latest.state !== current.state) {
+      return { job: latest, changed: false, skippedBusy: LIFECYCLE_RECONCILIATION_BUSY_STATES.has(latest.state) };
+    }
+    throw error;
+  }
 }
 
 export function createApproval(dbPath, jobId, kind, payload, channel = "cli") {
@@ -488,6 +530,97 @@ VALUES (${jobId}, ${kind}, 'pending', ${channel}, ${tokenHash}, ${payloadJson})
 RETURNING id;
 `, { json: true });
   return { id, jobId, kind, status: "pending", tokenHash, payload };
+}
+
+export function transitionJobAndCreateApproval(dbPath, jobId, fromStates, toState, kind, payload, channel = "cli", lastError = null) {
+  if (!JOB_STATES.has(toState)) {
+    throw new Error(`Unknown job state ${toState}`);
+  }
+  const allowed = [...new Set(Array.isArray(fromStates) ? fromStates : [fromStates])];
+  if (!allowed.length) {
+    throw new Error(`Job ${jobId} transition to ${toState} has no allowed source states`);
+  }
+  const payloadJson = JSON.stringify(payload);
+  const tokenHash = stableHash({ jobId, kind, payload });
+  const allowedSql = allowed.map(state => sql`${state}`).join(", ");
+  return sqliteTransaction(dbPath, database => {
+    const updatedJob = database.prepare(sql`
+UPDATE jobs
+SET state = ${toState},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    last_error = ${lastError}
+WHERE id = ${jobId}
+  AND state IN (` + allowedSql + `)
+RETURNING id, state;
+`).all()[0];
+    if (!updatedJob) {
+      const current = database.prepare(sql`SELECT state FROM jobs WHERE id = ${jobId} LIMIT 1;`).all()[0];
+      if (!current) {
+        throw new Error(`Job ${jobId} was not found`);
+      }
+      throw new Error(`Cannot transition job ${jobId} from ${current.state} to ${toState}`);
+    }
+    const approvalRow = database.prepare(sql`
+INSERT INTO approvals (job_id, kind, status, channel, token_hash, payload_json)
+VALUES (${jobId}, ${kind}, 'pending', ${channel}, ${tokenHash}, ${payloadJson})
+RETURNING id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash, payload_json AS payloadJson;
+`).all()[0];
+    const { payloadJson: _payloadJson, ...approval } = approvalRow;
+    return {
+      job: updatedJob,
+      approval: { ...approval, payload: JSON.parse(approvalRow.payloadJson) }
+    };
+  });
+}
+
+export function transitionJobAndResolveApproval(dbPath, jobId, approvalId, fromStates, toState, status, actor = "operator", lastError = null) {
+  if (!JOB_STATES.has(toState)) {
+    throw new Error(`Unknown job state ${toState}`);
+  }
+  if (!["approved", "rejected"].includes(status)) {
+    throw new Error(`Unsupported approval status ${status}`);
+  }
+  const allowed = [...new Set(Array.isArray(fromStates) ? fromStates : [fromStates])];
+  if (!allowed.length) {
+    throw new Error(`Job ${jobId} transition to ${toState} has no allowed source states`);
+  }
+  const allowedSql = allowed.map(state => sql`${state}`).join(", ");
+  return sqliteTransaction(dbPath, database => {
+    const updatedJob = database.prepare(sql`
+UPDATE jobs
+SET state = ${toState},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    last_error = ${lastError}
+WHERE id = ${jobId}
+  AND state IN (` + allowedSql + `)
+RETURNING id, state;
+`).all()[0];
+    if (!updatedJob) {
+      const current = database.prepare(sql`SELECT state FROM jobs WHERE id = ${jobId} LIMIT 1;`).all()[0];
+      if (!current) {
+        throw new Error(`Job ${jobId} was not found`);
+      }
+      throw new Error(`Cannot transition job ${jobId} from ${current.state} to ${toState}`);
+    }
+    const resolved = database.prepare(sql`
+UPDATE approvals
+SET status = ${status},
+    approved_by = ${actor},
+    approved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${approvalId} AND job_id = ${jobId} AND status = 'pending'
+RETURNING id;
+`).all()[0];
+    if (!resolved) {
+      throw new Error(`Approval ${approvalId} is no longer pending for job ${jobId}`);
+    }
+    const approvals = database.prepare(sql`
+SELECT id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash
+FROM approvals
+WHERE job_id = ${jobId}
+ORDER BY id;
+`).all();
+    return { job: updatedJob, approvals };
+  });
 }
 
 export function pendingApprovalForJob(dbPath, jobId, kind = "action") {
@@ -518,6 +651,21 @@ LIMIT 1;
     return null;
   }
   return { ...row, payload: JSON.parse(row.payloadJson) };
+}
+
+export function latestApprovalForJob(dbPath, jobId, kind, status) {
+  const row = sqliteExec(dbPath, sql`
+SELECT id, job_id AS jobId, kind, status, channel, token_hash AS tokenHash, payload_json AS payloadJson
+FROM approvals
+WHERE job_id = ${jobId} AND kind = ${kind} AND status = ${status}
+ORDER BY id DESC
+LIMIT 1;
+`, { json: true })[0];
+  if (!row) {
+    return null;
+  }
+  const { payloadJson, ...approval } = row;
+  return { ...approval, payload: JSON.parse(payloadJson) };
 }
 
 export function supersedePendingApprovals(dbPath, jobId, kind = "action") {
@@ -592,13 +740,14 @@ WHERE id = ${runId};
 `);
   return sqliteExec(dbPath, sql`
 SELECT
-	  id,
-	  job_id AS jobId,
-	  kind,
-	  status,
-	  config_json AS configJson,
-	  final_result_json AS finalResultJson,
-	  error,
+  id,
+  job_id AS jobId,
+  kind,
+  status,
+  prompt,
+  config_json AS configJson,
+  final_result_json AS finalResultJson,
+  error,
   owner_pid AS ownerPid,
   owner_started_at AS ownerStartedAt,
   started_at AS startedAt,
@@ -667,22 +816,20 @@ SET state = 'failed_retryable',
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     last_error = ${message}
 WHERE id = ${run.jobId}
-  AND state IN ('approved_for_execution', 'executing', 'waiting_for_plex_verification', 'drafting_comment');
+  AND state IN ('approved_for_execution', 'executing', 'drafting_comment');
 `);
   }
   return recoverable.length;
 }
 
 export function recordAgentRunEvent(dbPath, runId, jobId, eventType, payload) {
-  sqliteExec(dbPath, sql`
-BEGIN;
+  sqliteTransaction(dbPath, database => database.exec(sql`
 INSERT INTO agent_run_events (run_id, job_id, event_type, payload_json)
 VALUES (${runId}, ${jobId}, ${eventType}, ${JSON.stringify(payload || {})});
 UPDATE agent_runs
 SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE id = ${runId} AND status = 'running';
-COMMIT;
-`);
+`));
 }
 
 function tokenCount(value) {
@@ -968,7 +1115,8 @@ SELECT
   payload_json AS payloadJson
 FROM approvals
 WHERE job_id = ${jobId}
-ORDER BY id DESC;
+ORDER BY id DESC
+LIMIT 100;
 `, { json: true }).map(row => ({ ...row, payload: JSON.parse(row.payloadJson) }));
   const plannedActions = sqliteExec(dbPath, sql`
 SELECT
@@ -983,7 +1131,8 @@ SELECT
   result_json AS resultJson
 FROM planned_actions
 WHERE job_id = ${jobId}
-ORDER BY id DESC;
+ORDER BY id DESC
+LIMIT 200;
 `, { json: true }).map(row => ({
     ...row,
     args: JSON.parse(row.argsJson),
@@ -1001,7 +1150,8 @@ SELECT
   completed_at AS completedAt
 FROM verification_checks
 WHERE job_id = ${jobId}
-ORDER BY id DESC;
+ORDER BY id DESC
+LIMIT 100;
 `, { json: true }).map(row => ({ ...row, criteria: JSON.parse(row.criteriaJson) }));
   const auditEvents = sqliteExec(dbPath, sql`
 SELECT
@@ -1081,29 +1231,34 @@ WHERE id = ${actionId};
   }
 }
 
-export function createVerificationCheck(dbPath, jobId, checkType, criteria, status = "running") {
-  const [{ id }] = sqliteExec(dbPath, sql`
-INSERT INTO verification_checks (job_id, check_type, criteria_json, status, started_at)
-VALUES (${jobId}, ${checkType}, ${JSON.stringify(criteria || {})}, ${status}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-RETURNING id;
-`, { json: true });
-  return { id, jobId, checkType, criteria, status };
-}
-
-export function completeVerificationCheck(dbPath, checkId, status) {
-  sqliteExec(dbPath, sql`
-UPDATE verification_checks
-SET status = ${status},
-    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE id = ${checkId};
-`);
-}
-
 export function recordAudit(dbPath, eventType, payload, jobId = null) {
   sqliteExec(dbPath, sql`
 INSERT INTO audit_events (job_id, event_type, redacted_payload_json)
 VALUES (${jobId}, ${eventType}, ${JSON.stringify(payload)});
 `);
+}
+
+export function latestAuditEvent(dbPath, jobId, eventTypes = []) {
+  const types = [...new Set((Array.isArray(eventTypes) ? eventTypes : [eventTypes]).filter(Boolean))];
+  if (!types.length) {
+    return null;
+  }
+  const typeSql = types.map(type => sql`${type}`).join(", ");
+  const querySql = sql`
+SELECT
+  id,
+  job_id AS jobId,
+  event_type AS eventType,
+  redacted_payload_json AS redactedPayloadJson,
+  created_at AS createdAt
+FROM audit_events
+WHERE job_id = ${jobId}
+  AND event_type IN (` + typeSql + `)
+ORDER BY id DESC
+LIMIT 1;
+`;
+  const row = sqliteExec(dbPath, querySql, { json: true })[0];
+  return row ? { ...row, redactedPayload: parseJson(row.redactedPayloadJson, {}) } : null;
 }
 
 export function recordIssueLogEvent(dbPath, { jobId = null, source, issueId, record }) {
@@ -1122,33 +1277,40 @@ VALUES (
   ${JSON.stringify(record)}
 );
 `);
-  issueLogWritesSincePrune += 1;
-  if (issueLogWritesSincePrune >= ISSUE_LOG_PRUNE_INTERVAL_WRITES) {
-    issueLogWritesSincePrune = 0;
-    pruneIssueLogEvents(dbPath);
-  }
 }
 
-export function pruneIssueLogEvents(dbPath, maxRows = ISSUE_LOG_EVENT_RETENTION_ROWS) {
-  const limit = Math.max(1, Number(maxRows) || ISSUE_LOG_EVENT_RETENTION_ROWS);
-  sqliteExec(dbPath, sql`
-DELETE FROM issue_log_events
-WHERE id NOT IN (
-  SELECT id
-  FROM issue_log_events
-  ORDER BY id DESC
-  LIMIT ${limit}
-);
-`);
+export function issueLogRecordPage(dbPath, source, issueId, options = {}) {
+  const afterId = Math.max(0, Number(options.afterId || 0));
+  const limit = Math.max(1, Math.min(Number(options.limit || 1000), 5000));
+  return sqliteExec(dbPath, sql`
+SELECT id, record_json AS recordJson
+FROM issue_log_events
+WHERE source = ${String(source)}
+  AND issue_id = ${String(issueId)}
+  AND id > ${afterId}
+ORDER BY id ASC
+LIMIT ${limit};
+  `, { json: true }).map(row => ({
+    id: row.id,
+    record: parseJson(row.recordJson, null)
+  }));
 }
 
 export function issueLogRecords(dbPath, source, issueId) {
-  return sqliteExec(dbPath, sql`
-SELECT record_json AS recordJson
-FROM issue_log_events
-WHERE source = ${String(source)} AND issue_id = ${String(issueId)}
-ORDER BY timestamp ASC, id ASC;
-`, { json: true }).map(row => parseJson(row.recordJson, null)).filter(Boolean);
+  const records = [];
+  let afterId = 0;
+  for (;;) {
+    const page = issueLogRecordPage(dbPath, source, issueId, { afterId, limit: 1000 });
+    if (!page.length) {
+      break;
+    }
+    records.push(...page.map(row => row.record).filter(Boolean));
+    afterId = page.at(-1).id;
+    if (page.length < 1000) {
+      break;
+    }
+  }
+  return records;
 }
 
 export function statusSummary(dbPath) {
@@ -1206,10 +1368,10 @@ SELECT
 FROM jobs
 ORDER BY
   CASE
-    WHEN state IN ('approved_for_execution', 'executing', 'waiting_for_plex_verification', 'drafting_comment', 'closing_issue') THEN 0
-    WHEN state IN ('detected', 'queued_for_investigation', 'investigating', 'awaiting_action_approval', 'awaiting_comment_approval', 'awaiting_resolution_approval', 'posting_comment', 'failed_retryable', 'blocked_needs_human') THEN 1
+    WHEN state IN ('approved_for_execution', 'executing', 'drafting_comment', 'closing_issue', 'reopening_issue') THEN 0
+    WHEN state IN ('detected', 'queued_for_investigation', 'investigating', 'awaiting_action_approval', 'awaiting_resolution_approval', 'failed_retryable', 'blocked_needs_human') THEN 1
     WHEN state IN ('failed_terminal') THEN 2
-    WHEN state IN ('closed', 'dry_run_complete') THEN 3
+    WHEN state IN ('closed') THEN 3
     ELSE 2
   END,
   updated_at DESC,

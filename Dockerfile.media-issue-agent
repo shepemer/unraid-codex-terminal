@@ -15,7 +15,6 @@ ENV NODE_ENV=production \
     ISSUE_AGENT_MEDIA_MCP_URL=http://media-mcp:6971/mcp \
     ISSUE_AGENT_POLL_INTERVAL_SECONDS=300 \
     ISSUE_AGENT_SNAPSHOT_RETENTION=200 \
-    ISSUE_AGENT_APPROVAL_BACKEND=web \
     ISSUE_AGENT_WEB_ENABLED=true \
     ISSUE_AGENT_WEB_HOST=0.0.0.0 \
     ISSUE_AGENT_WEB_PORT=6983 \
@@ -39,7 +38,6 @@ RUN groupmod -n agent node \
         ca-certificates \
         git \
         libgnutls30 \
-        sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY media-issue-agent/package.json media-issue-agent/package-lock.json ./
