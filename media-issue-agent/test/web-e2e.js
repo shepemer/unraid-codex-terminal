@@ -178,10 +178,13 @@ async function startFakeMediaMcp(issues) {
   };
 }
 
-async function startHarness(root, fakeMcp) {
+async function startHarness(root, fakeMcp, options = {}) {
   const codexHome = await createCodexHome(root);
   const codexLogPath = path.join(root, "codex-invocations.jsonl");
-  const codexBin = await createFakeCodexBin(root, codexLogPath);
+  const codexBin = options.codexBin || await createFakeCodexBin(root, codexLogPath);
+  if (options.codexBin) {
+    await writeFile(codexLogPath, "");
+  }
   const previousLog = process.env.WEB_E2E_CODEX_LOG;
   process.env.WEB_E2E_CODEX_LOG = codexLogPath;
   const config = await loadConfig({
@@ -285,7 +288,7 @@ async function testIssueStateActionMatrix(browser) {
       { source: "seerr", issueId: "204", date: "2026-01-04T00:00:00Z", reporter: "Fixture", mediaTitle: "Resolution", status: "open", description: "Resolution issue" },
       { source: "seerr", issueId: "205", date: "2026-01-05T00:00:00Z", reporter: "Fixture", mediaTitle: "Closed", status: "open", description: "Closed issue" },
       { source: "seerr", issueId: "206", date: "2026-01-06T00:00:00Z", reporter: "Fixture", mediaTitle: "Terminal", status: "open", description: "Terminal repair issue" },
-      { source: "seerr", issueId: "207", date: "2026-01-07T00:00:00Z", reporter: "Fixture", mediaTitle: "Reopened stale", status: "resolved", description: "Resolved source row reopened locally.", lifecycle: "closed" }
+      { source: "seerr", issueId: "207", date: "2026-01-07T00:00:00Z", reporter: "Fixture", mediaTitle: "Source closed, job stale", status: "resolved", description: "Resolved source row with a stale detected job.", lifecycle: "closed" }
     ];
     insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
 
@@ -411,7 +414,7 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 2).getByRole("button", { name: "Re-investigate" })).toBeVisible();
     await expect(row(page, 2).getByRole("button", { name: "Close" })).toBeVisible();
     await expect(row(page, 3).getByRole("button", { name: "View repair" })).toBeVisible();
-    await expect(row(page, 3).getByRole("button", { name: "Close" })).toBeVisible();
+    await expect(row(page, 3).getByRole("button", { name: "Close" })).toHaveCount(0);
     await expect(row(page, 4).getByRole("button", { name: "Approve fix" })).toBeVisible();
     await expect(row(page, 4).getByRole("button", { name: "Close" })).toBeVisible();
     await expect(row(page, 5).getByRole("button", { name: "View summary" })).toBeVisible();
@@ -419,10 +422,10 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 5)).toHaveClass(/issue-closed/);
     await expect(row(page, 6).getByRole("button", { name: "Review repair" })).toBeVisible();
     await expect(row(page, 6).getByRole("button", { name: "Re-investigate" })).toHaveCount(0);
-    await expect(row(page, 7).locator("td").nth(6)).toHaveText("open");
-    await expect(row(page, 7)).not.toHaveClass(/issue-closed/);
-    await expect(row(page, 7).getByRole("button", { name: "Investigate" })).toBeVisible();
-    await expect(row(page, 7).getByRole("button", { name: "Close" })).toBeVisible();
+    await expect(row(page, 7).locator("td").nth(6)).toHaveText("closed");
+    await expect(row(page, 7)).toHaveClass(/issue-closed/);
+    await expect(row(page, 7).getByRole("button", { name: "View summary" })).toBeVisible();
+    await expect(row(page, 7).getByRole("button", { name: "Close" })).toHaveCount(0);
 
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
@@ -914,6 +917,73 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
   }
 }
 
+async function testAbortBecomesAvailableDuringApprovalExecution(browser) {
+  const root = await tempDir();
+  const fakeMcp = await startFakeMediaMcp([]);
+  let harness;
+  let context;
+  try {
+    const codexBin = path.join(root, "codex-hanging-repair.mjs");
+    await writeFile(codexBin, [
+      "#!/usr/bin/env node",
+      "import { readFileSync } from 'node:fs';",
+      "readFileSync(0, 'utf8');",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"));
+    await chmod(codexBin, 0o700);
+    harness = await startHarness(root, fakeMcp, { codexBin });
+    const dbPath = harness.config.dbPath;
+    const entries = [{
+      source: "seerr",
+      issueId: "abort-in-flight",
+      date: "2026-01-11T00:00:00Z",
+      reporter: "Fixture Reporter",
+      mediaTitle: "Abort In-flight Fixture",
+      status: "open",
+      description: "Repair will remain active until aborted."
+    }];
+    insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
+    const job = ensureJob(dbPath, "seerr", "abort-in-flight");
+    transitionJob(dbPath, job.id, "detected", "awaiting_action_approval");
+    upsertInvestigation(dbPath, job.id, {
+      status: "ready",
+      summary: "Run the fixture repair until explicitly aborted.",
+      evidence: { entry: entries[0] }
+    });
+    createApproval(dbPath, job.id, "action", {
+      source: "seerr",
+      issueId: "abort-in-flight",
+      summary: "Run the fixture repair until explicitly aborted.",
+      evidence: { entry: entries[0] },
+      plan: {
+        classification: "server_action",
+        executionMode: "approved_repair_agent",
+        requiresServerAction: true,
+        actions: [],
+        repairPrompt: "Run the fixture repair until explicitly aborted."
+      }
+    });
+
+    const pageHandle = await newPage(browser, harness.baseUrl);
+    context = pageHandle.context;
+    const page = pageHandle.page;
+    await page.locator(`[data-job-id="${job.id}"]`).click();
+    await expect(page.locator("#approval-actions")).toBeVisible();
+    await page.locator("#approve-button").click();
+    await expect(page.locator("#abort-repair-button")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await expect(page.locator("#detail-processing")).toContainText("Executing repair");
+    await page.locator("#abort-repair-button").click();
+    await expect(page.locator("#investigation-output")).toContainText(/aborted|Review or steer/i, { timeout: 10_000 });
+    await expect(page.locator("#abort-repair-button")).toBeHidden();
+  } finally {
+    await context?.close();
+    await harness?.close();
+    await fakeMcp.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testDiagnosticLogDownloadDialog(browser) {
   const root = await tempDir();
   const fakeMcp = await startFakeMediaMcp([]);
@@ -926,10 +996,10 @@ async function testDiagnosticLogDownloadDialog(browser) {
     appendDiagnosticLog(harness.config.logPath, "info", "download_outside_range", {
       message: "This log line should not be downloaded."
     }, { timestamp: outside.toISOString() });
-    appendDiagnosticLog(harness.config.logPath, "error", "download_inside_range", {
+    harness.agent.diagnostic("error", "download_inside_range", {
       jobId: 44,
       error: "Synthetic repair failure for download test."
-    }, { timestamp: inside.toISOString() });
+    });
 
     const pageHandle = await newPage(browser, harness.baseUrl);
     context = pageHandle.context;
@@ -1287,6 +1357,7 @@ async function run() {
     await testFullBrowserWorkflow(browser);
     await testManualCloseReopenBrowser(browser);
     await testExecutingRepairStatusRendersFromIssueQueue(browser);
+    await testAbortBecomesAvailableDuringApprovalExecution(browser);
     await testDiagnosticLogDownloadDialog(browser);
     await testMobileTriageLayoutAndManualActions(browser);
     await testMobileDetailSheetAndJobControls(browser);

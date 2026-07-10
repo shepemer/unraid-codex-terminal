@@ -50,11 +50,6 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install SQLite
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
-
       - name: Run media MCP checks
         run: |
           npm --prefix media-mcp ci
@@ -71,7 +66,7 @@ jobs:
           npm --prefix media-issue-agent ci
           npm --prefix media-issue-agent exec playwright install --with-deps chromium
           npm --prefix media-issue-agent run check
-          npm --prefix media-issue-agent test
+          npm --prefix media-issue-agent run test:coverage
           npm --prefix media-issue-agent run test:web
           npm --prefix media-issue-agent run sil
 

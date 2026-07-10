@@ -43,6 +43,22 @@ function containsApiKey(value) {
   return false;
 }
 
+function hasChatGptTokenShape(authJson) {
+  if (!authJson || typeof authJson !== "object" || Array.isArray(authJson)) {
+    return false;
+  }
+  const authMode = String(authJson.auth_mode || authJson.authMode || "").trim().toLowerCase();
+  if (authMode !== "chatgpt") {
+    return false;
+  }
+  const tokens = authJson.tokens;
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) {
+    return false;
+  }
+  return [tokens.access_token, tokens.refresh_token, tokens.id_token]
+    .some(value => typeof value === "string" && value.trim().length > 0);
+}
+
 export function assertNoOpenAiApiKeys(env = process.env) {
   if (env.OPENAI_API_KEY || env.CODEX_API_KEY) {
     throw new Error("media-issue-agent refuses OpenAI API key auth; use Codex ChatGPT auth in CODEX_HOME instead.");
@@ -92,6 +108,13 @@ export async function inspectCodexAuth(codexHome) {
       message: "CODEX_HOME/auth.json appears to contain API-key auth; use ChatGPT Codex auth instead."
     };
   }
+  if (!hasChatGptTokenShape(authJson)) {
+    return {
+      ok: false,
+      status: "missing_chatgpt_tokens",
+      message: "CODEX_HOME/auth.json does not contain a valid ChatGPT Codex token cache; complete Codex ChatGPT login first."
+    };
+  }
   return {
     ok: true,
     status: "chatgpt_auth",
@@ -119,9 +142,6 @@ export async function loadConfig(env = process.env, options = {}) {
     repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || "",
     pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
     issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, 200, 1),
-    approvalBackend: env.ISSUE_AGENT_APPROVAL_BACKEND || "cli",
-    discordBotToken: env.ISSUE_AGENT_DISCORD_BOT_TOKEN || "",
-    discordChannelId: env.ISSUE_AGENT_DISCORD_CHANNEL_ID || "",
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",
     pushoverUserKey: env.ISSUE_AGENT_PUSHOVER_USER_KEY || "",
     codexHome: env.CODEX_HOME || "",

@@ -339,7 +339,10 @@ async function testAgentGuardRails() {
 async function testPlexResolutionFallbackAndClosure() {
   const root = await tempDir();
   const dbPath = path.join(root, "state.sqlite");
-  const codexHome = await writeAuthHome({ chatgpt: { account: "fixture" } });
+  const codexHome = await writeAuthHome({
+    auth_mode: "chatgpt",
+    tokens: { access_token: "fixture-access-token", refresh_token: "fixture-refresh-token" }
+  });
   const calls = [];
   try {
     const codexBin = await writeFakeCodex(root, [
@@ -409,7 +412,10 @@ async function testPlexResolutionFallbackAndClosure() {
 async function testDelegatingDraftRejectedBeforeFallback() {
   const root = await tempDir();
   const dbPath = path.join(root, "state.sqlite");
-  const codexHome = await writeAuthHome({ chatgpt: { account: "fixture" } });
+  const codexHome = await writeAuthHome({
+    auth_mode: "chatgpt",
+    tokens: { access_token: "fixture-access-token", refresh_token: "fixture-refresh-token" }
+  });
   try {
     const codexBin = await writeFakeCodex(root, [
       "if (prompt.includes('Draft a reporter-facing')) {",
@@ -548,8 +554,8 @@ async function testManualCloseReopenAndClosedCommentSummary() {
     assert.equal(jobDetails(dbPath, closed.jobId).job.state, "closed");
     assert.deepEqual(calls.filter(call => call.args.issueId === 5101).map(call => [call.name, call.args.message || ""]).slice(-3), [
       ["seerr_add_issue_comment", "Operator manually closed this fixture."],
-      ["seerr_add_issue_comment", CLOSED_MARKER],
-      ["seerr_resolve_issue", ""]
+      ["seerr_resolve_issue", ""],
+      ["seerr_add_issue_comment", CLOSED_MARKER]
     ]);
 
     const localSummary = await agent.issueSummary(snapshot.id, 1);

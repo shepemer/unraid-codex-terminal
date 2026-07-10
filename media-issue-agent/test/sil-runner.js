@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
+import { jobDetails } from "../src/db.js";
 import { startWebServer } from "../src/web.js";
 import { closeServer, createCodexHome, jsonRpcError, jsonRpcResult, readBody } from "./helpers.js";
 
@@ -523,7 +524,7 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
   assert.equal(resolveCall.args.dryRun, false);
 }
 
-async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId) {
+async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId, dbPath) {
   await api(baseUrl, "/api/settings/codex", {
     method: "POST",
     body: JSON.stringify({
@@ -587,9 +588,11 @@ async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId
   assert.deepEqual(pendingApproval(details, "resolution").payload.executionResult.missingMcpItems, []);
   assert.deepEqual(details.missingMcpItems, []);
   assert.deepEqual((await api(baseUrl, "/api/mcp-missing-items")).items, []);
-  assert.match(details.agentRuns[0].prompt, /Current media MCP tool briefing/);
-  assert.match(details.agentRuns[0].prompt, /bazarr_download_movie_subtitles_for_plex/);
-  assert.match(details.agentRuns[0].prompt, /Persistent scratch workspace/);
+  assert.equal(Object.hasOwn(details.agentRuns[0], "prompt"), false);
+  const internalDetails = jobDetails(dbPath, investigated.result.jobId);
+  assert.match(internalDetails.agentRuns[0].prompt, /Current media MCP tool briefing/);
+  assert.match(internalDetails.agentRuns[0].prompt, /bazarr_download_movie_subtitles_for_plex/);
+  assert.match(internalDetails.agentRuns[0].prompt, /Persistent scratch workspace/);
   assert.ok(details.agentRunEvents.some(event => event.payload?.item?.name === "media.bazarr_download_movie_subtitles_for_plex"));
   assert.ok(details.agentRunEvents.some(event => event.eventType === "repair_mcp_tool_call" && event.payload?.toolName === "bazarr_download_movie_subtitles_for_plex"));
   assert.ok(details.agentRunEvents.some(event => event.eventType === "repair_mcp_tool_result" && event.payload?.calls?.[0]?.toolName === "plex_verify_subtitle_track"));
@@ -749,7 +752,7 @@ async function run() {
     const snapshotId = await assertPolling(baseUrl, fakeMcp);
     await assertCliAccess(env, snapshotId);
     await assertInvestigationSteeringAndClosure(baseUrl, codexLogPath, fakeMcp, snapshotId);
-    await assertServerActionExecution(baseUrl, codexLogPath, fakeMcp, snapshotId);
+    await assertServerActionExecution(baseUrl, codexLogPath, fakeMcp, snapshotId, dbPath);
     await assertRejectPath(baseUrl, snapshotId);
     await assertClosureFailurePath(baseUrl, fakeMcp, snapshotId);
     await assertCodexFailurePath(baseUrl, snapshotId);

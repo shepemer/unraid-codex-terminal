@@ -5,7 +5,7 @@ import http from "node:http";
 import { inspectCodexAuth } from "./config.js";
 import { buildCodexSubprocessEnv } from "./codex.js";
 import { redactText, sanitizeValue } from "./redact.js";
-import { normalizeDiagnosticLogRange, readDiagnosticLogRecords, streamDiagnosticLog } from "./diagnostic-log.js";
+import { normalizeDiagnosticLogRange, streamDiagnosticLog } from "./diagnostic-log.js";
 
 const HTML = `<!doctype html>
 <html lang="en" data-theme="dark">
@@ -1989,6 +1989,7 @@ const JS = `const state = {
   entries: [],
   jobs: [],
   activeJobId: null,
+  activeJobState: null,
   activeEntryIndex: null,
   closeEntryIndex: null,
   busy: false,
@@ -2003,7 +2004,7 @@ const JS = `const state = {
   jobPollTimer: null,
   liveLogsTimer: null,
   liveLogsPaused: false,
-  liveLogsLastTimestamp: "",
+  liveLogsCursor: 0,
   liveLogSeenKeys: new Set()
 };
 
@@ -2093,9 +2094,9 @@ const el = {
 const PROCESSING_JOB_STATES = new Set([
   "approved_for_execution",
   "executing",
-  "waiting_for_plex_verification",
   "drafting_comment",
-  "closing_issue"
+  "closing_issue",
+  "reopening_issue"
 ]);
 
 function autoResizeSteerInput() {
@@ -2166,6 +2167,7 @@ function updateIssueRowHighlights() {
 function closeDetail() {
   clearJobPolling();
   state.activeJobId = null;
+  state.activeJobState = null;
   state.activeEntryIndex = null;
   setDetailProcessing(false);
   setDetailOpen(false);
@@ -2173,6 +2175,7 @@ function closeDetail() {
   el.output.textContent = "Select an issue to investigate.";
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  el.abortRepairButton.classList.add("hidden");
   el.approvalActions.classList.add("hidden");
   setSteerVisible(false);
   setRetrySameRepairVisible(false);
@@ -2186,7 +2189,7 @@ function setBusy(value) {
   state.busy = value;
   for (const button of document.querySelectorAll("button:not([data-theme-choice])")) {
     if (value) {
-      button.disabled = true;
+      button.disabled = button !== el.abortRepairButton || state.activeJobState !== "executing";
     } else if (button === el.loginButton) {
       button.disabled = state.loginRunning || state.authOk;
     } else if (button.dataset.investigate) {
@@ -2235,7 +2238,7 @@ async function api(path, options = {}) {
 function badgeClass(stateName) {
   const normalized = String(stateName || "");
   if (!normalized) return "badge muted";
-  if (normalized === "closed" || normalized === "approved_for_execution" || normalized === "dry_run_complete") return "badge success";
+  if (normalized === "closed" || normalized === "approved_for_execution") return "badge success";
   if (normalized.startsWith("failed") || normalized === "blocked_needs_human") return "badge danger";
   if (normalized.includes("awaiting")) return "badge warning";
   return "badge muted";
@@ -2249,14 +2252,11 @@ function stateLabel(stateName) {
     awaiting_action_approval: "Needs approval",
     approved_for_execution: "Queued repair",
     executing: "Executing repair",
-    waiting_for_plex_verification: "Verifying fix",
     drafting_comment: "Drafting fix",
-    awaiting_comment_approval: "Comment review",
     awaiting_resolution_approval: "Approve fix",
-    posting_comment: "Posting",
     closing_issue: "Closing",
+    reopening_issue: "Re-opening",
     closed: "Closed",
-    dry_run_complete: "Dry-run done",
     blocked_needs_human: "Needs human",
     failed_retryable: "Retry needed",
     failed_terminal: "Failed"
@@ -2278,9 +2278,7 @@ function jobActivityRank(job) {
     "queued_for_investigation",
     "investigating",
     "awaiting_action_approval",
-    "awaiting_comment_approval",
     "awaiting_resolution_approval",
-    "posting_comment",
     "failed_retryable",
     "blocked_needs_human"
   ].includes(stateName)) {
@@ -2289,7 +2287,7 @@ function jobActivityRank(job) {
   if (stateName === "failed_terminal") {
     return 2;
   }
-  if (["closed", "dry_run_complete"].includes(stateName)) {
+  if (stateName === "closed") {
     return 3;
   }
   return 2;
@@ -2328,17 +2326,11 @@ function jobOperationLabel(job) {
   if (["detected", "queued_for_investigation", "investigating", "awaiting_action_approval"].includes(stateName)) {
     return "Issue investigation";
   }
-  if (["approved_for_execution", "executing", "waiting_for_plex_verification", "drafting_comment", "awaiting_resolution_approval", "failed_retryable", "failed_terminal"].includes(stateName)) {
+  if (["approved_for_execution", "executing", "drafting_comment", "awaiting_resolution_approval", "failed_retryable", "failed_terminal"].includes(stateName)) {
     return "Issue repair";
   }
-  if (["awaiting_comment_approval", "posting_comment"].includes(stateName)) {
-    return "Issue comment";
-  }
-  if (["closing_issue", "closed"].includes(stateName)) {
+  if (["closing_issue", "reopening_issue", "closed"].includes(stateName)) {
     return "Issue closure";
-  }
-  if (stateName === "dry_run_complete") {
-    return "Issue dry run";
   }
   if (stateName === "blocked_needs_human") {
     return "Issue review";
@@ -2484,17 +2476,32 @@ function canReinvestigate(entry) {
     && ["detected", "queued_for_investigation", "awaiting_action_approval", "failed_retryable", "blocked_needs_human"].includes(entry.jobState);
 }
 
-function isLiveOpenEntry(entry) {
+function explicitSourceLifecycleClosed(entry) {
   const liveStatus = String(entry?.liveStatus || "").toLowerCase();
   if (liveStatus === "open" || liveStatus === "reopened") {
+    return false;
+  }
+  if (liveStatus === "closed" || liveStatus === "resolved") {
     return true;
   }
-  return entry?.jobState === "detected";
+  const commentLifecycle = issueLifecycleFromEntryComments(entry);
+  if (commentLifecycle !== null) {
+    return commentLifecycle;
+  }
+  const marker = String(entry?.lifecycleMarker || entry?.raw?.lifecycleMarker || "").trim().toLowerCase();
+  if (marker === "closed.") {
+    return true;
+  }
+  if (marker === "re-opened issue.") {
+    return false;
+  }
+  return null;
 }
 
-function isClosedEntry(entry) {
-  if (isLiveOpenEntry(entry)) {
-    return false;
+function sourceLifecycleClosed(entry) {
+  const explicitLifecycle = explicitSourceLifecycleClosed(entry);
+  if (explicitLifecycle !== null) {
+    return explicitLifecycle;
   }
   const lifecycle = String(entry?.lifecycle || entry?.raw?.lifecycle || "").toLowerCase();
   if (lifecycle === "closed") {
@@ -2503,10 +2510,6 @@ function isClosedEntry(entry) {
   if (lifecycle === "open") {
     return false;
   }
-  const commentLifecycle = issueLifecycleFromEntryComments(entry);
-  if (commentLifecycle !== null) {
-    return commentLifecycle;
-  }
   if (entry?.isClosed === true || entry?.raw?.isClosed === true) {
     return true;
   }
@@ -2514,20 +2517,33 @@ function isClosedEntry(entry) {
   if (status === "closed" || status === "resolved" || status.includes("closed") || status.includes("resolved")) {
     return true;
   }
-  return entry?.jobState === "closed";
+  if (status === "open" || status === "pending" || status.includes("open")) {
+    return false;
+  }
+  return null;
+}
+
+function isLiveOpenEntry(entry) {
+  return !isClosedEntry(entry);
+}
+
+function isClosedEntry(entry) {
+  const explicitLifecycle = explicitSourceLifecycleClosed(entry);
+  if (explicitLifecycle !== null) {
+    return explicitLifecycle;
+  }
+  const sourceClosed = sourceLifecycleClosed(entry);
+  if (sourceClosed === true || entry?.jobState === "closed") {
+    return true;
+  }
+  return false;
 }
 
 function displayIssueStatus(entry) {
-  if (entry?.liveStatus) {
-    return entry.liveStatus;
-  }
-  if (entry?.jobState === "closed") {
+  if (isClosedEntry(entry)) {
     return "closed";
   }
-  if (isLiveOpenEntry(entry)) {
-    return "open";
-  }
-  return entry?.status || entry?.raw?.status || entry?.raw?.rawStatus || "unknown";
+  return "open";
 }
 
 function canInvestigate(entry) {
@@ -2557,7 +2573,7 @@ function issueAction(entry) {
 
 function issueActionButton(entry) {
   const action = issueAction(entry);
-  const closeButton = isClosedEntry(entry)
+  const closeButton = isClosedEntry(entry) || ["investigating", ...PROCESSING_JOB_STATES].includes(entry.jobState)
     ? ""
     : \`<button class="secondary" type="button" data-close-issue="\${entry.idx}">Close</button>\`;
   const logsButton = \`<button class="secondary" type="button" data-issue-logs="\${entry.idx}">Logs</button>\`;
@@ -2771,9 +2787,6 @@ function appendLiveLogRecords(records, { replace = false } = {}) {
       : "";
     el.liveLogsOutput.textContent = existing + lines.join("\\n");
   }
-  if (freshRecords.length) {
-    state.liveLogsLastTimestamp = freshRecords.at(-1).timestamp || state.liveLogsLastTimestamp;
-  }
   if (!state.liveLogsPaused && (replace || wasAtBottom)) {
     el.liveLogsOutput.scrollTop = el.liveLogsOutput.scrollHeight;
   }
@@ -2785,17 +2798,18 @@ async function fetchLiveLogs({ initial = false } = {}) {
   }
   const params = new URLSearchParams();
   params.set("limit", initial ? "800" : "500");
-  if (!initial && state.liveLogsLastTimestamp) {
-    params.set("from", state.liveLogsLastTimestamp);
+  if (!initial && state.liveLogsCursor) {
+    params.set("cursor", String(state.liveLogsCursor));
   }
   const result = await api(\`/api/logs/records?\${params.toString()}\`);
-  appendLiveLogRecords(result.records || [], { replace: initial });
+  appendLiveLogRecords(result.records || [], { replace: initial || result.reset === true });
+  state.liveLogsCursor = Number(result.cursor || state.liveLogsCursor || 0);
   el.liveLogsStatus.textContent = state.liveLogsPaused ? "Paused" : "Live";
 }
 
 async function openLiveLogsDialog() {
   state.liveLogsPaused = false;
-  state.liveLogsLastTimestamp = "";
+  state.liveLogsCursor = 0;
   state.liveLogSeenKeys = new Set();
   el.liveLogsPauseButton.textContent = "Pause";
   el.liveLogsStatus.textContent = "Loading";
@@ -3267,6 +3281,9 @@ function mergeJobDetailState(detail) {
   if (!job) {
     return;
   }
+  if (Number(state.activeJobId) === Number(job.id)) {
+    state.activeJobState = job.state;
+  }
   let matchedJob = false;
   state.jobs = state.jobs.map(existing => {
     if (Number(existing.id) !== Number(job.id)) {
@@ -3372,6 +3389,7 @@ function showEntry(index) {
   el.detailHeading.textContent = "Investigation";
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  el.abortRepairButton.classList.add("hidden");
   setRepairRetryVisible(false);
   setRetrySameRepairVisible(false);
   renderJobs(state.jobs);
@@ -3568,6 +3586,21 @@ function canRetrySameRepair(detail) {
     (detail.job.state === "awaiting_action_approval" && hasPendingRepair)
     || (["failed_retryable", "failed_terminal"].includes(detail.job.state) && hasApprovedRepair)
   );
+}
+
+function canRetryResolutionDraft(detail) {
+  if (detail.job.state !== "failed_retryable" || pendingApproval(detail)) {
+    return false;
+  }
+  const latestPhaseEvent = (detail.auditEvents || []).find(event => [
+    "resolution_draft_failed",
+    "execution_failed",
+    "repair_returned_to_investigation_review",
+    "direct_close_failed",
+    "reopen_failed",
+    "issue_close_failed"
+  ].includes(event.eventType));
+  return latestPhaseEvent?.eventType === "resolution_draft_failed";
 }
 
 function formatActionSummary(summary) {
@@ -3809,26 +3842,25 @@ function updateJobControls(detail) {
   const pending = pendingApproval(detail);
   const stateName = detail.job.state;
   const canApprove = Boolean(pending) && (
-    ["awaiting_action_approval", "awaiting_comment_approval", "awaiting_resolution_approval"].includes(stateName)
+    ["awaiting_action_approval", "awaiting_resolution_approval"].includes(stateName)
     || (stateName === "failed_retryable" && pending.kind === "resolution")
   );
-  const hasApprovedRepair = (detail.approvals || []).some(approval => approval.kind === "action"
-    && approval.status === "approved"
-    && approval.payload?.plan?.executionMode === "approved_repair_agent");
   const hasPendingResolution = pending?.kind === "resolution";
+  const retryResolutionDraft = canRetryResolutionDraft(detail);
   el.approvalActions.classList.toggle("hidden", !canApprove);
-  el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution");
+  el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution" && !retryResolutionDraft);
+  el.continueButton.textContent = retryResolutionDraft ? "Retry draft" : "Continue";
   const canAbortRepair = stateName === "executing";
   el.abortRepairButton.classList.toggle("hidden", !canAbortRepair);
-  el.abortRepairButton.disabled = !canAbortRepair || state.busy || !state.authOk;
+  el.abortRepairButton.disabled = !canAbortRepair || !state.authOk;
   setRepairRetryVisible(false);
   setSteerVisible(stateName === "awaiting_action_approval"
-    || (["failed_retryable", "failed_terminal"].includes(stateName) && hasApprovedRepair && !hasPendingResolution));
+    || (["failed_retryable", "failed_terminal"].includes(stateName) && Boolean(detail.investigation) && !hasPendingResolution && !retryResolutionDraft));
   setRetrySameRepairVisible(canRetrySameRepair(detail));
 }
 
 function shouldPollJob(detail) {
-  return ["investigating", "approved_for_execution", "executing", "waiting_for_plex_verification", "drafting_comment", "closing_issue"].includes(detail.job.state);
+  return ["investigating", "approved_for_execution", "executing", "drafting_comment", "closing_issue", "reopening_issue"].includes(detail.job.state);
 }
 
 function clearJobPolling() {
@@ -3955,6 +3987,7 @@ async function showIssueSummary(index) {
   el.detailHeading.textContent = "Issue Summary";
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
+  el.abortRepairButton.classList.add("hidden");
   setSteerVisible(false);
   setRepairRetryVisible(false);
   setRetrySameRepairVisible(false);
@@ -4081,6 +4114,7 @@ async function investigate(index, force = false) {
   updateIssueRowHighlights();
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");
+  el.abortRepairButton.classList.add("hidden");
   setRepairRetryVisible(false);
   setRetrySameRepairVisible(false);
   try {
@@ -4433,6 +4467,36 @@ function isAuthorized(req, config) {
   return timingSafeEqual(username, config.webUsername) && timingSafeEqual(password, config.webPassword);
 }
 
+function mutationRequestRejection(req) {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method || "")) {
+    return null;
+  }
+  const contentType = String(req.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return { status: 415, error: "Mutating API requests must use application/json." };
+  }
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) {
+    return null;
+  }
+  if (origin === "null") {
+    return { status: 403, error: "Cross-origin API request rejected." };
+  }
+  try {
+    const originHost = new URL(origin).host.toLowerCase();
+    const acceptedHosts = new Set([
+      String(req.headers.host || "").trim().toLowerCase(),
+      ...String(req.headers["x-forwarded-host"] || "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean)
+    ].filter(Boolean));
+    if (!acceptedHosts.has(originHost)) {
+      return { status: 403, error: "Cross-origin API request rejected." };
+    }
+  } catch {
+    return { status: 403, error: "Cross-origin API request rejected." };
+  }
+  return null;
+}
+
 function send(res, status, body, contentType = "text/plain; charset=utf-8") {
   res.writeHead(status, {
     "content-type": contentType,
@@ -4453,6 +4517,29 @@ function beginLogDownload(res, filename) {
     "cache-control": "no-store",
     "x-content-type-options": "nosniff"
   });
+}
+
+async function writeDownloadLine(res, line) {
+  if (res.destroyed || res.writableEnded) {
+    return false;
+  }
+  if (res.write(line)) {
+    return true;
+  }
+  const outcome = await new Promise(resolve => {
+    const finish = value => {
+      res.removeListener("drain", onDrain);
+      res.removeListener("close", onClose);
+      res.removeListener("error", onClose);
+      resolve(value);
+    };
+    const onDrain = () => finish("drain");
+    const onClose = () => finish("close");
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onClose);
+  });
+  return outcome === "drain" && !res.destroyed;
 }
 
 function logDownloadFilename(...parts) {
@@ -4572,6 +4659,11 @@ export function createWebHandler(agent, config) {
         res.end("Unauthorized");
         return;
       }
+      const mutationRejection = mutationRequestRejection(req);
+      if (mutationRejection) {
+        sendJson(res, mutationRejection.status, { ok: false, error: mutationRejection.error });
+        return;
+      }
 
       if (req.method === "GET" && url.pathname === "/") {
         send(res, 200, HTML, "text/html; charset=utf-8");
@@ -4615,12 +4707,9 @@ export function createWebHandler(agent, config) {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/logs/records") {
-        const from = url.searchParams.get("from") || "";
-        const to = url.searchParams.get("to") || "";
         const limit = Number(url.searchParams.get("limit") || 500);
-        normalizeDiagnosticLogRange({ from, to });
-        const records = await readDiagnosticLogRecords(config.logPath, { from, to }, { limit });
-        sendJson(res, 200, { ok: true, records });
+        const afterCursor = Number(url.searchParams.get("cursor") || 0);
+        sendJson(res, 200, { ok: true, ...agent.liveDiagnosticRecords({ afterCursor, limit }) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/mcp-missing-items") {
@@ -4656,7 +4745,9 @@ export function createWebHandler(agent, config) {
       }
       const jobDetailMatch = url.pathname.match(/^\/api\/jobs\/(\d+)$/);
       if (req.method === "GET" && jobDetailMatch) {
-        sendJson(res, 200, { ok: true, detail: agent.jobDetails(Number(jobDetailMatch[1])) });
+        const jobId = Number(jobDetailMatch[1]);
+        const detail = typeof agent.publicJobDetails === "function" ? agent.publicJobDetails(jobId) : agent.jobDetails(jobId);
+        sendJson(res, 200, { ok: true, detail });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/poll") {
@@ -4681,15 +4772,30 @@ export function createWebHandler(agent, config) {
       const issueLogsMatch = url.pathname.match(/^\/api\/issues\/(\d+)\/(\d+)\/logs$/);
       if (req.method === "GET" && issueLogsMatch) {
         const [, snapshotId, index] = issueLogsMatch;
-        const result = await agent.issueLogs(Number(snapshotId), Number(index));
+        const target = agent.issueLogTarget(Number(snapshotId), Number(index));
         agent.diagnostic?.("info", "issue_log_download_requested", {
-          source: result.source,
-          issueId: result.issueId,
-          recordCount: result.records.length
+          source: target.source,
+          issueId: target.issueId
         });
-        beginLogDownload(res, `${logDownloadFilename("media-issue-agent", result.source, result.issueId)}.log`);
-        for (const record of result.records) {
-          res.write(`${JSON.stringify(record)}\n`);
+        beginLogDownload(res, `${logDownloadFilename("media-issue-agent", target.source, target.issueId)}.log`);
+        let afterId = 0;
+        for (;;) {
+          const page = agent.issueLogPage(Number(snapshotId), Number(index), { afterId, limit: 1000 });
+          if (!page.rows.length) {
+            break;
+          }
+          for (const row of page.rows) {
+            if (!row.record) {
+              continue;
+            }
+            if (!await writeDownloadLine(res, `${JSON.stringify(row.record)}\n`)) {
+              return;
+            }
+          }
+          afterId = page.rows.at(-1).id;
+          if (page.rows.length < 1000) {
+            break;
+          }
         }
         res.end();
         return;
