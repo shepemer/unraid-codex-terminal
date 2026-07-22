@@ -2014,6 +2014,11 @@ pre {
     padding: 10px;
   }
 
+  .steer-panel textarea {
+    font-size: 16px;
+    touch-action: manipulation;
+  }
+
   .steer-panel button {
     width: 100%;
   }
@@ -2219,6 +2224,17 @@ function autoResizeSteerInput() {
   const nextHeight = Math.min(input.scrollHeight + border, maxHeight);
   input.style.height = \`\${nextHeight}px\`;
   input.style.overflowY = input.scrollHeight + border > maxHeight ? "auto" : "hidden";
+}
+
+function dismissSteeringFocus(event) {
+  const active = document.activeElement;
+  if (active !== el.steerInput && active !== el.repairRetryInput) {
+    return;
+  }
+  if (event.target === active || active.contains(event.target)) {
+    return;
+  }
+  active.blur();
 }
 
 function toast(message) {
@@ -4534,9 +4550,12 @@ async function abortRepair() {
 }
 
 async function steerInvestigation() {
-  if (!state.activeJobId) return;
+  if (!state.activeJobId || state.busy) return;
   const message = el.steerInput.value.trim();
   if (!message) return;
+  el.steerInput.value = "";
+  autoResizeSteerInput();
+  el.steerInput.blur();
   setBusy(true);
   setDetailOpen(true);
   setDetailProcessing(true, "Revising");
@@ -4547,13 +4566,15 @@ async function steerInvestigation() {
       method: "POST",
       body: JSON.stringify({ message })
     });
-    el.steerInput.value = "";
-    autoResizeSteerInput();
     el.output.textContent = result.result.summary;
     toast("Investigation revised");
     await refresh();
     await showJob(state.activeJobId);
   } catch (error) {
+    if (!el.steerInput.value.trim()) {
+      el.steerInput.value = message;
+      autoResizeSteerInput();
+    }
     setDetailProcessing(false);
     el.output.textContent = error.message;
     toast(error.message);
@@ -4679,6 +4700,7 @@ el.repairRetryButton.addEventListener("click", retryRepair);
 el.retrySameRepairButton.addEventListener("click", retrySameRepair);
 el.steerButton.addEventListener("click", steerInvestigation);
 el.steerInput.addEventListener("input", autoResizeSteerInput);
+document.addEventListener("pointerdown", dismissSteeringFocus, { passive: true });
 el.repairRetryInput.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     retryRepair();

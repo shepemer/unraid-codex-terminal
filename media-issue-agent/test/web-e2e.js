@@ -1278,9 +1278,27 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await card(page, 1).getByRole("button", { name: "Re-investigate" }).click();
     await expect(page.locator("#investigation-output")).toContainText("Action summary");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 2);
-    await page.locator("#steer-input").fill("Treat this as a client-side app issue with no server-side action.");
-    await page.locator("#steer-button").click();
+    const mobileSteeringFontSize = await page.locator("#steer-input").evaluate(element =>
+      Number.parseFloat(window.getComputedStyle(element).fontSize)
+    );
+    assert.ok(mobileSteeringFontSize >= 16, `mobile steering font was ${mobileSteeringFontSize}px`);
+    await page.locator("#steer-input").fill("Dismiss this draft by tapping outside.");
+    await page.locator("#investigation-output").click();
+    assert.notEqual(await page.evaluate(() => document.activeElement?.id), "steer-input");
+
+    const steeringMessage = "Treat this as a client-side app issue with no server-side action.";
+    await page.locator("#steer-input").fill(steeringMessage);
+    const submittedSteeringState = await page.evaluate(() => {
+      document.querySelector("#steer-button").click();
+      return {
+        value: document.querySelector("#steer-input").value,
+        activeElementId: document.activeElement?.id || ""
+      };
+    });
+    assert.equal(submittedSteeringState.value, "");
+    assert.notEqual(submittedSteeringState.activeElementId, "steer-input");
     await expect(page.locator("#investigation-output")).toContainText("No server-side repair will run");
+    await expect(page.locator("#investigation-output")).toContainText(steeringMessage);
     await expect(page.locator("#approval-actions")).toBeVisible();
     await page.locator("#approve-button").click();
     await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
