@@ -67,9 +67,9 @@ async function createFakeCodexBin(root, logPath) {
     "} else if (kind === 'comment-draft') {",
     "  process.stdout.write('Reviewed as a client-side playback problem. No server-side media action was applied.\\nAutomated response from Codex.\\n');",
     "} else if (kind === 'steered-investigation') {",
-    "  process.stdout.write('Revised investigation: client-side app playback issue. No server-side action is required.\\n');",
+    "  process.stdout.write('### Revised investigation\\n\\nThe fixture is a client-side app playback issue. No server-side action is required.\\n\\n### Exact safe next actions\\n\\n1. Confirm that no server-side media change is needed.\\n2. Explain the client-side resolution to the reporter.\\n');",
     "} else {",
-    "  process.stdout.write('Investigation summary: fixture diagnostics require operator steering before repair.\\n');",
+    "  process.stdout.write('### Investigation summary\\n\\nFixture diagnostics require operator review before repair. The available evidence does not yet identify the failed media state.\\n\\n### Exact safe next actions\\n\\n1. Verify the current fixture state.\\n2. Select a repair only after verification.\\n');",
     "}"
   ].join("\n"));
   await chmod(bin, 0o700);
@@ -494,7 +494,7 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
     await expect(row(page, 3)).toHaveClass(/issue-active/);
     await expect(page.locator("#investigation-output")).toContainText("Job");
-    await expect(page.locator("#investigation-output")).toContainText("Approved");
+    await expect(page.locator("#investigation-full-report")).toContainText("Approved summary");
     await expect(page.locator("#continue-button")).toBeVisible();
     await expect(page.locator("#investigation-output")).not.toContainText("Cannot transition");
 
@@ -737,7 +737,19 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#detail-processing")).toBeVisible();
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
-    await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    await expect(page.locator("#investigation-review")).toBeVisible();
+    await expect(page.locator("#investigation-review-title")).toHaveText("Server-side repair recommended");
+    await expect(page.locator("#investigation-review-summary")).toContainText("Fixture diagnostics require operator review");
+    await expect(page.locator("#investigation-next-steps-list li")).toHaveText([
+      "Verify the current fixture state.",
+      "Select a repair only after verification."
+    ]);
+    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
+    await expect(page.locator("#investigation-full-report")).toBeHidden();
+    await page.locator("#investigation-full-details summary").click();
+    await expect(page.locator("#investigation-full-report")).toBeVisible();
+    await expect(page.locator("#investigation-full-report")).toContainText("### Investigation summary");
+    await page.locator("#investigation-full-details summary").click();
     await expect(page.locator("#investigation-output")).toContainText("Action summary");
     await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
     await expect(page.locator("#detail-processing")).toBeHidden();
@@ -746,7 +758,8 @@ async function testFullBrowserWorkflow(browser) {
 
     await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
     await row(page, 1).getByRole("button", { name: "Re-investigate" }).click();
-    await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    await expect(page.locator("#investigation-full-report")).toContainText("### Investigation summary");
+    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 2);
 
     const emptySteeringBox = await page.locator("#steer-input").evaluate(element => {
@@ -788,8 +801,15 @@ async function testFullBrowserWorkflow(browser) {
     assert.ok(steeringBox.height <= fiveRowMax, JSON.stringify(steeringBox));
     await page.locator("#steer-button").click();
     await expect(page.locator("#steer-input")).toHaveValue("");
-    await expect(page.locator("#investigation-output")).toContainText("Revised investigation");
-    await expect(page.locator("#investigation-output")).toContainText("Pending action approval");
+    await expect(page.locator("#investigation-output")).toContainText("Pending action approval", { timeout: 10_000 });
+    await expect(page.locator("#investigation-review-title")).toHaveText("Client-side resolution recommended");
+    await expect(page.locator("#investigation-review-summary")).toContainText("client-side app playback issue");
+    await expect(page.locator("#investigation-next-steps-list li")).toHaveText([
+      "Confirm that no server-side media change is needed.",
+      "Explain the client-side resolution to the reporter."
+    ]);
+    await expect(page.locator("#investigation-full-report")).toContainText("### Revised investigation");
+    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
     await expect(page.locator("#investigation-output")).toContainText("No server-side repair will run");
     await expect(page.locator("#investigation-output")).toContainText("Steering history:");
     await expect(page.locator("#investigation-output")).toContainText("Mention that the user should restart the app.");
@@ -831,7 +851,7 @@ async function testFullBrowserWorkflow(browser) {
     await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
 
     await row(page, 1).getByRole("button", { name: "Re-investigate" }).click();
-    await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
+    await expect(page.locator("#investigation-full-report")).toContainText("### Investigation summary");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 6);
   } finally {
     await context?.close();
@@ -1263,11 +1283,20 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await card(page, 1).getByRole("button", { name: "Investigate" }).click();
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
+    await expect(page.locator("#investigation-review")).toBeVisible();
+    await expect(page.locator("#investigation-review-summary")).toContainText("Fixture diagnostics require operator review");
+    await expect(page.locator("#investigation-next-steps-list li")).toHaveCount(2);
+    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
     await expect(page.locator("#investigation-output")).toContainText("Action summary");
     await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
     await expect(card(page, 1)).toHaveClass(/issue-active/);
     await assertMobileDetailSheet(page);
     await assertNoHorizontalOverflow(page);
+    const mobileReviewOrder = await page.evaluate(() => ({
+      reviewTop: document.querySelector("#investigation-review").getBoundingClientRect().top,
+      outputTop: document.querySelector("#investigation-output").getBoundingClientRect().top
+    }));
+    assert.ok(mobileReviewOrder.reviewTop < mobileReviewOrder.outputTop, JSON.stringify(mobileReviewOrder));
     assert.equal(await codexInvocationCount(harness.codexLogPath), 1);
 
     await page.locator("#detail-close-button").click();

@@ -92,7 +92,7 @@ function isInterruptedPollError(error) {
 
 function textSuggestsClientSide(...values) {
   const text = values.join(" ").toLowerCase();
-  return /\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
+  return /\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
     || /\bno automated (?:server )?(?:fix|action|repair)\b/.test(text)
     || /\b(?:determination|conclusion|classification)\s+(?:is|:)\s+(?:client-side|client side)\b/.test(text)
     || /\b(?:client-side|client side|user-side|user side)\b.{0,120}\b(?:only|no server|without server|not a server)\b/.test(text);
@@ -100,8 +100,8 @@ function textSuggestsClientSide(...values) {
 
 function textSuggestsServerSide(...values) {
   const text = values.join(" ").toLowerCase()
-    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/g, "")
-    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)\b/g, "")
+    .replace(/\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/g, "")
+    .replace(/\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)\b/g, "")
     .replace(/\bno automated (?:server )?(?:fix|action|repair)\b/g, "");
   const squashed = text.replace(/[^a-z0-9]+/g, "");
   return /\b(?:server-side|server side|server)\b.{0,140}\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b/.test(text)

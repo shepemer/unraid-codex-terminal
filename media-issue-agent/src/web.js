@@ -154,6 +154,22 @@ const HTML = `<!doctype html>
             </div>
           </div>
         </div>
+        <section id="investigation-review" class="investigation-review hidden" aria-labelledby="investigation-review-title">
+          <div class="investigation-review-overview">
+            <span class="eyebrow">Investigation at a glance</span>
+            <h3 id="investigation-review-title">Issue assessment</h3>
+            <p id="investigation-review-summary"></p>
+          </div>
+          <div id="investigation-next-steps" class="investigation-next-steps">
+            <h4>Exact safe next steps</h4>
+            <ol id="investigation-next-steps-list"></ol>
+            <p id="investigation-next-steps-empty" class="investigation-next-steps-empty hidden">No explicit steps were extracted. Expand the full report to review the complete recommendation.</p>
+          </div>
+          <details id="investigation-full-details" class="investigation-full-details">
+            <summary>Read full investigation report</summary>
+            <pre id="investigation-full-report" class="investigation-full-report"></pre>
+          </details>
+        </section>
         <pre id="investigation-output">Select an issue to investigate.</pre>
         <div id="steer-panel" class="steer-panel hidden">
           <textarea id="steer-input" rows="1" placeholder="Steer the investigation or repair plan"></textarea>
@@ -1051,6 +1067,131 @@ pre {
     linear-gradient(90deg, color-mix(in srgb, var(--accent-soft) 34%, transparent), transparent 28rem),
     var(--panel);
   font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.investigation-review {
+  flex: 0 1 auto;
+  max-height: 55%;
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 72%, var(--panel));
+  overscroll-behavior: contain;
+}
+
+.investigation-review.hidden {
+  display: none;
+}
+
+.investigation-review-overview,
+.investigation-next-steps {
+  padding: 14px 16px;
+}
+
+.investigation-review-overview {
+  border-left: 3px solid var(--accent);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent-soft) 45%, transparent), transparent 34rem);
+}
+
+.investigation-review-overview h3 {
+  margin: 4px 0 6px;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+
+.investigation-review-overview p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
+.investigation-next-steps {
+  border-top: 1px solid var(--line);
+}
+
+.investigation-next-steps h4 {
+  margin: 0 0 9px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+
+.investigation-next-steps ol {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding-left: 22px;
+  color: var(--text);
+}
+
+.investigation-next-steps li {
+  padding-left: 3px;
+  line-height: 1.45;
+}
+
+.investigation-next-steps-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.investigation-full-details {
+  border-top: 1px solid var(--line);
+}
+
+.investigation-full-details summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  padding: 0 16px;
+  color: var(--accent-strong);
+  font-weight: 720;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.investigation-full-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.investigation-full-details summary::before {
+  content: "›";
+  width: 18px;
+  margin-right: 6px;
+  font-size: 20px;
+  line-height: 1;
+  transform-origin: center;
+  transition: transform 140ms ease;
+}
+
+.investigation-full-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.investigation-full-details summary:hover,
+.investigation-full-details summary:focus-visible {
+  background: color-mix(in srgb, var(--accent-soft) 32%, transparent);
+}
+
+.investigation-full-details summary:focus-visible {
+  outline: none;
+  box-shadow: inset var(--focus);
+}
+
+.investigation-full-report {
+  flex: none;
+  min-height: 0;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .steer-panel {
@@ -2179,6 +2320,14 @@ const el = {
   detailBand: document.getElementById("detail-band"),
   detailHeading: document.getElementById("detail-heading"),
   output: document.getElementById("investigation-output"),
+  investigationReview: document.getElementById("investigation-review"),
+  investigationReviewTitle: document.getElementById("investigation-review-title"),
+  investigationReviewSummary: document.getElementById("investigation-review-summary"),
+  investigationNextSteps: document.getElementById("investigation-next-steps"),
+  investigationNextStepsList: document.getElementById("investigation-next-steps-list"),
+  investigationNextStepsEmpty: document.getElementById("investigation-next-steps-empty"),
+  investigationFullDetails: document.getElementById("investigation-full-details"),
+  investigationFullReport: document.getElementById("investigation-full-report"),
   detailCloseButton: document.getElementById("detail-close-button"),
   detailProcessing: document.getElementById("detail-processing"),
   reopenButton: document.getElementById("reopen-button"),
@@ -2293,6 +2442,7 @@ function closeDetail() {
   state.activeEntryIndex = null;
   setDetailProcessing(false);
   setDetailOpen(false);
+  hideInvestigationReview();
   el.detailHeading.textContent = "Investigation";
   el.output.textContent = "Select an issue to investigate.";
   el.reopenButton.classList.add("hidden");
@@ -3652,9 +3802,15 @@ function showEntry(index) {
   if (entry.investigationSummary) {
     const status = entry.investigationStatus ? \`Status: \${stateLabel(entry.jobState || entry.investigationStatus)}\` : "Status: Investigation cached";
     const updated = entry.investigationUpdatedAt ? \`Updated: \${entry.investigationUpdatedAt}\` : "";
-    el.output.textContent = [formatEntryMetadata(entry), "", status, updated, "", entry.investigationSummary].filter(Boolean).join("\\n");
+    renderInvestigationReview({
+      job: { id: entry.jobId || null },
+      investigation: { summary: entry.investigationSummary, updatedAt: entry.investigationUpdatedAt },
+      approvals: []
+    });
+    el.output.textContent = [formatEntryMetadata(entry), "", status, updated].filter(Boolean).join("\\n");
     el.approvalActions.classList.toggle("hidden", entry.jobState !== "awaiting_action_approval");
   } else {
+    hideInvestigationReview();
     el.output.textContent = [formatEntryMetadata(entry), "", "No cached investigation. Select Investigate to run Codex."].filter(Boolean).join("\\n");
     el.approvalActions.classList.add("hidden");
     setSteerVisible(false);
@@ -4017,6 +4173,201 @@ function formatSteeringHistory(investigation) {
   return lines.join("\\n");
 }
 
+const INVESTIGATION_ACTION_HEADINGS = new Set([
+  "exact safe next actions",
+  "safe next actions",
+  "server side safe next actions",
+  "client side safe next actions",
+  "exact safe next steps",
+  "safe next steps",
+  "next actions",
+  "next steps",
+  "recommended actions",
+  "recommended next actions",
+  "suggested repair steps",
+  "repair plan"
+]);
+
+function stripInvestigationMarkdown(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^#{1,6}[ \\t]*/, "")
+    .replace(/^(?:[-*+]|[0-9]+[.)])[ \\t]+/, "")
+    .replaceAll("**", "")
+    .replaceAll("__", "")
+    .replaceAll("\`", "")
+    .replace(/[ \\t]+/g, " ")
+    .trim();
+}
+
+function normalizedInvestigationHeading(value) {
+  return stripInvestigationMarkdown(value)
+    .replace(/:[ \\t]*$/, "")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function isInvestigationActionHeading(value) {
+  return INVESTIGATION_ACTION_HEADINGS.has(normalizedInvestigationHeading(value));
+}
+
+function investigationActionHeading(value) {
+  const line = stripInvestigationMarkdown(value);
+  const separator = line.indexOf(":");
+  const label = separator >= 0 ? line.slice(0, separator) : line;
+  return {
+    matches: isInvestigationActionHeading(label),
+    inline: separator >= 0 ? line.slice(separator + 1).trim() : ""
+  };
+}
+
+function isInvestigationSectionHeading(value) {
+  const line = String(value || "").trim();
+  return line.startsWith("#") || (line.startsWith("**") && line.endsWith("**"));
+}
+
+function investigationActionSectionIndex(lines) {
+  return lines.findIndex(line => investigationActionHeading(line).matches);
+}
+
+function extractInvestigationNextSteps(summary) {
+  const lines = String(summary || "").split("\\n");
+  const start = investigationActionSectionIndex(lines);
+  if (start < 0) {
+    return [];
+  }
+  const header = investigationActionHeading(lines[start]);
+  const steps = header.inline
+    ? header.inline.split(";").map(stripInvestigationMarkdown).filter(Boolean)
+    : [];
+  let sawBlank = false;
+  for (const rawLine of lines.slice(start + 1)) {
+    const line = String(rawLine || "").trim();
+    if (!line) {
+      sawBlank = true;
+      continue;
+    }
+    if (isInvestigationSectionHeading(line)) {
+      break;
+    }
+    const listMatch = line.match(/^(?:[-*+]|[0-9]+[.)])[ \\t]+(.*)$/);
+    if (listMatch) {
+      const step = stripInvestigationMarkdown(listMatch[1]);
+      if (step) {
+        steps.push(step);
+      }
+      sawBlank = false;
+      continue;
+    }
+    if (steps.length && !sawBlank) {
+      steps[steps.length - 1] = stripInvestigationMarkdown(steps[steps.length - 1] + " " + line);
+      continue;
+    }
+    if (steps.length) {
+      break;
+    }
+    const inlineSteps = line.split(";").map(stripInvestigationMarkdown).filter(Boolean);
+    steps.push(...inlineSteps);
+    sawBlank = false;
+  }
+  return [...new Set(steps)].slice(0, 20);
+}
+
+function extractInvestigationOverview(summary) {
+  const lines = String(summary || "").split("\\n");
+  const actionIndex = investigationActionSectionIndex(lines);
+  const sourceLines = actionIndex >= 0 ? lines.slice(0, actionIndex) : lines;
+  const paragraphs = [];
+  let current = [];
+  const flush = () => {
+    if (current.length) {
+      paragraphs.push(current.join(" "));
+      current = [];
+    }
+  };
+  for (const rawLine of sourceLines) {
+    const line = String(rawLine || "").trim();
+    if (!line || isInvestigationSectionHeading(line)) {
+      flush();
+      continue;
+    }
+    const clean = stripInvestigationMarkdown(line);
+    if (clean) {
+      current.push(clean);
+    }
+  }
+  flush();
+  const overview = (paragraphs[0] || stripInvestigationMarkdown(summary)).trim();
+  return overview.length > 520 ? overview.slice(0, 519).trim() + "..." : overview;
+}
+
+function latestInvestigationPlan(detail) {
+  const pending = pendingApproval(detail);
+  const pendingPlan = pending?.kind === "action" ? pending.payload?.plan : null;
+  if (pendingPlan) {
+    return pendingPlan;
+  }
+  return [...(detail?.approvals || [])]
+    .filter(approval => approval.kind === "action" && approval.payload?.plan)
+    .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0]?.payload?.plan || null;
+}
+
+function investigationReviewTitle(plan) {
+  if (plan?.classification === "client_side"
+    || plan?.executionMode === "none"
+    || plan?.actionSummary?.mode === "client_side"
+    || String(plan?.actionSummary?.headline || "").toLowerCase().includes("no server-side repair")) {
+    return "Client-side resolution recommended";
+  }
+  if (plan?.requiresServerAction === true || plan?.executionMode === "approved_repair_agent") {
+    return "Server-side repair recommended";
+  }
+  return "Issue assessment";
+}
+
+function hideInvestigationReview() {
+  el.investigationReview.classList.add("hidden");
+  el.investigationReviewTitle.textContent = "Issue assessment";
+  el.investigationReviewSummary.textContent = "";
+  el.investigationNextStepsList.replaceChildren();
+  el.investigationNextStepsEmpty.classList.add("hidden");
+  el.investigationFullDetails.open = false;
+  el.investigationFullReport.textContent = "";
+}
+
+function renderInvestigationReview(detail) {
+  const summary = String(detail?.investigation?.summary || "").trim();
+  if (!summary) {
+    hideInvestigationReview();
+    return;
+  }
+  const sameReport = !el.investigationReview.classList.contains("hidden")
+    && el.investigationFullReport.textContent === summary;
+  const preserveOpen = sameReport && el.investigationFullDetails.open;
+  const preserveScrollTop = sameReport ? el.investigationReview.scrollTop : 0;
+  const plan = latestInvestigationPlan(detail);
+  const parsedSteps = extractInvestigationNextSteps(summary);
+  const fallbackSteps = Array.isArray(plan?.actionSummary?.expectedSteps)
+    ? plan.actionSummary.expectedSteps.map(stripInvestigationMarkdown).filter(Boolean)
+    : [];
+  const steps = parsedSteps.length ? parsedSteps : fallbackSteps;
+  el.investigationReviewTitle.textContent = investigationReviewTitle(plan);
+  el.investigationReviewSummary.textContent = extractInvestigationOverview(summary);
+  el.investigationNextStepsList.replaceChildren();
+  for (const step of steps) {
+    const item = document.createElement("li");
+    item.textContent = step;
+    el.investigationNextStepsList.appendChild(item);
+  }
+  el.investigationNextStepsList.classList.toggle("hidden", !steps.length);
+  el.investigationNextStepsEmpty.classList.toggle("hidden", Boolean(steps.length));
+  el.investigationFullReport.textContent = summary;
+  el.investigationFullDetails.open = preserveOpen;
+  el.investigationReview.classList.remove("hidden");
+  el.investigationReview.scrollTop = preserveScrollTop;
+}
+
 function formatPromptImprovementItem(item) {
   const details = item.details || {};
   return [
@@ -4057,7 +4408,6 @@ function formatJobDetail(detail) {
     }
   }
   if (detail.investigation?.summary) {
-    lines.push("", "Investigation:", detail.investigation.summary);
     const trustedReporterGuidance = detail.investigation.evidence?.trustedReporterGuidance?.message || "";
     if (trustedReporterGuidance) {
       lines.push("", "Trusted server-owner report guidance:", trustedReporterGuidance);
@@ -4176,11 +4526,15 @@ function restoreOutputScroll(snapshot) {
 }
 
 async function showJob(jobId, options = {}) {
+  const switchingJobs = Number(state.activeJobId) !== Number(jobId);
   state.activeJobId = Number(jobId);
   state.activeEntryIndex = entryIndexForJob(jobId);
   setDetailOpen(true);
   el.detailHeading.textContent = "Job Detail";
   if (!options.quiet) {
+    if (switchingJobs) {
+      hideInvestigationReview();
+    }
     el.output.textContent = "Loading job detail...";
     setDetailProcessing(true, "Loading");
   }
@@ -4192,6 +4546,7 @@ async function showJob(jobId, options = {}) {
     const outputScroll = options.quiet ? captureOutputScroll() : null;
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
     mergeJobDetailState(result.detail);
+    renderInvestigationReview(result.detail);
     el.output.textContent = formatJobDetail(result.detail);
     restoreOutputScroll(outputScroll);
     updateJobControls(result.detail);
@@ -4259,6 +4614,7 @@ async function showIssueSummary(index) {
   state.activeJobId = entry?.jobId || null;
   setDetailOpen(true);
   setDetailProcessing(false);
+  hideInvestigationReview();
   el.detailHeading.textContent = "Issue Summary";
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
@@ -4386,6 +4742,7 @@ async function investigate(index, force = false) {
   state.activeEntryIndex = Number(index);
   setDetailOpen(true);
   setDetailProcessing(true, "Investigating");
+  hideInvestigationReview();
   updateIssueRowHighlights();
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");

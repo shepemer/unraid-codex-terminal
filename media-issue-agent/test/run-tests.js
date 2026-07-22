@@ -3170,6 +3170,9 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="detail-band"/);
     assert.match(pageText, /id="detail-close-button"/);
     assert.match(pageText, /id="detail-processing"/);
+    assert.match(pageText, /id="investigation-review"/);
+    assert.match(pageText, /id="investigation-next-steps-list"/);
+    assert.match(pageText, /id="investigation-full-details"/);
     assert.match(pageText, /Retry same repair/);
     assert.match(pageText, /id="continue-button"/);
     assert.match(pageText, /id="reopen-button"/);
@@ -3211,6 +3214,9 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.token-usage/);
     assert.match(cssText, /\.work-area\.detail-open/);
     assert.match(cssText, /\.detail-band\.processing::before/);
+    assert.match(cssText, /\.investigation-review/);
+    assert.match(cssText, /\.investigation-next-steps/);
+    assert.match(cssText, /\.investigation-full-details/);
     assert.match(cssText, /\.runner-strip/);
     assert.match(cssText, /\.compact-field/);
     assert.match(cssText, /\.mobile-only/);
@@ -3229,6 +3235,7 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /@keyframes mcpGapStatusSheen/);
     assert.match(cssText, /\.steer-panel textarea \{[\s\S]*min-height: 42px;[\s\S]*max-height: 132px;[\s\S]*resize: none;/);
     assert.match(cssText, /@media \(max-width: 700px\)/);
+    assert.match(cssText, /font-size: 16px;\s+touch-action: manipulation;/);
     assert.match(cssText, /\.app-shell\.runner-settings-open \.runner-strip/);
     assert.match(cssText, /\.app-shell\.activity-open \.side-panel/);
     assert.match(cssText, /\.detail-band \{/);
@@ -3290,6 +3297,8 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /data-learn-issue/);
     assert.match(jsText, /function issueCardHtml/);
     assert.match(jsText, /function mergeJobDetailState/);
+    assert.match(jsText, /function renderInvestigationReview/);
+    assert.match(jsText, /function extractInvestigationNextSteps/);
     assert.match(jsText, /PROCESSING_JOB_STATES/);
     assert.match(jsText, /function handleIssueListClick/);
     assert.match(jsText, /\/api\/settings\/codex/);
