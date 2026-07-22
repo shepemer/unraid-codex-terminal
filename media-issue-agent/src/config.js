@@ -140,6 +140,7 @@ export async function loadConfig(env = process.env, options = {}) {
     logPath: env.ISSUE_AGENT_LOG_PATH || defaultDiagnosticLogPath(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"),
     repairWorkspaceRoot: env.ISSUE_AGENT_REPAIR_WORKSPACE_ROOT || path.join(path.dirname(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"), "repair-workspaces"),
     repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || "",
+    serverOwnerReporterUsername: String(env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || "").trim(),
     pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
     issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, 200, 1),
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",

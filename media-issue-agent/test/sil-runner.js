@@ -308,12 +308,25 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
     "if (prompt.includes('Autonomous approved media repair execution')) kind = 'repair-execution';",
+    "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
+    "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
     "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
     "  process.exit(42);",
     "}",
-    "if (kind === 'comment-draft') {",
+    "if (kind === 'workflow-improvement') {",
+    "  const result = { summary: 'Learned one reusable SIL workflow improvement.', improvements: [{ dedupeKey: 'sil_verify_before_client_classification', title: 'Verify evidence before client-side classification', target: 'suggested_repair_steps', description: 'Require an evidence check before handing a client-side conclusion to the repair runner.', recommendedChange: 'Verify the reported condition before concluding that no server-side action is required.', rationale: 'Trusted operator steering corrected the initial repair direction.', issuePattern: 'Playback reports where the first investigation lacks decisive evidence.', implementationSignals: ['verify the reported condition before classification'], steeringEvidence: [{ sequence: 1, guidance: 'Treat this as a client-side app issue with no server-side action.', effect: 'Changed the approved repair direction.' }] }] };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'prompt-improvement-check') {",
+    "  const itemIds = [...prompt.matchAll(/\\\"id\\\":\\s*(\\d+)/g)].map(match => Number(match[1]));",
+    "  const result = { summary: 'SIL prompt implementation check completed.', results: itemIds.map(itemId => ({ itemId, implemented: true, matchType: 'implemented', confidence: 'high', matchedSurfaces: ['investigationPromptInstructions'], reason: 'The current investigation prompt implements the requested evidence-verification behavior.', rationaleDetails: { requestedBehavior: 'Verify evidence before classification.', implementedBehavior: 'The prompt requires evidence-based classification and exact next actions.', remainingGap: '', evidence: ['Evidence-based classification is required.'] } })) };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'comment-draft') {",
     "  if (prompt.includes('server_action_completed')) {",
     "    process.stdout.write('Downloaded the requested Korean subtitles and refreshed Plex. Automated response from Codex.\\n');",
     "  } else {",
@@ -522,6 +535,30 @@ async function assertInvestigationSteeringAndClosure(baseUrl, logPath, fakeMcp, 
   assert.equal(closeComments[1].args.message, "Closed.");
   const resolveCall = fakeMcp.calls.find(call => call.name === "seerr_resolve_issue" && call.args.issueId === 1001);
   assert.equal(resolveCall.args.dryRun, false);
+
+  const improvements = await api(baseUrl, "/api/improvements");
+  const learned = improvements.items.find(item => item.jobId === investigated.result.jobId && item.itemType === "investigation_prompt");
+  assert.ok(learned, "resolved steered workflow should create a prompt improvement");
+  assert.equal(learned.details.target, "suggested_repair_steps");
+
+  const checked = await api(baseUrl, "/api/improvements/check", {
+    method: "POST",
+    body: "{}"
+  });
+  const learnedResult = checked.results.find(result => result.itemId === learned.id);
+  assert.equal(learnedResult.implemented, true);
+  assert.match(learnedResult.rationaleDetails.implementedBehavior, /prompt requires evidence-based classification/i);
+
+  await api(baseUrl, `/api/improvements/${learned.id}`, { method: "DELETE" });
+  assert.equal((await api(baseUrl, "/api/improvements")).items.some(item => item.id === learned.id), false);
+
+  const regenerated = await api(baseUrl, `/api/issues/${snapshotId}/1/improvements`, {
+    method: "POST",
+    body: "{}"
+  });
+  assert.equal(regenerated.result.status, "completed");
+  assert.equal(regenerated.result.improvements.length, 1);
+  assert.equal((await api(baseUrl, "/api/improvements")).items.some(item => item.id === learned.id), true);
 }
 
 async function assertServerActionExecution(baseUrl, logPath, fakeMcp, snapshotId, dbPath) {

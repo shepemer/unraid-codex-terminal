@@ -2818,10 +2818,12 @@ async function testAuthConfig() {
     ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
     CODEX_HOME: codexHome,
     ISSUE_AGENT_DB_PATH: "/tmp/media-issue-agent.sqlite",
-    ISSUE_AGENT_LOG_PATH: "/tmp/media-issue-agent-diagnostics.log"
+    ISSUE_AGENT_LOG_PATH: "/tmp/media-issue-agent-diagnostics.log",
+    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: " fixture-owner "
   });
   assert.equal(loaded.codexHome, codexHome);
   assert.equal(loaded.logPath, "/tmp/media-issue-agent-diagnostics.log");
+  assert.equal(loaded.serverOwnerReporterUsername, "fixture-owner");
   const chatGptLoaded = await loadConfig({
     ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
     CODEX_HOME: chatGptCodexHome
@@ -2982,6 +2984,8 @@ async function testWebAuthAndApi() {
   let steerRequest = null;
   let closeRequest = null;
   let reopenRequest = null;
+  let improvementRequest = null;
+  let removedImprovementId = null;
   const liveLogRecords = [];
   const issueLogRows = [{
     id: 1,
@@ -3034,6 +3038,42 @@ async function testWebAuthAndApi() {
     }),
     jobs: () => [{ id: 9, source: "seerr", issueId: "fixture", state: "approved_for_execution" }],
     approvals: () => [],
+    publicImprovementItems: () => [{
+      id: 31,
+      itemType: "investigation_prompt",
+      title: "Fixture prompt improvement",
+      description: "Improve fixture investigation guidance.",
+      category: "suggested_repair_steps",
+      details: {
+        target: "suggested_repair_steps",
+        recommendedChange: "Verify fixture state before repair.",
+        rationale: "Trusted fixture steering corrected the plan.",
+        issuePattern: "Synthetic fixture reports.",
+        implementationSignals: ["verify fixture state"],
+        steeringEvidence: []
+      }
+    }],
+    checkImprovements: async () => ({
+      items: agent.publicImprovementItems(),
+      results: [{
+        itemId: 31,
+        itemType: "investigation_prompt",
+        implemented: true,
+        matchType: "implemented",
+        confidence: "high",
+        reason: "Fixture prompt contains the requested behavior.",
+        rationaleDetails: {
+          requestedBehavior: "Verify fixture state before repair.",
+          implementedBehavior: "Current fixture prompt verifies state.",
+          remainingGap: "",
+          evidence: ["fixture prompt"]
+        }
+      }]
+    }),
+    removeImprovementItem: itemId => {
+      removedImprovementId = itemId;
+      return { id: itemId, itemType: "investigation_prompt", title: "Fixture prompt improvement" };
+    },
     codexSettings: () => ({
       defaults: { model: "gpt-5.5", reasoningEffort: "xhigh", fastMode: true, serviceTier: "fast" },
       effective: { model: "gpt-5.5", reasoningEffort: "xhigh", fastMode: true, serviceTier: "fast" },
@@ -3083,6 +3123,15 @@ async function testWebAuthAndApi() {
     reopenIssue: async (snapshotId, index, actor) => {
       reopenRequest = { snapshotId, index, actor };
       return { jobId: 9, status: "open" };
+    },
+    generateIssueImprovements: async (snapshotId, index, actor) => {
+      improvementRequest = { snapshotId, index, actor };
+      return {
+        jobId: 9,
+        status: "completed",
+        summary: "Generated one fixture improvement.",
+        improvements: agent.publicImprovementItems()
+      };
     }
   };
   const server = http.createServer(createWebHandler(agent, config));
@@ -3131,7 +3180,9 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="mcp-gaps-download-button"/);
     assert.match(pageText, /id="mcp-gap-detection-dialog"/);
     assert.match(pageText, /id="mcp-gap-detection-close-button"/);
-    assert.match(pageText, /Check MCP Capabilities/);
+    assert.match(pageText, /Improvement Backlog/);
+    assert.match(pageText, /Check Implemented/);
+    assert.match(pageText, /data-improvement-filter="investigation_prompt"/);
     assert.match(pageText, /id="runner-settings-backdrop"/);
     assert.match(pageText, /id="activity-drawer-backdrop"/);
     assert.match(pageText, /id="live-logs-open-button"/);
@@ -3170,6 +3221,9 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.mcp-gap-status-button/);
     assert.match(cssText, /\.mcp-gap-detected/);
     assert.match(cssText, /\.mcp-gap-not-detected/);
+    assert.match(cssText, /\.improvement-filters/);
+    assert.match(cssText, /\.improvement-kind\.prompt/);
+    assert.match(cssText, /\.improvement-recommendation/);
     assert.match(cssText, /@keyframes mcpDetectedButtonBg/);
     assert.match(cssText, /@keyframes mcpNotDetectedButtonBg/);
     assert.match(cssText, /@keyframes mcpGapStatusSheen/);
@@ -3227,11 +3281,13 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function renderTokenUsage/);
     assert.match(jsText, /function setActivityDrawerOpen/);
     assert.match(jsText, /function setRunnerSettingsOpen/);
-    assert.match(jsText, /function checkMcpCapabilities/);
+    assert.match(jsText, /function checkImprovements/);
     assert.match(jsText, /function mcpGapReportMarkdown/);
     assert.match(jsText, /function downloadMcpGapReport/);
-    assert.match(jsText, /UNTRUSTED_MCP_GAP_DATA_START/);
-    assert.match(jsText, /\/api\/mcp-missing-items\/check-capabilities/);
+    assert.match(jsText, /UNTRUSTED_IMPROVEMENT_DATA_START/);
+    assert.match(jsText, /\/api\/improvements\/check/);
+    assert.match(jsText, /function generateIssueImprovements/);
+    assert.match(jsText, /data-learn-issue/);
     assert.match(jsText, /function issueCardHtml/);
     assert.match(jsText, /function mergeJobDetailState/);
     assert.match(jsText, /PROCESSING_JOB_STATES/);
@@ -3264,6 +3320,28 @@ async function testWebAuthAndApi() {
       body: JSON.stringify({ model: "gpt-5", reasoningEffort: "high", fastMode: false, serviceTier: "" })
     });
     assert.equal((await savedSettings.json()).settings.effective.reasoningEffort, "high");
+    const improvements = await fetch(`${baseUrl}/api/improvements`, { headers: { authorization: auth } });
+    const improvementItems = (await improvements.json()).items;
+    assert.equal(improvementItems[0].itemType, "investigation_prompt");
+    const checkedImprovements = await fetch(`${baseUrl}/api/improvements/check`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal((await checkedImprovements.json()).results[0].implemented, true);
+    const removedImprovement = await fetch(`${baseUrl}/api/improvements/31`, {
+      method: "DELETE",
+      headers: { authorization: auth, "content-type": "application/json" }
+    });
+    assert.equal((await removedImprovement.json()).item.id, 31);
+    assert.equal(removedImprovementId, 31);
+    const learned = await fetch(`${baseUrl}/api/issues/7/1/improvements`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal((await learned.json()).result.status, "completed");
+    assert.deepEqual(improvementRequest, { snapshotId: 7, index: 1, actor: "web" });
     const investigated = await fetch(`${baseUrl}/api/investigate`, {
       method: "POST",
       headers: { authorization: auth, "content-type": "application/json" },

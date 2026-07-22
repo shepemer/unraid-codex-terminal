@@ -15,6 +15,7 @@ import {
   recordAgentRunEvent,
   setPendingApprovals,
   transitionJob,
+  upsertImprovementItems,
   upsertMissingMcpItems,
   upsertInvestigation
 } from "../src/db.js";
@@ -42,8 +43,21 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
     "if (prompt.includes('MCP capability gap audit')) kind = 'mcp-capability-check';",
+    "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
+    "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
     "appendFileSync(process.env.WEB_E2E_CODEX_LOG, `${JSON.stringify({ kind })}\\n`);",
-    "if (kind === 'mcp-capability-check') {",
+    "if (kind === 'workflow-improvement') {",
+    "  const result = { summary: 'Learned one reusable fixture improvement.', improvements: [{ dedupeKey: 'fixture_verify_before_repair', title: 'Verify fixture state before repair', target: 'suggested_repair_steps', description: 'Check fixture state before selecting repair actions.', recommendedChange: 'Inspect and verify fixture state before handing repair steps to the executor.', rationale: 'Trusted steering corrected a missing verification step.', issuePattern: 'Fixture issues needing operator correction.', implementationSignals: ['verify fixture state'], steeringEvidence: [{ sequence: 1, guidance: 'Verify first.', effect: 'Added verification.' }] }] };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'prompt-improvement-check') {",
+    "  const itemIds = [...prompt.matchAll(/\\\"id\\\":\\s*(\\d+)/g)].map(match => Number(match[1]));",
+    "  const result = { summary: 'Fixture prompt check completed.', results: itemIds.map(itemId => ({ itemId, implemented: true, matchType: 'implemented', confidence: 'high', matchedSurfaces: ['investigationPromptInstructions'], reason: 'The fixture prompt implements the requested verification behavior.', rationaleDetails: { requestedBehavior: 'Verify fixture state.', implementedBehavior: 'Current prompt requires verification.', remainingGap: '', evidence: ['verification instruction'] } })) };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'mcp-capability-check') {",
     "  const itemIds = [...prompt.matchAll(/\\\"id\\\":\\s*(\\d+)/g)].map(match => Number(match[1]));",
     "  const negativeItemId = prompt.includes('fixture_archive_probe') ? Math.max(...itemIds) : null;",
     "  const result = { summary: 'Fixture capability check completed.', results: itemIds.map(itemId => itemId === negativeItemId ? ({ itemId, detected: false, toolName: 'media_diagnose_issue', matchType: 'partial', confidence: 'high', reason: 'The available fixture diagnostics tool is related but does not satisfy the requested archive probe.' }) : ({ itemId, detected: true, toolName: 'sonarr_replace_fixture_episode', matchType: 'agent_reasoned', confidence: 'high', reason: 'The available fixture replacement tool satisfies this request.' })) };",
@@ -313,7 +327,18 @@ async function testIssueStateActionMatrix(browser) {
 
     const closed = ensureJob(dbPath, "seerr", "205");
     transitionJob(dbPath, closed.id, "detected", "closed");
-    upsertInvestigation(dbPath, closed.id, { status: "ready", summary: "Closed summary", evidence: {} });
+    upsertInvestigation(dbPath, closed.id, {
+      status: "ready",
+      summary: "Closed summary with fixture verification.",
+      evidence: {
+        steeringHistory: [{
+          sequence: 1,
+          actor: "fixture-operator",
+          message: "Verify fixture state before selecting repair actions.",
+          previousSummary: "Closed summary without verification."
+        }]
+      }
+    });
 
     const terminal = ensureJob(dbPath, "seerr", "206");
     transitionJob(dbPath, terminal.id, "detected", "failed_terminal", "Terminal fixture");
@@ -333,6 +358,19 @@ async function testIssueStateActionMatrix(browser) {
       suggestedToolName: "fixture_archive_probe",
       category: "diagnostics"
     }]);
+    upsertImprovementItems(dbPath, closed.id, null, [{
+      itemType: "investigation_prompt",
+      dedupeKey: "fixture_existing_prompt_improvement",
+      title: "Add fixture verification to investigation guidance",
+      target: "evidence_collection",
+      category: "evidence_collection",
+      description: "Require fixture-state verification before classification.",
+      recommendedChange: "Add a fixture-state verification step before classification.",
+      rationale: "Trusted steering corrected a missing evidence check.",
+      issuePattern: "Synthetic fixture issues.",
+      implementationSignals: ["verify fixture state"],
+      steeringEvidence: [{ sequence: 1, guidance: "Verify first.", effect: "Added evidence collection." }]
+    }], "investigation_prompt");
 
     ensureJob(dbPath, "seerr", "207");
 
@@ -344,18 +382,27 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
     await expect(page.locator("#mcp-gaps-list")).toContainText("sonarr_replace_fixture_episode");
     await expect(page.locator("#mcp-gaps-list")).toContainText("Inspect unavailable fixture archive");
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Add fixture verification to investigation guidance");
+    await expect(page.locator("#improvement-count-all")).toHaveText("3");
+    await expect(page.locator("#improvement-count-mcp")).toHaveText("2");
+    await expect(page.locator("#improvement-count-prompts")).toHaveText("1");
+    await page.locator('[data-improvement-filter="investigation_prompt"]').click();
+    await expect(page.locator(".prompt-improvement")).toHaveCount(1);
+    await expect(page.locator(".mcp-improvement")).toHaveCount(0);
+    await page.locator('[data-improvement-filter="all"]').click();
     await page.locator("#mcp-gaps-check-button").click();
-    await expect(page.locator(".mcp-gap-detected")).toHaveText("DETECTED");
-    await expect(page.locator(".mcp-gap-detected")).toHaveAttribute("type", "button");
+    await expect(page.locator(".mcp-improvement .mcp-gap-detected")).toHaveText("DETECTED");
+    await expect(page.locator(".mcp-improvement .mcp-gap-detected")).toHaveAttribute("type", "button");
+    await expect(page.locator(".prompt-improvement .mcp-gap-detected")).toHaveText("IMPLEMENTED");
     await expect(page.locator(".mcp-gap-not-detected")).toHaveText("NOT DETECTED");
     await expect(page.locator(".mcp-gap-not-detected")).toHaveAttribute("type", "button");
-    await expect(page.locator(".mcp-gap-item.detected [data-remove-mcp-gap]")).toHaveClass(/detected/);
-    for (const selector of [".mcp-gap-item.detected .mcp-gap-actions", ".mcp-gap-item.not-detected .mcp-gap-actions"]) {
+    await expect(page.locator(".mcp-gap-item.detected [data-remove-mcp-gap]").first()).toHaveClass(/detected/);
+    for (const selector of [".mcp-improvement.detected .mcp-gap-actions", ".prompt-improvement.detected .mcp-gap-actions", ".mcp-gap-item.not-detected .mcp-gap-actions"]) {
       await expect(page.locator(selector).locator("button")).toHaveCount(2);
       const actionWidths = await page.locator(selector).locator("button").evaluateAll(buttons => buttons.map(button => Math.round(button.getBoundingClientRect().width)));
       assert.equal(actionWidths[0], actionWidths[1]);
     }
-    await page.locator(".mcp-gap-detected").click();
+    await page.locator(".mcp-improvement .mcp-gap-detected").click();
     await expect(page.locator("#mcp-gap-detection-dialog")).toBeVisible();
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("Replace a fixture episode");
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("sonarr_replace_fixture_episode");
@@ -375,20 +422,30 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator("#mcp-gap-detection-body")).toContainText("Agent advisory: not detected");
     await page.locator("#mcp-gap-detection-close-button").click();
     await expect(page.locator("#mcp-gap-detection-dialog")).toBeHidden();
+    await page.locator(".prompt-improvement .mcp-gap-detected").click();
+    await expect(page.locator("#mcp-gap-detection-dialog")).toBeVisible();
+    await expect(page.locator("#mcp-gap-detection-title")).toHaveText("Prompt Implementation Rationale");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Requested improvement");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Current implementation");
+    await expect(page.locator("#mcp-gap-detection-body")).toContainText("Current prompt requires verification");
+    await page.locator("#mcp-gap-detection-close-button").click();
     const gapReportDownload = page.waitForEvent("download");
     await page.locator("#mcp-gaps-download-button").click();
     const gapReport = await gapReportDownload;
-    assert.match(gapReport.suggestedFilename(), /^media-issue-agent-mcp-gaps-.*\.md$/);
+    assert.match(gapReport.suggestedFilename(), /^media-issue-agent-improvements-.*\.md$/);
     const gapReportPath = await gapReport.path();
     const gapReportText = await readFile(gapReportPath, "utf8");
-    assert.match(gapReportText, /# MCP Gap Report/);
-    assert.match(gapReportText, /Important for Codex: the MCP gap details/);
-    assert.match(gapReportText, /\[UNTRUSTED_MCP_GAP_DATA_START\]/);
-    assert.match(gapReportText, /\[UNTRUSTED_MCP_GAP_DATA_END\]/);
+    assert.match(gapReportText, /# Media Issue Agent Improvement Backlog/);
+    assert.match(gapReportText, /Important for Codex: improvement details/);
+    assert.match(gapReportText, /\[UNTRUSTED_IMPROVEMENT_DATA_START\]/);
+    assert.match(gapReportText, /\[UNTRUSTED_IMPROVEMENT_DATA_END\]/);
     assert.match(gapReportText, /Replace a fixture episode/);
     assert.match(gapReportText, /Detection status: DETECTED/);
     assert.match(gapReportText, /Inspect unavailable fixture archive/);
     assert.match(gapReportText, /Detection status: NOT DETECTED/);
+    assert.match(gapReportText, /Add fixture verification to investigation guidance/);
+    assert.match(gapReportText, /Implementation status: IMPLEMENTED/);
+    assert.match(gapReportText, /Recommended change:/);
     assert.match(gapReportText, /Decision factors:/);
     assert.match(gapReportText, /Missing requirements:/);
     assert.match(gapReportText, /Raw detection JSON:/);
@@ -399,13 +456,13 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator(".mcp-gap-detected")).toHaveCount(0);
     await expect(page.locator(".mcp-gap-not-detected")).toHaveCount(0);
     await expect(page.locator("#mcp-gaps-list")).toContainText("Replace a fixture episode");
-    await expect(page.locator("[data-remove-mcp-gap]")).toHaveCount(2);
+    await expect(page.locator("[data-remove-mcp-gap]")).toHaveCount(3);
     while (await page.locator("[data-remove-mcp-gap]").count()) {
       const beforeRemove = await page.locator("[data-remove-mcp-gap]").count();
       await page.locator("[data-remove-mcp-gap]").first().click();
       await expect(page.locator("[data-remove-mcp-gap]")).toHaveCount(beforeRemove - 1);
     }
-    await expect(page.locator("#mcp-gaps-list")).toContainText("No active missing MCP items");
+    await expect(page.locator("#mcp-gaps-list")).toContainText("No active improvements");
     await page.locator("#mcp-gaps-close-button").click();
     await expect(page.locator("#mcp-gaps-dialog")).toBeHidden();
 
@@ -426,6 +483,12 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 7)).toHaveClass(/issue-closed/);
     await expect(row(page, 7).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(row(page, 7).getByRole("button", { name: "Close" })).toHaveCount(0);
+    await expect(row(page, 5).getByRole("button", { name: "Learn" })).toBeVisible();
+    await row(page, 5).getByRole("button", { name: "Learn" }).click();
+    await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
+    await expect(page.locator('[data-improvement-filter="investigation_prompt"]')).toHaveClass(/active/);
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Verify fixture state before repair");
+    await page.locator("#mcp-gaps-close-button").click();
 
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
@@ -756,6 +819,10 @@ async function testFullBrowserWorkflow(browser) {
     assert.equal(commentCalls[1].args.message, "Closed.");
     const resolveCall = fakeMcp.calls.find(call => call.name === "seerr_resolve_issue");
     assert.equal(resolveCall.args.dryRun, false);
+    await page.locator("#mcp-gaps-button").click();
+    await expect(page.locator("#mcp-gaps-list")).toContainText("Verify fixture state before repair");
+    await expect(page.locator(".prompt-improvement")).toBeVisible();
+    await page.locator("#mcp-gaps-close-button").click();
 
     await row(page, 1).getByRole("button", { name: "View summary" }).click();
     await expect(page.locator("#reopen-button")).toBeVisible();
@@ -765,7 +832,7 @@ async function testFullBrowserWorkflow(browser) {
 
     await row(page, 1).getByRole("button", { name: "Re-investigate" }).click();
     await expect(page.locator("#investigation-output")).toContainText("Investigation summary");
-    assert.equal(await codexInvocationCount(harness.codexLogPath), 5);
+    assert.equal(await codexInvocationCount(harness.codexLogPath), 6);
   } finally {
     await context?.close();
     await harness?.close();
