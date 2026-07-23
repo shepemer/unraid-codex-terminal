@@ -2451,6 +2451,462 @@ async function sonarrBlocklistEpisodeFileSource(input) {
   };
 }
 
+function sonarrQueueEpisodeIds(record) {
+  return uniquePositiveIds([
+    record?.episodeId,
+    record?.episode?.id,
+    ...(Array.isArray(record?.episodes) ? record.episodes.map(episode => episode?.id) : [])
+  ].filter(Boolean)).filter(id => Number.isInteger(id) && id > 0);
+}
+
+function sonarrQueueMatchesScope(record, scope) {
+  const recordSeriesId = Number(record?.seriesId ?? record?.series?.id);
+  if (scope.seriesId && recordSeriesId !== Number(scope.seriesId)) {
+    return false;
+  }
+  const wantedEpisodeIds = uniquePositiveIds(scope.episodeIds || []).filter(id => Number.isInteger(id) && id > 0);
+  if (!wantedEpisodeIds.length) {
+    return true;
+  }
+  const recordEpisodeIds = sonarrQueueEpisodeIds(record);
+  return recordEpisodeIds.some(id => wantedEpisodeIds.includes(id));
+}
+
+async function suppressNewSonarrQueueItems(beforeIds, scope, settleMs) {
+  const deadline = Date.now() + settleMs;
+  const matched = new Map();
+  const cleanupRuns = [];
+  const attemptedIds = new Set();
+  async function cleanMatches(records) {
+    const newMatches = records.filter(record => {
+      const recordId = Number(record.id);
+      return Number.isInteger(recordId)
+        && !beforeIds.has(recordId)
+        && !attemptedIds.has(recordId)
+        && sonarrQueueMatchesScope(record, scope);
+    });
+    if (!newMatches.length) {
+      return;
+    }
+    for (const record of newMatches) {
+      const recordId = Number(record.id);
+      matched.set(recordId, record);
+      attemptedIds.add(recordId);
+    }
+    cleanupRuns.push(await removeArrQueueItems("sonarr", newMatches.map(record => Number(record.id)), {
+      removeFromClient: true,
+      blocklist: true,
+      skipRedownload: true,
+      dryRun: false
+    }));
+  }
+  do {
+    const records = await arrQueueDetails("sonarr");
+    await cleanMatches(records);
+    if (Date.now() >= deadline) {
+      break;
+    }
+    await delay(Math.min(250, Math.max(1, deadline - Date.now())));
+  } while (Date.now() <= deadline);
+  await cleanMatches(await arrQueueDetails("sonarr"));
+  const records = await arrQueueDetails("sonarr");
+  const remaining = records.filter(record => matched.has(Number(record.id)));
+  return {
+    records,
+    matches: [...matched.values()],
+    cleanupRuns,
+    remaining
+  };
+}
+
+async function sonarrBlocklistHistoryWithoutRetry(input) {
+  const queueBefore = await arrQueueDetails("sonarr");
+  const beforeIds = new Set(queueBefore.map(record => Number(record.id)).filter(Number.isInteger));
+  const blocklist = await sonarrBlocklistEpisodeFileSource(input);
+  const base = {
+    ...blocklist,
+    suppressReplacement: true,
+    queueBefore: queueBefore.map(summarizeQueueRecord),
+    settleMs: input.settleMs
+  };
+  if (input.dryRun || !blocklist.blocklisted) {
+    return {
+      ...base,
+      replacementSuppressed: false,
+      replacementCleanup: input.dryRun ? {
+        dryRun: true,
+        removeFromClient: true,
+        blocklist: true,
+        skipRedownload: true,
+        note: "After marking the exact history source failed, newly spawned replacement queue items in this episode scope will be removed with skipRedownload."
+      } : undefined
+    };
+  }
+
+  const scope = {
+    seriesId: blocklist.blocklistEntry?.seriesId,
+    episodeIds: blocklist.episodeIds
+  };
+  const observed = await suppressNewSonarrQueueItems(beforeIds, scope, input.settleMs);
+  const replacementIds = observed.matches.map(record => record.id);
+  const deleteResults = observed.cleanupRuns.flatMap(run => run.deleteResults || []);
+  const failedCleanup = deleteResults.filter(result => !result.ok);
+  const replacementCleanup = {
+    dryRun: false,
+    requestedIds: replacementIds,
+    cleanupRuns: observed.cleanupRuns,
+    deleteResults,
+    remainingAfter: observed.remaining.map(summarizeQueueRecord),
+    note: replacementIds.length
+      ? `Observed and handled replacement queue items throughout the ${input.settleMs}ms window.`
+      : `No replacement queue item appeared during the ${input.settleMs}ms observation window.`
+  };
+  return {
+    ...base,
+    queueObservedAfterBlocklist: observed.records.map(summarizeQueueRecord),
+    replacementQueueItems: observed.matches.map(summarizeQueueRecord),
+    replacementCleanup,
+    replacementSuppressed: failedCleanup.length === 0 && observed.remaining.length === 0,
+    verification: {
+      status: failedCleanup.length === 0 && observed.remaining.length === 0 ? "passed" : "failed",
+      observedReplacementCount: replacementIds.length,
+      remainingReplacementCount: observed.remaining.length
+    }
+  };
+}
+
+const SONARR_SUPPRESSED_RELEASES_FORMAT_NAME = "Media Issue Agent - Suppressed Releases";
+
+function escapeRegexLiteral(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function exactReleaseTitlePattern(title) {
+  return `(?i)^${escapeRegexLiteral(String(title).trim())}$`;
+}
+
+function releaseSuppressionSpecification(title) {
+  return {
+    name: `Suppress exact release: ${String(title).trim().slice(0, 120)}`,
+    implementation: "ReleaseTitleSpecification",
+    implementationName: "Release Title",
+    negate: false,
+    required: false,
+    fields: [{ name: "value", value: exactReleaseTitlePattern(title) }]
+  };
+}
+
+function customFormatReleasePatterns(format) {
+  return new Set((format?.specifications || [])
+    .flatMap(specification => specification?.fields || [])
+    .filter(field => field?.name === "value" && typeof field.value === "string")
+    .map(field => field.value));
+}
+
+async function currentSonarrReleaseCandidates(input) {
+  const queries = input.episodeIds?.length
+    ? input.episodeIds.map(episodeId => ({ episodeId }))
+    : [{ seriesId: input.seriesId, seasonNumber: input.seasonNumber }];
+  const batches = await Promise.all(queries.map(query => arrApi("sonarr", "v3", "release", { query })));
+  const records = batches.flatMap(body => Array.isArray(body) ? body : []);
+  const unique = new Map();
+  for (const record of records) {
+    unique.set(`${record.indexerId}:${record.guid}`, record);
+  }
+  return [...unique.values()];
+}
+
+function exactCandidateMatch(records, requested) {
+  return records.find(record =>
+    String(record?.guid || "") === String(requested.guid || "")
+    && Number(record?.indexerId) === Number(requested.indexerId)
+    && String(record?.title || "") === String(requested.title || "")
+  );
+}
+
+function normalizedReleaseLanguages(value) {
+  return (Array.isArray(value) ? value : [])
+    .map(language => JSON.stringify(compactObject({
+      id: language?.id,
+      name: language?.name ?? language?.englishName ?? language
+    })))
+    .sort();
+}
+
+function releaseCandidateEpisodeIds(record) {
+  return uniquePositiveIds([
+    record?.episodeId,
+    ...(Array.isArray(record?.episodeIds) ? record.episodeIds : []),
+    ...(Array.isArray(record?.episodes) ? record.episodes.map(episode => episode?.id) : [])
+  ].filter(Boolean))
+    .filter(id => Number.isInteger(id) && id > 0)
+    .sort((left, right) => left - right);
+}
+
+function releaseCandidateContextMismatches(record, requested) {
+  const mismatches = [];
+  if (requested.quality !== undefined && JSON.stringify(record?.quality) !== JSON.stringify(requested.quality)) {
+    mismatches.push("quality");
+  }
+  if (requested.languages !== undefined
+    && JSON.stringify(normalizedReleaseLanguages(record?.languages)) !== JSON.stringify(normalizedReleaseLanguages(requested.languages))) {
+    mismatches.push("languages");
+  }
+  if (requested.episodeIds !== undefined) {
+    const expected = uniquePositiveIds(requested.episodeIds)
+      .filter(id => Number.isInteger(id) && id > 0)
+      .sort((left, right) => left - right);
+    if (JSON.stringify(releaseCandidateEpisodeIds(record)) !== JSON.stringify(expected)) {
+      mismatches.push("episodeIds");
+    }
+  }
+  return mismatches;
+}
+
+function releaseSuppressionScore(profile, candidates, requestedScore) {
+  const currentCandidateScore = Math.max(
+    0,
+    ...candidates.map(candidate => Number(candidate?.customFormatScore || 0)).filter(Number.isFinite)
+  );
+  const minimumAcceptedScore = Number.isInteger(profile?.minFormatScore) ? profile.minFormatScore : 0;
+  return Math.max(-1000000, Math.min(requestedScore, minimumAcceptedScore - currentCandidateScore - 1000));
+}
+
+async function sonarrBlocklistReleaseCandidates(input) {
+  const currentCandidates = await currentSonarrReleaseCandidates(input);
+  const matched = [];
+  const blockers = [];
+  for (const requested of input.candidates) {
+    const candidate = exactCandidateMatch(currentCandidates, requested);
+    if (!candidate) {
+      blockers.push({
+        type: "candidate_not_in_current_search",
+        guid: requested.guid,
+        indexerId: requested.indexerId,
+        title: requested.title,
+        message: "The exact candidate was not returned by a fresh Sonarr interactive search for the requested scope."
+      });
+    } else {
+      const contextMismatches = releaseCandidateContextMismatches(candidate, requested);
+      if (contextMismatches.length) {
+        blockers.push({
+          type: "candidate_context_mismatch",
+          guid: requested.guid,
+          indexerId: requested.indexerId,
+          title: requested.title,
+          fields: contextMismatches,
+          message: "The fresh Sonarr result did not match all supplied candidate context fields."
+        });
+      } else {
+        matched.push(candidate);
+      }
+    }
+  }
+
+  const series = await arrApi("sonarr", "v3", `series/${input.seriesId}`);
+  const assignedQualityProfileId = Number(series?.qualityProfileId);
+  const qualityProfileId = input.qualityProfileId || assignedQualityProfileId;
+  if (input.qualityProfileId && input.qualityProfileId !== assignedQualityProfileId) {
+    blockers.push({
+      type: "quality_profile_scope_mismatch",
+      qualityProfileId: input.qualityProfileId,
+      assignedQualityProfileId,
+      message: "The requested quality profile is not assigned to the target Sonarr series."
+    });
+  }
+  if (input.episodeIds?.length) {
+    const scopedEpisodes = await sonarrEpisodesForSeries(input.seriesId, input.seasonNumber);
+    const scopedEpisodeIds = new Set(scopedEpisodes.map(episode => Number(episode.id)));
+    const outsideScope = input.episodeIds.filter(episodeId => !scopedEpisodeIds.has(episodeId));
+    if (outsideScope.length) {
+      blockers.push({
+        type: "episode_scope_mismatch",
+        episodeIds: outsideScope,
+        message: "One or more requested episode IDs do not belong to the target Sonarr series and season scope."
+      });
+    }
+  }
+  if (!qualityProfileId) {
+    blockers.push({
+      type: "missing_quality_profile",
+      message: "The target Sonarr series did not expose a qualityProfileId."
+    });
+  }
+  const [formats, profiles] = await Promise.all([
+    servarrRecords("sonarr", "customformat"),
+    servarrRecords("sonarr", "qualityprofile")
+  ]);
+  const currentFormat = formats.find(format => exactNameMatches(format.name, SONARR_SUPPRESSED_RELEASES_FORMAT_NAME)) || null;
+  const currentProfile = profiles.find(profile => profile.id === qualityProfileId) || null;
+  if (qualityProfileId && !currentProfile) {
+    blockers.push({
+      type: "quality_profile_not_found",
+      qualityProfileId,
+      message: "The Sonarr quality profile assigned to the target series was not found."
+    });
+  }
+
+  const proposedFormat = currentFormat
+    ? cloneJson(currentFormat)
+    : {
+      name: SONARR_SUPPRESSED_RELEASES_FORMAT_NAME,
+      includeCustomFormatWhenRenaming: false,
+      specifications: []
+    };
+  const existingPatterns = customFormatReleasePatterns(proposedFormat);
+  for (const candidate of matched) {
+    const pattern = exactReleaseTitlePattern(candidate.title);
+    if (!existingPatterns.has(pattern)) {
+      proposedFormat.specifications.push(releaseSuppressionSpecification(candidate.title));
+      existingPatterns.add(pattern);
+    }
+  }
+  const formatValidationErrors = validateCustomFormat(proposedFormat, currentFormat);
+  blockers.push(...formatValidationErrors.map(message => ({
+    type: "custom_format_validation_failed",
+    message
+  })));
+
+  const effectiveScore = currentProfile
+    ? releaseSuppressionScore(currentProfile, matched, input.score)
+    : input.score;
+  const highestCandidateScore = Math.max(
+    0,
+    ...matched.map(candidate => Number(candidate?.customFormatScore || 0)).filter(Number.isFinite)
+  );
+  if (currentProfile && effectiveScore + highestCandidateScore >= Number(currentProfile.minFormatScore || 0)) {
+    blockers.push({
+      type: "suppression_score_out_of_range",
+      message: "A safe custom-format score within the supported range could not place every candidate below the profile minimum."
+    });
+  }
+  const base = {
+    dryRun: input.dryRun,
+    service: "sonarr",
+    strategy: "exact_release_title_custom_format",
+    nativeBlocklistInsertSupported: false,
+    seriesId: input.seriesId,
+    seasonNumber: input.seasonNumber,
+    episodeIds: input.episodeIds || [],
+    qualityProfileId,
+    requestedScore: input.score,
+    effectiveScore,
+    requestedCandidates: input.candidates.map(summarizeArrReleaseCandidate),
+    matchedCandidates: matched.map(summarizeArrReleaseCandidate),
+    formatName: SONARR_SUPPRESSED_RELEASES_FORMAT_NAME,
+    customFormatPlan: {
+      action: currentFormat ? "update" : "create",
+      diff: compactDiff(currentFormat || {}, proposedFormat),
+      titleTests: customFormatTitleTests(proposedFormat, matched.map(candidate => candidate.title))
+    },
+    blockers
+  };
+  if (blockers.length) {
+    return { ...base, suppressed: false };
+  }
+  if (input.dryRun) {
+    return {
+      ...base,
+      suppressed: false,
+      qualityProfilePlan: {
+        qualityProfileId,
+        customFormatScore: effectiveScore,
+        minimumAcceptedScore: currentProfile.minFormatScore,
+        note: "The exact-title custom format will be attached to this profile below its minimum accepted score."
+      },
+      note: "Set dryRun to false to suppress these exact current Sonarr candidates without grabbing or downloading them."
+    };
+  }
+
+  let appliedFormat;
+  if (currentFormat && !compactDiff(currentFormat, proposedFormat).length) {
+    appliedFormat = currentFormat;
+  } else {
+    appliedFormat = await arrApi("sonarr", "v3", currentFormat ? `customformat/${currentFormat.id}` : "customformat", {
+      method: currentFormat ? "PUT" : "POST",
+      body: proposedFormat
+    });
+  }
+  const formatId = Number(appliedFormat?.id ?? currentFormat?.id);
+  if (!formatId) {
+    throw new Error("Sonarr did not return an id for the candidate-suppression custom format");
+  }
+
+  const proposedProfile = cloneJson(currentProfile);
+  if (!Array.isArray(proposedProfile.formatItems)) {
+    proposedProfile.formatItems = [];
+  }
+  const profileItem = proposedProfile.formatItems.find(item => formatItemId(item) === formatId);
+  if (profileItem) {
+    profileItem.score = effectiveScore;
+    profileItem.name = profileItem.name || SONARR_SUPPRESSED_RELEASES_FORMAT_NAME;
+  } else {
+    proposedProfile.formatItems.push({
+      format: formatId,
+      name: SONARR_SUPPRESSED_RELEASES_FORMAT_NAME,
+      score: effectiveScore
+    });
+  }
+  const profileValidationErrors = validateQualityProfile(proposedProfile, currentProfile);
+  if (profileValidationErrors.length) {
+    throw new Error(`candidate-suppression quality profile update failed validation: ${profileValidationErrors.join("; ")}`);
+  }
+  const profileDiff = compactDiff(currentProfile, proposedProfile);
+  if (profileDiff.length) {
+    await arrApi("sonarr", "v3", `qualityprofile/${qualityProfileId}`, {
+      method: "PUT",
+      body: proposedProfile
+    });
+  }
+
+  const [verifiedFormats, verifiedProfiles] = await Promise.all([
+    servarrRecords("sonarr", "customformat"),
+    servarrRecords("sonarr", "qualityprofile")
+  ]);
+  const verifiedFormat = verifiedFormats.find(format => format.id === formatId);
+  const verifiedProfile = verifiedProfiles.find(profile => profile.id === qualityProfileId);
+  const verifiedPatterns = customFormatReleasePatterns(verifiedFormat);
+  const titlesVerified = matched.every(candidate => verifiedPatterns.has(exactReleaseTitlePattern(candidate.title)));
+  const verifiedProfileItem = verifiedProfile?.formatItems?.find(item => formatItemId(item) === formatId);
+  const profileVerified = Number(verifiedProfileItem?.score) === effectiveScore;
+  const postUpdateCandidates = await currentSonarrReleaseCandidates(input);
+  const candidateVerification = input.candidates.map(requested => {
+    const candidate = exactCandidateMatch(postUpdateCandidates, requested);
+    const rejections = candidate ? releaseRejectionTexts(candidate) : [];
+    return {
+      guid: requested.guid,
+      indexerId: requested.indexerId,
+      title: requested.title,
+      found: Boolean(candidate),
+      rejected: candidate?.downloadAllowed === false || candidate?.rejected === true,
+      customFormatScore: candidate?.customFormatScore,
+      rejections
+    };
+  });
+  const candidatesRejected = candidateVerification.every(candidate => candidate.found && candidate.rejected);
+  const suppressed = titlesVerified && profileVerified && candidatesRejected;
+  return {
+    ...base,
+    dryRun: false,
+    suppressed,
+    customFormat: redactSensitiveObject(verifiedFormat),
+    qualityProfile: compactObject({
+      id: verifiedProfile?.id,
+      name: verifiedProfile?.name,
+      minFormatScore: verifiedProfile?.minFormatScore,
+      suppressionScore: verifiedProfileItem?.score
+    }),
+    profileDiff,
+    verification: {
+      status: suppressed ? "passed" : "failed",
+      exactTitlesPresent: titlesVerified,
+      qualityProfileScoreApplied: profileVerified,
+      candidatesRejected,
+      candidates: candidateVerification
+    }
+  };
+}
+
 function plexMetadataRecords(body) {
   const container = body?.MediaContainer || {};
   return [
@@ -2933,6 +3389,11 @@ function normalizedIssueMatchesMediaType(issue, desired) {
 function summarizeQueueRecord(record) {
   const title = decodedField(record.title);
   const outputPath = decodedField(record.outputPath);
+  const episodeIds = uniquePositiveIds([
+    record.episodeId,
+    record.episode?.id,
+    ...(Array.isArray(record.episodes) ? record.episodes.map(episode => episode?.id) : [])
+  ].filter(Boolean)).filter(id => Number.isInteger(id) && id > 0);
   return compactObject({
     id: record.id,
     title: title.value,
@@ -2942,6 +3403,7 @@ function summarizeQueueRecord(record) {
     movieId: record.movieId ?? record.movie?.id,
     movieTitle: record.movie?.title,
     episodeId: record.episodeId,
+    episodeIds: episodeIds.length ? episodeIds : undefined,
     seasonNumber: record.seasonNumber,
     status: record.status,
     trackedDownloadStatus: record.trackedDownloadStatus,
@@ -4076,7 +4538,8 @@ async function removeArrQueueItems(serviceName, ids, options) {
   const missingBefore = uniqueIds.filter(id => !matchedBefore.some(record => record.id === id));
   const query = {
     removeFromClient: options.removeFromClient,
-    blocklist: options.blocklist
+    blocklist: options.blocklist,
+    skipRedownload: options.skipRedownload ?? false
   };
 
   if (options.dryRun) {
@@ -4086,6 +4549,7 @@ async function removeArrQueueItems(serviceName, ids, options) {
       requestedIds: uniqueIds,
       removeFromClient: options.removeFromClient,
       blocklist: options.blocklist,
+      skipRedownload: options.skipRedownload ?? false,
       matchedBefore: matchedBefore.map(summarizeQueueRecord),
       missingBefore
     };
@@ -4109,6 +4573,7 @@ async function removeArrQueueItems(serviceName, ids, options) {
     requestedIds: uniqueIds,
     removeFromClient: options.removeFromClient,
     blocklist: options.blocklist,
+    skipRedownload: options.skipRedownload ?? false,
     matchedBefore: matchedBefore.map(summarizeQueueRecord),
     missingBefore,
     deleteResults,
@@ -4447,6 +4912,63 @@ async function removeNzbgetHistory(ids, options) {
     result,
     matchedBefore: matchedBefore.map(summarizeNzbgetHistory),
     missingBefore,
+    remainingAfter: remainingAfter.map(summarizeNzbgetHistory)
+  };
+}
+
+async function removeNzbgetQueueItems(selectors, options) {
+  const uniqueIds = uniquePositiveIds(selectors.ids || []);
+  const uniqueDownloadIds = [...new Set((selectors.downloadIds || []).map(value => String(value).trim()).filter(Boolean))];
+  const queue = await nzbgetRpc("listgroups");
+  const records = Array.isArray(queue) ? queue : [];
+  const matchedBefore = records.filter(record =>
+    uniqueIds.includes(nzbgetRecordId(record))
+    || uniqueDownloadIds.includes(String(nzbgetRecordDownloadId(record) || ""))
+  );
+  const matchedIds = matchedBefore.map(nzbgetRecordId);
+  const missingBefore = uniqueIds.filter(id => !matchedIds.includes(id));
+  const matchedDownloadIds = [...new Set(matchedBefore.map(nzbgetRecordDownloadId).filter(Boolean).map(String))];
+  const missingDownloadIds = uniqueDownloadIds.filter(downloadId => !matchedDownloadIds.includes(downloadId));
+  const command = options.deleteFiles ? "GroupDelete" : "GroupParkDelete";
+
+  if (options.dryRun || !matchedIds.length) {
+    return {
+      dryRun: options.dryRun,
+      clientType: "nzbget",
+      command,
+      requestedIds: uniqueIds,
+      requestedDownloadIds: uniqueDownloadIds,
+      matchedIds,
+      matchedDownloadIds,
+      deleteFiles: options.deleteFiles,
+      matchedBefore: matchedBefore.map(summarizeNzbgetHistory),
+      missingBefore,
+      missingDownloadIds,
+      removed: false,
+      note: matchedIds.length
+        ? "Set dryRun to false to remove these exact active NZBGet queue groups."
+        : "No active NZBGet queue groups matched the requested NZBID values; no editqueue call was made."
+    };
+  }
+
+  const result = await nzbgetRpc("editqueue", [command, "", matchedIds]);
+  const afterQueue = await nzbgetRpc("listgroups");
+  const afterRecords = Array.isArray(afterQueue) ? afterQueue : [];
+  const remainingAfter = afterRecords.filter(record => matchedIds.includes(nzbgetRecordId(record)));
+  return {
+    dryRun: false,
+    clientType: "nzbget",
+    command,
+    requestedIds: uniqueIds,
+    requestedDownloadIds: uniqueDownloadIds,
+    matchedIds,
+    matchedDownloadIds,
+    deleteFiles: options.deleteFiles,
+    result,
+    matchedBefore: matchedBefore.map(summarizeNzbgetHistory),
+    missingBefore,
+    missingDownloadIds,
+    removed: remainingAfter.length === 0,
     remainingAfter: remainingAfter.map(summarizeNzbgetHistory)
   };
 }
@@ -8102,6 +8624,7 @@ function summarizeArrReleaseCandidate(record) {
     indexerFlags: record.indexerFlags,
     releaseWeight: record.releaseWeight,
     releaseType: record.releaseType,
+    episodeIds: releaseCandidateEpisodeIds(record),
     downloadAllowed: record.downloadAllowed,
     rejected: record.rejected,
     rejections,
@@ -10398,6 +10921,7 @@ function createServer() {
       ids: z.array(z.number().int().positive()).min(1),
       removeFromClient: z.boolean().default(true),
       blocklist: z.boolean().default(false),
+      skipRedownload: z.boolean().default(false),
       dryRun: z.boolean().default(true)
     }
   }, async (input) => {
@@ -10480,6 +11004,54 @@ function createServer() {
       dryRun: z.boolean().default(true)
     }
   }, async (input) => jsonText(await sonarrBlocklistEpisodeFileSource(input)));
+
+  server.registerTool("sonarr_blocklist_history_without_retry", {
+    title: "Sonarr Imported-Source Blocklist Without Retry",
+    description: "Mark one exact imported Sonarr history source failed, then detect and remove replacement queue items in the same episode scope with blocklist and skipRedownload enabled. Monitoring is not changed. Dry-run is enabled by default.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      episodeFileIds: z.array(z.number().int().positive()).max(20).optional(),
+      episodeIds: z.array(z.number().int().positive()).max(100).optional(),
+      seriesId: z.number().int().positive().optional(),
+      sourceTitle: z.string().min(1).optional(),
+      indexer: z.string().min(1).optional(),
+      protocol: z.string().min(1).optional(),
+      quality: z.any().optional(),
+      languages: z.array(z.any()).optional(),
+      message: z.string().min(1).optional(),
+      historyLimit: z.number().int().min(1).max(50).default(10),
+      settleMs: z.number().int().min(0).max(15000).default(5000),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => jsonText(await sonarrBlocklistHistoryWithoutRetry(input)));
+
+  server.registerTool("sonarr_blocklist_release_candidates", {
+    title: "Sonarr Exact Release Candidate Suppression",
+    description: "Suppress one or more exact current Sonarr interactive-search candidates without grabbing or downloading them. Because Sonarr has no public native blocklist-insert endpoint, this maintains a dedicated exact-title custom format scored below the target series quality profile minimum. Fresh search matching, dry-run planning, and post-update verification are included.",
+    annotations: { destructiveHint: true, idempotentHint: true },
+    inputSchema: {
+      seriesId: z.number().int().positive(),
+      seasonNumber: z.number().int().min(0).optional(),
+      episodeIds: z.array(z.number().int().positive()).min(1).max(100).optional(),
+      qualityProfileId: z.number().int().positive().optional(),
+      candidates: z.array(z.object({
+        guid: z.string().min(1).max(2000),
+        indexerId: z.number().int().positive(),
+        title: z.string().min(1).max(500),
+        indexer: z.string().min(1).max(250).optional(),
+        quality: z.any().optional(),
+        languages: z.array(z.any()).optional(),
+        episodeIds: z.array(z.number().int().positive()).optional()
+      })).min(1).max(50),
+      score: z.number().int().min(-1000000).max(-1).default(-10000),
+      dryRun: z.boolean().default(true)
+    }
+  }, async (input) => {
+    if (input.seasonNumber === undefined && !input.episodeIds?.length) {
+      throw new Error("seasonNumber or episodeIds is required to verify candidates against a fresh scoped search");
+    }
+    return jsonText(await sonarrBlocklistReleaseCandidates(input));
+  });
 
   server.registerTool("sonarr_import_queue_item", {
     title: "Sonarr Import Queue Item",
@@ -10879,6 +11451,7 @@ function createServer() {
       ids: z.array(z.number().int().positive()).min(1),
       removeFromClient: z.boolean().default(true),
       blocklist: z.boolean().default(false),
+      skipRedownload: z.boolean().default(false),
       dryRun: z.boolean().default(true)
     }
   }, async (input) => {
@@ -11382,6 +11955,23 @@ function createServer() {
     }
   }, async ({ ids, deleteFiles, dryRun }) => {
     return jsonText(await removeNzbgetHistory(ids, { deleteFiles, dryRun }));
+  });
+
+  server.registerTool("nzbget_remove_queue_items", {
+    title: "NZBGet Remove Active Queue Items",
+    description: "Remove exact active NZBGet queue groups by NZBID or downloadId. Set deleteFiles false to park the item in history while preserving downloaded files, or true to clean downloaded files. Dry-run is enabled by default, unmatched selectors are not sent to editqueue, and the active queue is rechecked after execution.",
+    annotations: { destructiveHint: true, idempotentHint: false },
+    inputSchema: {
+      ids: z.array(z.number().int().positive()).min(1).max(100).optional(),
+      downloadIds: z.array(z.string().min(1).max(500)).min(1).max(100).optional(),
+      deleteFiles: z.boolean().default(false),
+      dryRun: z.boolean().default(true)
+    }
+  }, async ({ ids, downloadIds, deleteFiles, dryRun }) => {
+    if (!ids?.length && !downloadIds?.length) {
+      throw new Error("ids or downloadIds is required");
+    }
+    return jsonText(await removeNzbgetQueueItems({ ids, downloadIds }, { deleteFiles, dryRun }));
   });
 
   server.registerTool("download_client_remove_history", {
