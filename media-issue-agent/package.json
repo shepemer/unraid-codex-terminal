@@ -9,7 +9,7 @@
   },
   "scripts": {
     "check": "node --check src/*.js test/*.js",
-    "test": "node test/run-tests.js && node test/comprehensive-tests.js && node test/review-regressions.js",
+    "test": "node test/run-tests.js && node test/comprehensive-tests.js && node test/review-regressions.js && node test/feedback-loop-tests.js",
     "test:coverage": "c8 --all --include='src/*.js' --reporter=text-summary --reporter=lcov --check-coverage --statements=88 --branches=65 --functions=85 --lines=88 npm test",
     "test:comprehensive": "node test/comprehensive-tests.js",
     "test:web": "node test/web-e2e.js",

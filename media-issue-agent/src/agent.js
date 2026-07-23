@@ -40,12 +40,25 @@ import {
   transitionJob,
   transitionJobAndCreateApproval,
   transitionJobAndResolveApproval,
+  upsertImprovementItems,
   upsertMissingMcpItems,
+  listImprovementItems,
   listMissingMcpItems,
+  dismissImprovementItem,
   dismissMissingMcpItem,
   upsertInvestigation
 } from "./db.js";
-import { commentDraftPrompt, investigationPrompt, repairExecutionPrompt, runCodex, runCodexMcpCapabilityCheck, runCodexRepair, steeredInvestigationPrompt } from "./codex.js";
+import {
+  commentDraftPrompt,
+  investigationPrompt,
+  repairExecutionPrompt,
+  runCodex,
+  runCodexMcpCapabilityCheck,
+  runCodexPromptImprovementCheck,
+  runCodexRepair,
+  runCodexWorkflowImprovementAnalysis,
+  steeredInvestigationPrompt
+} from "./codex.js";
 import { inspectCodexAuth, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
@@ -79,7 +92,7 @@ function isInterruptedPollError(error) {
 
 function textSuggestsClientSide(...values) {
   const text = values.join(" ").toLowerCase();
-  return /\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
+  return /\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/.test(text)
     || /\bno automated (?:server )?(?:fix|action|repair)\b/.test(text)
     || /\b(?:determination|conclusion|classification)\s+(?:is|:)\s+(?:client-side|client side)\b/.test(text)
     || /\b(?:client-side|client side|user-side|user side)\b.{0,120}\b(?:only|no server|without server|not a server)\b/.test(text);
@@ -87,8 +100,8 @@ function textSuggestsClientSide(...values) {
 
 function textSuggestsServerSide(...values) {
   const text = values.join(" ").toLowerCase()
-    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/g, "")
-    .replace(/\bno server(?:-side| side)? (?:action|fix|change|work|repair)\b/g, "")
+    .replace(/\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)(?: is)? (?:required|needed|available)\b/g, "")
+    .replace(/\bno server(?:-side| side)? (?:media(?:-side| side)? )?(?:action|fix|change|work|repair)\b/g, "")
     .replace(/\bno automated (?:server )?(?:fix|action|repair)\b/g, "");
   const squashed = text.replace(/[^a-z0-9]+/g, "");
   return /\b(?:server-side|server side|server)\b.{0,140}\b(?:action|fix|repair|required|needed|provision|download|refresh|analy[sz]e)\b/.test(text)
@@ -196,6 +209,98 @@ function latestSteeringMessage(evidence = {}) {
   return history.at(-1)?.message || "";
 }
 
+function reporterIdentityValues(value) {
+  if (typeof value === "string") {
+    return [value.trim()].filter(Boolean);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+  return [
+    value.username,
+    value.userName
+  ].filter(entry => typeof entry === "string" && entry.trim()).map(entry => entry.trim());
+}
+
+function reporterMatches(value, configuredUsername) {
+  const expected = String(configuredUsername || "").trim().toLowerCase();
+  return Boolean(expected) && reporterIdentityValues(value).some(identity => identity.toLowerCase() === expected);
+}
+
+function commentAuthorMatches(comment, configuredUsername) {
+  return [
+    comment?.reporter,
+    comment?.user,
+    comment?.author,
+    comment?.createdBy,
+    comment?.username,
+    comment?.userName
+  ].some(value => reporterMatches(value, configuredUsername));
+}
+
+function trustedServerOwnerGuidance(entry, details, configuredUsername) {
+  if (!String(configuredUsername || "").trim()) {
+    return "";
+  }
+  const issue = details?.issue || details || {};
+  const raw = entry?.raw || {};
+  const sourceReporterIdentities = [
+    raw.reporter,
+    raw.user,
+    issue.reporter,
+    issue.user,
+    issue.createdBy
+  ].filter(value => value !== undefined && value !== null && value !== "");
+  if (!sourceReporterIdentities.length) {
+    sourceReporterIdentities.push(entry?.reporter);
+  }
+  const reportAuthoredByOwner = sourceReporterIdentities
+    .some(value => reporterMatches(value, configuredUsername));
+  const guidance = [];
+  if (reportAuthoredByOwner) {
+    guidance.push(
+      entry?.description,
+      raw.description,
+      raw.message,
+      raw.subject,
+      issue.description,
+      issue.message,
+      issue.subject
+    );
+  }
+  const comments = [
+    ...(Array.isArray(raw.comments) ? raw.comments : []),
+    ...(Array.isArray(issue.comments) ? issue.comments : [])
+  ];
+  for (const comment of comments) {
+    if (commentAuthorMatches(comment, configuredUsername)) {
+      guidance.push(comment.message || comment.text || comment.body);
+    }
+  }
+  return [...new Set(guidance
+    .filter(value => typeof value === "string")
+    .map(value => redactText(value).trim())
+    .filter(Boolean))]
+    .join("\n\n");
+}
+
+function trustedReporterGuidanceFromEvidence(evidence = {}) {
+  return String(evidence?.trustedReporterGuidance?.message || "").trim();
+}
+
+function combinedRepairGuidance(evidence = {}) {
+  const sections = [];
+  const ownerGuidance = trustedReporterGuidanceFromEvidence(evidence);
+  if (ownerGuidance) {
+    sections.push("Server-owner report guidance:\n" + ownerGuidance);
+  }
+  const steering = latestSteeringMessage(evidence);
+  if (steering) {
+    sections.push("Latest operator steering:\n" + steering);
+  }
+  return sections.join("\n\n");
+}
+
 function truncateForPrompt(value, maxLength = 4000) {
   const text = String(value || "");
   if (text.length <= maxLength) {
@@ -245,7 +350,7 @@ function compactForRepairPrompt(value, key = "", depth = 0) {
   return output;
 }
 
-function buildRepairPromptPreview(summary, operatorMessage = "") {
+function buildRepairPromptPreview(summary, trustedGuidance = "") {
   const lines = [
     "Autonomous approved media repair execution.",
     "Use the configured MCP server named media to inspect, repair, and verify the issue directly.",
@@ -256,8 +361,8 @@ function buildRepairPromptPreview(summary, operatorMessage = "") {
     "Investigation summary:",
     truncateForPrompt(summary, 7000)
   ];
-  if (String(operatorMessage || "").trim()) {
-    lines.push("", "Latest trusted steering note:", truncateForPrompt(operatorMessage, 1200));
+  if (String(trustedGuidance || "").trim()) {
+    lines.push("", "Trusted guidance:", truncateForPrompt(trustedGuidance, 2000));
   }
   return lines.join("\n");
 }
@@ -392,16 +497,21 @@ function normalizeDraftComment(source, draft, executionResult = null) {
 
 function buildPlan(entry, evidence, summary, operatorMessage = "") {
   const effectiveEntry = evidence?.entry || entry || {};
-  const clientSideText = textSuggestsClientSide(summary, operatorMessage);
-  const serverSide = textSuggestsServerSide(summary, operatorMessage) || !clientSideText;
+  const trustedGuidance = [
+    trustedReporterGuidanceFromEvidence(evidence),
+    String(operatorMessage || "").trim()
+  ].filter(Boolean).join("\n\n");
+  const clientSideText = textSuggestsClientSide(summary, trustedGuidance);
+  const serverSide = textSuggestsServerSide(summary, trustedGuidance) || !clientSideText;
   const clientSide = !serverSide && clientSideText;
-  const repairPrompt = serverSide ? buildRepairPromptPreview(summary, operatorMessage) : undefined;
+  const repairPrompt = serverSide ? buildRepairPromptPreview(summary, trustedGuidance) : undefined;
   const plan = {
     classification: serverSide ? "server_action" : "client_side",
     executionMode: serverSide ? "approved_repair_agent" : "none",
     actions: [],
     requiresServerAction: serverSide,
     repairPrompt,
+    trustedGuidance: trustedGuidance || undefined,
     note: serverSide
       ? "Approval will run the autonomous Codex repair runner using the current investigation, compacted evidence, and live media-mcp tool briefing."
       : "Determination is client-side or no server-side action is required."
@@ -1130,6 +1240,130 @@ function parseMcpCapabilityCheckResult(output, items, tools) {
   };
 }
 
+const PROMPT_IMPROVEMENT_TARGETS = new Set([
+  "investigation_prompt",
+  "suggested_repair_steps",
+  "classification_guidance",
+  "evidence_collection"
+]);
+
+function parseWorkflowImprovementResult(output) {
+  const parsed = parseJsonObjectFromModel(output, "workflow improvement analysis");
+  const improvements = (Array.isArray(parsed.improvements) ? parsed.improvements : []).map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return null;
+    }
+    const target = String(item.target || "investigation_prompt").trim().toLowerCase();
+    const normalizedTarget = PROMPT_IMPROVEMENT_TARGETS.has(target) ? target : "investigation_prompt";
+    const title = String(item.title || "").trim();
+    const recommendedChange = String(item.recommendedChange || item.description || "").trim();
+    if (!title || !recommendedChange) {
+      return null;
+    }
+    const dedupeKey = String(item.dedupeKey || title)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 120) || "workflow_improvement_" + (index + 1);
+    return sanitizeValue({
+      itemType: "investigation_prompt",
+      dedupeKey,
+      title,
+      target: normalizedTarget,
+      category: normalizedTarget,
+      description: String(item.description || recommendedChange).trim(),
+      recommendedChange,
+      rationale: String(item.rationale || "").trim(),
+      issuePattern: String(item.issuePattern || "").trim(),
+      implementationSignals: Array.isArray(item.implementationSignals)
+        ? item.implementationSignals.map(value => String(value).trim()).filter(Boolean).slice(0, 20)
+        : [],
+      steeringEvidence: Array.isArray(item.steeringEvidence)
+        ? item.steeringEvidence.slice(0, 20)
+        : []
+    });
+  }).filter(Boolean);
+  return {
+    summary: String(parsed.summary || "").trim(),
+    improvements
+  };
+}
+
+function parsePromptImprovementCheckResult(output, items) {
+  const parsed = parseJsonObjectFromModel(output, "prompt improvement implementation check");
+  const byItemId = new Map();
+  for (const raw of Array.isArray(parsed.results) ? parsed.results : []) {
+    const itemId = Number(raw?.itemId);
+    if (!Number.isInteger(itemId)) {
+      continue;
+    }
+    const rationale = raw?.rationaleDetails && typeof raw.rationaleDetails === "object"
+      ? raw.rationaleDetails
+      : {};
+    byItemId.set(itemId, {
+      itemId,
+      implemented: raw?.implemented === true,
+      matchType: String(raw?.matchType || (raw?.implemented ? "implemented" : "not_implemented")).trim(),
+      confidence: String(raw?.confidence || "medium").trim(),
+      matchedSurfaces: Array.isArray(raw?.matchedSurfaces)
+        ? raw.matchedSurfaces.map(value => String(value).trim()).filter(Boolean)
+        : [],
+      reason: String(raw?.reason || "").trim(),
+      rationaleDetails: sanitizeValue({
+        requestedBehavior: String(rationale.requestedBehavior || "").trim(),
+        implementedBehavior: String(rationale.implementedBehavior || "").trim(),
+        remainingGap: String(rationale.remainingGap || "").trim(),
+        evidence: Array.isArray(rationale.evidence)
+          ? rationale.evidence.map(value => String(value).trim()).filter(Boolean)
+          : []
+      })
+    });
+  }
+  const results = items.map(item => byItemId.get(Number(item.id)) || {
+    itemId: item.id,
+    implemented: false,
+    matchType: "not_implemented",
+    confidence: "low",
+    matchedSurfaces: [],
+    reason: "The implementation-check agent did not return a result for this item.",
+    rationaleDetails: {
+      requestedBehavior: item.source?.recommendedChange || item.description || "",
+      implementedBehavior: "",
+      remainingGap: "No conclusive implementation result was returned.",
+      evidence: []
+    }
+  });
+  return {
+    summary: String(parsed.summary || "").trim(),
+    results
+  };
+}
+
+function publicImprovementItem(item) {
+  const source = item?.source || {};
+  const {
+    sourceJson,
+    fingerprint,
+    source: _source,
+    ...publicItem
+  } = item || {};
+  return {
+    ...publicItem,
+    details: item?.itemType === "investigation_prompt" ? {
+      target: source.target || item.category || "investigation_prompt",
+      recommendedChange: source.recommendedChange || item.description || "",
+      rationale: source.rationale || "",
+      issuePattern: source.issuePattern || "",
+      implementationSignals: Array.isArray(source.implementationSignals) ? source.implementationSignals : [],
+      steeringEvidence: Array.isArray(source.steeringEvidence) ? source.steeringEvidence : []
+    } : {
+      reason: source.reason || "",
+      context: source.context || null
+    }
+  };
+}
+
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
 function normalizeCodexSettings(values = {}, defaults = {}) {
@@ -1372,6 +1606,64 @@ function commentSummary(comments) {
     const message = String(comment.message || "").trim() || "(empty comment)";
     return `- ${date}: ${message}`;
   }).join("\n");
+}
+
+function workflowImprovementContext(details) {
+  const investigation = details?.investigation || {};
+  const evidence = investigation.evidence || {};
+  const steeringHistory = steeringHistoryFromEvidence(evidence);
+  const actionApprovals = (details?.approvals || [])
+    .filter(approval => approval.kind === "action")
+    .toSorted((left, right) => Number(left.id) - Number(right.id));
+  const resolutionApproval = (details?.approvals || [])
+    .find(approval => approval.kind === "resolution" && approval.status === "approved")
+    || (details?.approvals || []).find(approval => approval.kind === "resolution");
+  return {
+    trustedSteeringHistory: steeringHistory.map(entry => ({
+      sequence: entry.sequence,
+      createdAt: entry.createdAt,
+      actor: entry.actor,
+      message: entry.message
+    })),
+    trustedReporterGuidance: trustedReporterGuidanceFromEvidence(evidence),
+    initialInvestigation: steeringHistory[0]?.previousSummary || investigation.summary || "",
+    finalInvestigation: investigation.summary || "",
+    investigationRevisions: steeringHistory.map((entry, index) => ({
+      sequence: entry.sequence,
+      previousSummary: entry.previousSummary || "",
+      resultingSummary: index === steeringHistory.length - 1
+        ? investigation.summary || ""
+        : steeringHistory[index + 1]?.previousSummary || ""
+    })),
+    actionPlans: actionApprovals.map(approval => ({
+      status: approval.status,
+      createdAt: approval.createdAt,
+      approvedAt: approval.approvedAt,
+      summary: approval.payload?.summary || "",
+      classification: approval.payload?.plan?.classification || "",
+      actionSummary: approval.payload?.plan?.actionSummary || null,
+      repairPrompt: approval.payload?.plan?.repairPrompt || ""
+    })),
+    repairResults: (details?.agentRuns || []).map(run => ({
+      status: run.status,
+      finalResult: run.finalResult || null,
+      error: run.error || "",
+      startedAt: run.startedAt,
+      completedAt: run.completedAt
+    })),
+    workflowTimeline: (details?.auditEvents || [])
+      .map(event => ({
+        eventType: event.eventType,
+        createdAt: event.createdAt
+      }))
+      .toSorted((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || ""))),
+    resolution: resolutionApproval ? {
+      status: resolutionApproval.status,
+      message: resolutionApproval.payload?.message || "",
+      closeIssue: resolutionApproval.payload?.closeIssue !== false,
+      executionResult: resolutionApproval.payload?.executionResult || null
+    } : null
+  };
 }
 
 export class MediaIssueAgent {
@@ -1668,6 +1960,18 @@ export class MediaIssueAgent {
     return listMissingMcpItems(this.config.dbPath);
   }
 
+  improvementItems(options = {}) {
+    return listImprovementItems(this.config.dbPath, options);
+  }
+
+  publicImprovementItems(options = {}) {
+    return this.improvementItems(options).map(publicImprovementItem);
+  }
+
+  promptImprovementItems() {
+    return listImprovementItems(this.config.dbPath, { itemType: "investigation_prompt" });
+  }
+
   async checkMissingMcpCapabilities(actor = "operator") {
     await this.init();
     const items = this.missingMcpItems();
@@ -1756,6 +2060,128 @@ export class MediaIssueAgent {
     };
   }
 
+  async checkPromptImprovements(actor = "operator") {
+    await this.init();
+    const items = this.promptImprovementItems();
+    const startedAt = Date.now();
+    this.diagnostic("info", "prompt_improvement_check_started", {
+      actor,
+      itemCount: items.length,
+      mode: "codex_agent"
+    });
+    if (!items.length) {
+      return {
+        checkedAt: new Date().toISOString(),
+        items: [],
+        results: [],
+        implementedItemIds: [],
+        summary: "No active investigation prompt improvements to check.",
+        mode: "no_items"
+      };
+    }
+    const settings = this.codexSettings().effective;
+    try {
+      const output = await runCodexPromptImprovementCheck(this.config, items, settings, {
+        onEvent: event => {
+          this.recordCodexTokenUsage(event, {
+            source: "prompt_improvement_check",
+            settings
+          });
+          this.diagnostic("debug", "prompt_improvement_check_agent_event", { event });
+        }
+      });
+      const parsed = parsePromptImprovementCheckResult(output.finalMessage, items);
+      const results = parsed.results.map(result => ({
+        ...result,
+        itemType: "investigation_prompt",
+        decisionPolicy: "agent_prompt_surface_review"
+      }));
+      const implemented = results.filter(result => result.implemented);
+      this.diagnostic("info", "prompt_improvement_check_completed", {
+        actor,
+        itemCount: items.length,
+        implementedCount: implemented.length,
+        durationMs: Date.now() - startedAt,
+        model: output.settings?.model,
+        reasoningEffort: output.settings?.reasoningEffort,
+        fastMode: output.settings?.fastMode,
+        summary: parsed.summary
+      });
+      return {
+        checkedAt: new Date().toISOString(),
+        items,
+        results,
+        implementedItemIds: implemented.map(result => result.itemId),
+        summary: parsed.summary,
+        mode: "codex_agent"
+      };
+    } catch (error) {
+      this.diagnostic("error", "prompt_improvement_check_failed", {
+        actor,
+        itemCount: items.length,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  async checkImprovements(actor = "operator") {
+    await this.init();
+    const [mcp, prompts] = await Promise.all([
+      this.checkMissingMcpCapabilities(actor),
+      this.checkPromptImprovements(actor)
+    ]);
+    const mcpResults = (mcp.results || []).map(result => ({
+      ...result,
+      itemType: "mcp_capability",
+      implemented: result.detected === true,
+      decisionPolicy: mcp.decisionPolicy || "deterministic_metadata_policy"
+    }));
+    const promptResults = prompts.results || [];
+    const results = [...mcpResults, ...promptResults];
+    return {
+      checkedAt: new Date().toISOString(),
+      items: this.publicImprovementItems(),
+      results,
+      implementedItemIds: results.filter(result => result.implemented).map(result => result.itemId),
+      summary: [mcp.summary, prompts.summary].filter(Boolean).join(" "),
+      checks: {
+        mcp: {
+          itemCount: mcp.items?.length || 0,
+          toolCount: mcp.toolCount || 0,
+          summary: mcp.summary || ""
+        },
+        prompts: {
+          itemCount: prompts.items?.length || 0,
+          summary: prompts.summary || ""
+        }
+      }
+    };
+  }
+
+  removeImprovementItem(itemId, actor = "operator") {
+    const item = dismissImprovementItem(this.config.dbPath, itemId);
+    if (!item) {
+      throw new Error("Improvement item " + itemId + " was not found");
+    }
+    this.diagnostic("info", "improvement_item_removed", {
+      actor,
+      itemId: item.id,
+      itemType: item.itemType,
+      jobId: item.jobId,
+      title: item.title
+    });
+    if (item.jobId) {
+      recordAudit(this.config.dbPath, "improvement_item_removed", sanitizeValue({
+        actor,
+        itemId: item.id,
+        itemType: item.itemType,
+        title: item.title
+      }), item.jobId);
+    }
+    return item;
+  }
+
   removeMissingMcpItem(itemId, actor = "operator") {
     const item = dismissMissingMcpItem(this.config.dbPath, itemId);
     if (!item) {
@@ -1776,6 +2202,128 @@ export class MediaIssueAgent {
       }), item.jobId);
     }
     return item;
+  }
+
+  async generateJobImprovements(jobId, actor = "operator", options = {}) {
+    await this.init();
+    const details = this.jobDetails(jobId);
+    if (!details.investigation) {
+      return {
+        jobId,
+        status: "skipped",
+        summary: "No local investigation history is available for this issue.",
+        improvements: []
+      };
+    }
+    const context = workflowImprovementContext(details);
+    if (!context.trustedSteeringHistory.length && !context.trustedReporterGuidance) {
+      return {
+        jobId,
+        status: "skipped",
+        summary: "No operator steering or trusted server-owner guidance was recorded for this investigation.",
+        improvements: []
+      };
+    }
+    await validateCodexHome(this.config.codexHome);
+    const settings = this.codexSettings().effective;
+    const startedAt = Date.now();
+    this.diagnostic("info", "workflow_improvement_analysis_started", {
+      jobId,
+      actor,
+      trigger: options.trigger || "manual",
+      steeringCount: context.trustedSteeringHistory.length,
+      hasTrustedReporterGuidance: Boolean(context.trustedReporterGuidance)
+    });
+    try {
+      const output = await runCodexWorkflowImprovementAnalysis(this.config, context, settings, {
+        onEvent: event => {
+          this.recordCodexTokenUsage(event, {
+            jobId,
+            source: "workflow_improvement_analysis",
+            settings
+          });
+          this.diagnostic("debug", "workflow_improvement_analysis_agent_event", {
+            jobId,
+            event
+          });
+        }
+      });
+      const parsed = parseWorkflowImprovementResult(output.finalMessage);
+      const saved = upsertImprovementItems(
+        this.config.dbPath,
+        jobId,
+        null,
+        parsed.improvements,
+        "investigation_prompt"
+      );
+      this.diagnostic("info", "workflow_improvement_analysis_completed", {
+        jobId,
+        actor,
+        trigger: options.trigger || "manual",
+        suggestedCount: parsed.improvements.length,
+        savedCount: saved.length,
+        durationMs: Date.now() - startedAt,
+        summary: parsed.summary
+      });
+      recordAudit(this.config.dbPath, "workflow_improvements_generated", sanitizeValue({
+        actor,
+        trigger: options.trigger || "manual",
+        summary: parsed.summary,
+        improvementItemIds: saved.map(item => item.id),
+        suggestedCount: parsed.improvements.length
+      }), jobId);
+      return {
+        jobId,
+        status: "completed",
+        summary: parsed.summary,
+        improvements: saved
+      };
+    } catch (error) {
+      this.diagnostic("error", "workflow_improvement_analysis_failed", {
+        jobId,
+        actor,
+        trigger: options.trigger || "manual",
+        error: error.message
+      });
+      recordAudit(this.config.dbPath, "workflow_improvement_analysis_failed", sanitizeValue({
+        actor,
+        trigger: options.trigger || "manual",
+        error: error.message
+      }), jobId);
+      throw error;
+    }
+  }
+
+  async generateIssueImprovements(snapshotId, index, actor = "operator") {
+    await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) {
+      throw new Error("Snapshot " + snapshotId + " index " + index + " was not found");
+    }
+    const job = ensureJob(this.config.dbPath, entry.source, entry.issueId);
+    if (!entryIsClosed(entry) && job.state !== "closed") {
+      throw new Error("Workflow improvements can be generated after the issue is resolved");
+    }
+    return this.generateJobImprovements(job.id, actor, { trigger: "retroactive" });
+  }
+
+  async captureResolvedWorkflowImprovements(jobId, actor, trigger) {
+    try {
+      return await this.generateJobImprovements(jobId, actor, { trigger });
+    } catch (error) {
+      this.diagnostic("warn", "resolved_workflow_improvement_capture_failed", {
+        jobId,
+        actor,
+        trigger,
+        error: error.message
+      });
+      return {
+        jobId,
+        status: "failed",
+        summary: redactText(error.message),
+        improvements: []
+      };
+    }
   }
 
   jobDetails(jobId) {
@@ -1801,7 +2349,11 @@ export class MediaIssueAgent {
         ...investigation,
         evidence: {
           steering: publicSteeringEntry(details.investigation.evidence?.steering),
-          steeringHistory: (details.investigation.evidence?.steeringHistory || []).map(publicSteeringEntry)
+          steeringHistory: (details.investigation.evidence?.steeringHistory || []).map(publicSteeringEntry),
+          trustedReporterGuidance: details.investigation.evidence?.trustedReporterGuidance ? {
+            source: "configured_server_owner_reporter",
+            message: details.investigation.evidence.trustedReporterGuidance.message || ""
+          } : null
         }
       } : null,
       approvals: (details.approvals || []).map(({ payloadJson, tokenHash, ...approval }) => {
@@ -1820,7 +2372,8 @@ export class MediaIssueAgent {
       agentRunEvents: (details.agentRunEvents || []).map(({ payloadJson, ...event }) => event),
       auditEvents: (details.auditEvents || []).map(({ redactedPayload, redactedPayloadJson, ...event }) => event),
       plannedActions: (details.plannedActions || []).map(({ args, argsJson, dryRunResultJson, resultJson, ...action }) => action),
-      missingMcpItems: (details.missingMcpItems || []).map(({ source, sourceJson, ...item }) => item)
+      missingMcpItems: (details.missingMcpItems || []).map(({ source, sourceJson, ...item }) => item),
+      improvementItems: (details.improvementItems || []).map(publicImprovementItem)
     };
   }
 
@@ -1999,10 +2552,12 @@ export class MediaIssueAgent {
       const results = await this.runIssueActions(job.id, directCloseActionsFor(entry.source, entry.issueId, message), "direct_close", actor);
       transitionJob(this.config.dbPath, job.id, ["closing_issue"], "closed");
       recordAudit(this.config.dbPath, "direct_close_completed", sanitizeValue({ actor, results }), job.id);
+      const improvementAnalysis = await this.captureResolvedWorkflowImprovements(job.id, actor, "direct_close");
       return {
         jobId: job.id,
         status: "closed",
-        results
+        results,
+        improvementAnalysis
       };
     } catch (error) {
       const messageText = redactText(error.message);
@@ -2144,11 +2699,37 @@ export class MediaIssueAgent {
         error: message
       };
     }
-    const evidence = sanitizeValue({ entry, details, diagnosis });
+    const ownerGuidance = trustedServerOwnerGuidance(
+      entry,
+      details,
+      this.config.serverOwnerReporterUsername
+    );
+    const evidence = sanitizeValue({
+      entry,
+      details,
+      diagnosis,
+      trustedReporterGuidance: ownerGuidance ? {
+        source: "configured_server_owner_reporter",
+        message: ownerGuidance
+      } : null
+    });
+    if (ownerGuidance) {
+      this.diagnostic("info", "trusted_server_owner_guidance_applied", {
+        jobId: job.id,
+        source: entry.source,
+        issueId: entry.issueId,
+        guidanceLength: ownerGuidance.length
+      });
+      recordAudit(this.config.dbPath, "trusted_server_owner_guidance_applied", sanitizeValue({
+        guidanceLength: ownerGuidance.length
+      }), job.id);
+    }
     let summary;
     try {
       this.diagnostic("info", "codex_investigation_started", { jobId: job.id });
-      summary = await runCodex(this.config, investigationPrompt(evidence), {
+      summary = await runCodex(this.config, investigationPrompt(evidence, {
+        trustedReporterGuidance: ownerGuidance
+      }), {
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId: job.id,
           source: "investigation"
@@ -2251,7 +2832,9 @@ export class MediaIssueAgent {
     let summary;
     try {
       this.diagnostic("info", "codex_steered_investigation_started", { jobId });
-      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage), {
+      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage, {
+        trustedReporterGuidance: trustedReporterGuidanceFromEvidence(evidence)
+      }), {
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId,
           source: "steered_investigation"
@@ -2608,7 +3191,7 @@ export class MediaIssueAgent {
       issueId: payload.issueId || details.job.issueId,
       classification: plan.classification || "server_action",
       summary: payload.summary || details.investigation?.summary || "",
-      operatorMessage: latestSteeringMessage(payload.evidence),
+      operatorMessage: combinedRepairGuidance(payload.evidence),
       instructions: [
         "Use media-mcp directly through the configured Codex MCP server named media.",
         "Investigate, repair, and verify the approved issue as far as the available media tools allow.",
@@ -3081,11 +3664,15 @@ export class MediaIssueAgent {
         recordAudit(this.config.dbPath, "resolution_comment_posted_without_closure", sanitizeValue({ actor, results }), jobId);
       }
       recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: approval.id, kind: "resolution", actor }), jobId);
+      const improvementAnalysis = closeIssue
+        ? await this.captureResolvedWorkflowImprovements(jobId, actor, "approved_resolution")
+        : null;
       return {
         jobId,
         status: closeIssue ? "closed" : "blocked_needs_human",
         approvals,
-        results
+        results,
+        improvementAnalysis
       };
     } catch (error) {
       const messageText = redactText(error.message);

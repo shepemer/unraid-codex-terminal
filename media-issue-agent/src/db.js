@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS missing_mcp_items (
   job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
   agent_run_id INTEGER REFERENCES agent_runs(id) ON DELETE SET NULL,
   fingerprint TEXT NOT NULL UNIQUE,
+  item_type TEXT NOT NULL DEFAULT 'mcp_capability',
   title TEXT NOT NULL,
   description TEXT NOT NULL,
   suggested_tool_name TEXT,
@@ -243,10 +244,18 @@ ON missing_mcp_items(job_id, dismissed_at, updated_at DESC);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
   ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
   ensureColumn(dbPath, "agent_runs", "owner_started_at", "TEXT");
+  ensureColumn(dbPath, "missing_mcp_items", "item_type", "TEXT NOT NULL DEFAULT 'mcp_capability'");
   sqliteExec(dbPath, `
 UPDATE agent_runs
 SET heartbeat_at = COALESCE(heartbeat_at, started_at)
 WHERE heartbeat_at IS NULL;
+
+UPDATE missing_mcp_items
+SET item_type = 'mcp_capability'
+WHERE item_type IS NULL OR item_type = '';
+
+CREATE INDEX IF NOT EXISTS idx_missing_mcp_items_type
+ON missing_mcp_items(item_type, dismissed_at, updated_at DESC);
 
 UPDATE jobs SET state = 'executing' WHERE state = 'waiting_for_plex_verification';
 UPDATE jobs SET state = 'awaiting_resolution_approval' WHERE state = 'awaiting_comment_approval';
@@ -900,42 +909,66 @@ INSERT INTO token_usage_events (
   return row;
 }
 
-function normalizeMissingMcpDbItem(item) {
+export const IMPROVEMENT_ITEM_TYPES = new Set(["mcp_capability", "investigation_prompt"]);
+
+function normalizeImprovementItemType(value, fallback = "mcp_capability") {
+  const itemType = String(value || fallback).trim().toLowerCase();
+  if (!IMPROVEMENT_ITEM_TYPES.has(itemType)) {
+    throw new Error(`Unsupported improvement item type ${itemType}`);
+  }
+  return itemType;
+}
+
+function normalizeImprovementDbItem(item, fallbackType = "mcp_capability") {
+  const itemType = normalizeImprovementItemType(item?.itemType || item?.type, fallbackType);
   const title = String(item?.title || item?.capability || item?.suggestedToolName || "").trim();
-  const description = String(item?.description || item?.reason || title || "").trim();
+  const description = String(item?.description || item?.recommendedChange || item?.reason || title || "").trim();
   if (!title && !description) {
     return null;
   }
   const normalized = {
+    itemType,
     title: title || description.slice(0, 120),
     description: description || title,
     suggestedToolName: String(item?.suggestedToolName || item?.toolName || "").trim(),
     category: String(item?.category || item?.type || "").trim(),
     source: item || {}
   };
-  normalized.fingerprint = stableHash({
-    title: normalized.title.toLowerCase(),
-    description: normalized.description.toLowerCase(),
-    suggestedToolName: normalized.suggestedToolName.toLowerCase(),
-    category: normalized.category.toLowerCase()
-  });
+  if (itemType === "mcp_capability") {
+    normalized.fingerprint = stableHash({
+      title: normalized.title.toLowerCase(),
+      description: normalized.description.toLowerCase(),
+      suggestedToolName: normalized.suggestedToolName.toLowerCase(),
+      category: normalized.category.toLowerCase()
+    });
+  } else {
+    const dedupeKey = String(item?.dedupeKey || "").trim().toLowerCase();
+    normalized.fingerprint = stableHash({
+      itemType,
+      dedupeKey: dedupeKey || null,
+      target: String(item?.target || normalized.category || "investigation_prompt").trim().toLowerCase(),
+      title: dedupeKey ? null : normalized.title.toLowerCase(),
+      recommendedChange: dedupeKey ? null : String(item?.recommendedChange || normalized.description).trim().toLowerCase()
+    });
+  }
   return normalized;
 }
 
-export function upsertMissingMcpItems(dbPath, jobId, agentRunId, items = []) {
+export function upsertImprovementItems(dbPath, jobId, agentRunId, items = [], fallbackType = "mcp_capability") {
   const saved = [];
   for (const rawItem of items || []) {
-    const item = normalizeMissingMcpDbItem(rawItem);
+    const item = normalizeImprovementDbItem(rawItem, fallbackType);
     if (!item) {
       continue;
     }
     const [row] = sqliteExec(dbPath, sql`
 INSERT INTO missing_mcp_items (
-  job_id, agent_run_id, fingerprint, title, description, suggested_tool_name, category, source_json
+  job_id, agent_run_id, fingerprint, item_type, title, description, suggested_tool_name, category, source_json
 ) VALUES (
   ${jobId || null},
   ${agentRunId || null},
   ${item.fingerprint},
+  ${item.itemType},
   ${item.title},
   ${item.description},
   ${item.suggestedToolName || null},
@@ -945,6 +978,7 @@ INSERT INTO missing_mcp_items (
 ON CONFLICT(fingerprint) DO UPDATE SET
   job_id = excluded.job_id,
   agent_run_id = excluded.agent_run_id,
+  item_type = excluded.item_type,
   title = excluded.title,
   description = excluded.description,
   suggested_tool_name = excluded.suggested_tool_name,
@@ -957,6 +991,7 @@ RETURNING
   job_id AS jobId,
   agent_run_id AS agentRunId,
   fingerprint,
+  item_type AS itemType,
   title,
   description,
   suggested_tool_name AS suggestedToolName,
@@ -973,21 +1008,28 @@ RETURNING
   return saved;
 }
 
-function mapMissingMcpItem(row) {
+export function upsertMissingMcpItems(dbPath, jobId, agentRunId, items = []) {
+  return upsertImprovementItems(dbPath, jobId, agentRunId, items, "mcp_capability");
+}
+
+function mapImprovementItem(row) {
   return {
     ...row,
+    itemType: row.itemType || "mcp_capability",
     source: parseJson(row.sourceJson, {})
   };
 }
 
-export function listMissingMcpItems(dbPath, options = {}) {
+export function listImprovementItems(dbPath, options = {}) {
   const includeDismissed = Boolean(options.includeDismissed);
-  const rows = sqliteExec(dbPath, `
+  const itemType = options.itemType ? normalizeImprovementItemType(options.itemType) : null;
+  const rows = sqliteExec(dbPath, sql`
 SELECT
   missing_mcp_items.id,
   missing_mcp_items.job_id AS jobId,
   missing_mcp_items.agent_run_id AS agentRunId,
   missing_mcp_items.fingerprint,
+  missing_mcp_items.item_type AS itemType,
   missing_mcp_items.title,
   missing_mcp_items.description,
   missing_mcp_items.suggested_tool_name AS suggestedToolName,
@@ -1001,19 +1043,26 @@ SELECT
   jobs.state AS jobState
 FROM missing_mcp_items
 LEFT JOIN jobs ON jobs.id = missing_mcp_items.job_id
-WHERE ${includeDismissed ? "1 = 1" : "missing_mcp_items.dismissed_at IS NULL"}
+WHERE (${includeDismissed ? 1 : 0} = 1 OR missing_mcp_items.dismissed_at IS NULL)
+  AND (${itemType} IS NULL OR missing_mcp_items.item_type = ${itemType})
 ORDER BY missing_mcp_items.updated_at DESC, missing_mcp_items.id DESC;
 `, { json: true });
-  return rows.map(mapMissingMcpItem);
+  return rows.map(mapImprovementItem);
 }
 
-export function missingMcpItemsForJob(dbPath, jobId) {
+export function listMissingMcpItems(dbPath, options = {}) {
+  return listImprovementItems(dbPath, { ...options, itemType: "mcp_capability" });
+}
+
+export function improvementItemsForJob(dbPath, jobId, options = {}) {
+  const itemType = options.itemType ? normalizeImprovementItemType(options.itemType) : null;
   const rows = sqliteExec(dbPath, sql`
 SELECT
   id,
   job_id AS jobId,
   agent_run_id AS agentRunId,
   fingerprint,
+  item_type AS itemType,
   title,
   description,
   suggested_tool_name AS suggestedToolName,
@@ -1025,12 +1074,17 @@ SELECT
 FROM missing_mcp_items
 WHERE job_id = ${jobId}
   AND dismissed_at IS NULL
+  AND (${itemType} IS NULL OR item_type = ${itemType})
 ORDER BY updated_at DESC, id DESC;
 `, { json: true });
-  return rows.map(mapMissingMcpItem);
+  return rows.map(mapImprovementItem);
 }
 
-export function dismissMissingMcpItem(dbPath, itemId) {
+export function missingMcpItemsForJob(dbPath, jobId) {
+  return improvementItemsForJob(dbPath, jobId, { itemType: "mcp_capability" });
+}
+
+export function dismissImprovementItem(dbPath, itemId) {
   const [row] = sqliteExec(dbPath, sql`
 UPDATE missing_mcp_items
 SET dismissed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -1041,6 +1095,7 @@ RETURNING
   job_id AS jobId,
   agent_run_id AS agentRunId,
   fingerprint,
+  item_type AS itemType,
   title,
   description,
   suggested_tool_name AS suggestedToolName,
@@ -1050,7 +1105,19 @@ RETURNING
   updated_at AS updatedAt,
   dismissed_at AS dismissedAt;
 `, { json: true });
-  return row ? mapMissingMcpItem(row) : null;
+  return row ? mapImprovementItem(row) : null;
+}
+
+export function dismissMissingMcpItem(dbPath, itemId) {
+  const existing = sqliteExec(
+    dbPath,
+    "SELECT item_type AS itemType FROM missing_mcp_items WHERE id = " + Number(itemId) + " LIMIT 1;",
+    { json: true }
+  )[0] || null;
+  if (existing && existing.itemType !== "mcp_capability") {
+    throw new Error("Improvement item " + itemId + " is not an MCP capability gap");
+  }
+  return dismissImprovementItem(dbPath, itemId);
 }
 
 export function setPendingApprovals(dbPath, jobId, status, actor = "operator", kind = null) {
@@ -1201,8 +1268,9 @@ WHERE job_id = ${jobId}
 ORDER BY id DESC
 LIMIT 50;
 `, { json: true }).map(row => ({ ...row, payload: parseJson(row.payloadJson, {}) }));
-  const missingMcpItems = missingMcpItemsForJob(dbPath, jobId);
-  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents, agentRuns, agentRunEvents, missingMcpItems };
+  const improvementItems = improvementItemsForJob(dbPath, jobId);
+  const missingMcpItems = improvementItems.filter(item => item.itemType === "mcp_capability");
+  return { job, investigation, approvals, plannedActions, verificationChecks, auditEvents, agentRuns, agentRunEvents, missingMcpItems, improvementItems };
 }
 
 export function createPlannedAction(dbPath, jobId, toolName, args, riskLevel = "comment") {
