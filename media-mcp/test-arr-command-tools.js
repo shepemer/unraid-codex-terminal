@@ -123,6 +123,8 @@ async function run() {
       statusMessages: [{ title: "Found archive file, might need to be extracted", messages: ["Found archive file, might need to be extracted"] }]
     }
   ];
+  const sonarrBlocklistRecords = [];
+  let historyFailedCallCount = 0;
   const radarrQueue = [
     {
       id: 2001,
@@ -336,6 +338,30 @@ async function run() {
       DestDir: "/downloads/usenet/completed/Series/Deleted.Release"
     }
   ];
+  const nzbgetQueue = [
+    {
+      NZBID: 71001,
+      ID: 71001,
+      Name: "Queued.Show.S01E01.1080p-GRP",
+      NZBName: "Queued.Show.S01E01.1080p-GRP",
+      Status: "DOWNLOADING",
+      Category: "sonarr",
+      FileSizeMB: 900,
+      DownloadedSizeMB: 100,
+      Parameters: [{ Name: "drone", Value: "sonarr-queue-download" }]
+    },
+    {
+      NZBID: 71002,
+      ID: 71002,
+      Name: "Queued.Movie.2026.1080p-GRP",
+      NZBName: "Queued.Movie.2026.1080p-GRP",
+      Status: "PAUSED",
+      Category: "radarr",
+      FileSizeMB: 1200,
+      DownloadedSizeMB: 0,
+      Parameters: [{ Name: "drone", Value: "radarr-queue-download" }]
+    }
+  ];
   const nzbgetFiles = {
     70001: [
       {
@@ -521,10 +547,18 @@ async function run() {
           result = (nzbgetLog[request.params?.[0]] || []).slice(0, request.params?.[2] || 100);
           break;
         case "editqueue":
+          if (["GroupDelete", "GroupParkDelete"].includes(request.params?.[0])) {
+            const ids = request.params?.[2] || [];
+            for (let index = nzbgetQueue.length - 1; index >= 0; index -= 1) {
+              if (ids.includes(nzbgetQueue[index].NZBID)) {
+                nzbgetQueue.splice(index, 1);
+              }
+            }
+          }
           result = true;
           break;
         case "listgroups":
-          result = [];
+          result = nzbgetQueue;
           break;
         case "status":
           result = { DownloadPaused: false };
@@ -627,8 +661,27 @@ async function run() {
     if (req.method === "DELETE" && path.startsWith("command/")) {
       return sendJson(res, 200, { deleted: true, id: Number(path.split("/")[1]) });
     }
+    if (service === "sonarr" && req.method === "GET" && path === "series/10") {
+      return sendJson(res, 200, {
+        id: 10,
+        title: "Show",
+        qualityProfileId: 1,
+        monitored: true
+      });
+    }
+    if (service === "sonarr" && req.method === "GET" && path === "episode" && query.seriesId === "10") {
+      return sendJson(res, 200, [
+        { id: 101, seriesId: 10, seasonNumber: 1, episodeNumber: 1, monitored: true },
+        { id: 102, seriesId: 10, seasonNumber: 1, episodeNumber: 2, monitored: true }
+      ].filter(episode => query.seasonNumber === undefined || episode.seasonNumber === Number(query.seasonNumber)));
+    }
     if (req.method === "GET" && path === "release") {
       if (service === "sonarr" && query.seriesId && query.seasonNumber) {
+        const suppressionFormat = customFormats.sonarr.find(format => format.name === "Media Issue Agent - Suppressed Releases");
+        const suppressionProfileItem = qualityProfiles.sonarr[0].formatItems?.find(item => item.format === suppressionFormat?.id);
+        const seasonCandidateSuppressed = Boolean(suppressionFormat?.specifications?.some(specification =>
+          specification.fields?.some(field => field.value === "(?i)^Show\\.S01\\.1080p-GRP$")
+        ) && suppressionProfileItem?.score < qualityProfiles.sonarr[0].minFormatScore);
         return sendJson(res, 200, [
           {
             guid: "sonarr-season-guid",
@@ -636,9 +689,11 @@ async function run() {
             indexer: "Mock Indexer",
             title: "Show.S01.1080p-GRP",
             releaseType: "seasonPack",
-            downloadAllowed: true,
+            downloadAllowed: !seasonCandidateSuppressed,
+            rejected: seasonCandidateSuppressed,
+            customFormatScore: seasonCandidateSuppressed ? suppressionProfileItem.score : 0,
             downloadUrl: "https://example.invalid/download?apikey=secret",
-            rejections: []
+            rejections: seasonCandidateSuppressed ? [{ reason: "Custom format score below minimum" }] : []
           },
           {
             guid: "sonarr-single-guid",
@@ -729,10 +784,43 @@ async function run() {
       });
     }
     if (req.method === "POST" && path === "history/failed/5001") {
+      historyFailedCallCount += 1;
+      if (historyFailedCallCount >= 2) {
+        sonarrQueue.push(
+          {
+            id: 1100 + historyFailedCallCount,
+            title: `Show.S01E01.Replacement.${historyFailedCallCount}-GRP`,
+            seriesId: 10,
+            series: { id: 10, title: "Show" },
+            episodeId: 101,
+            episodes: [{ id: 101 }],
+            downloadId: `replacement-${historyFailedCallCount}`,
+            status: "downloading"
+          },
+          {
+            id: 1200 + historyFailedCallCount,
+            title: `Show.S01E01.Alternate.${historyFailedCallCount}-GRP`,
+            seriesId: 10,
+            series: { id: 10, title: "Show" },
+            episodeId: 101,
+            episodes: [{ id: 101 }],
+            downloadId: `replacement-alternate-${historyFailedCallCount}`,
+            status: "downloading"
+          }
+        );
+      }
       return sendJson(res, 200, {
         id: 5001,
         markedFailed: true,
         blocklisted: true
+      });
+    }
+    if (service === "sonarr" && req.method === "GET" && path === "blocklist") {
+      return sendJson(res, 200, {
+        page: 1,
+        pageSize: Number(query.pageSize || 50),
+        totalRecords: sonarrBlocklistRecords.length,
+        records: sonarrBlocklistRecords
       });
     }
     if (req.method === "GET" && path === "qualityprofile") {
@@ -778,6 +866,27 @@ async function run() {
     }
     if (req.method === "GET" && path === "queue/details") {
       return sendJson(res, 200, queueForService(service));
+    }
+    if (req.method === "DELETE" && path.startsWith("queue/")) {
+      const id = Number(path.split("/")[1]);
+      const queue = queueForService(service);
+      const index = queue.findIndex(record => record.id === id);
+      const [removed] = index >= 0 ? queue.splice(index, 1) : [];
+      if (removed && service === "sonarr" && query.blocklist === "true") {
+        sonarrBlocklistRecords.unshift({
+          id: 9000 + id,
+          sourceTitle: removed.title,
+          seriesId: removed.seriesId ?? removed.series?.id,
+          quality: removed.quality,
+          protocol: removed.protocol || "usenet",
+          indexer: removed.indexer || "Mock Indexer",
+          message: "Removed by fixture",
+          date: "2026-07-02T00:00:00Z"
+        });
+      }
+      return removed
+        ? sendJson(res, 200, { removed: true, id })
+        : sendJson(res, 404, { error: "missing queue item" });
     }
     if (req.method === "GET" && path === "queue") {
       return sendJson(res, 200, { page: 1, pageSize: Number(query.pageSize || 50), totalRecords: queueForService(service).length, records: queueForService(service) });
@@ -931,6 +1040,8 @@ async function run() {
       "sonarr_grab_release",
       "sonarr_grab_prowlarr_release",
       "sonarr_blocklist_episode_file_source",
+      "sonarr_blocklist_history_without_retry",
+      "sonarr_blocklist_release_candidates",
       "sonarr_download_client_scan",
       "sonarr_command_cancel",
       "sonarr_quality_profiles",
@@ -966,6 +1077,7 @@ async function run() {
       "nzbget_history_detail",
       "nzbget_download_files",
       "nzbget_retry_postprocess",
+      "nzbget_remove_queue_items",
       "download_client_archive_diagnosis",
       "nzbget_extract_archives",
       "prowlarr_search",
@@ -1418,6 +1530,134 @@ async function run() {
     assert.equal(lastCall().path, "history/failed/5001");
     assert.equal(blocklisted.result.markedFailed, true);
 
+    const beforeCandidateSuppressionMutations = calls.length;
+    const dryCandidateSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      seasonNumber: 1,
+      candidates: [{
+        guid: "sonarr-season-guid",
+        indexerId: 11,
+        title: "Show.S01.1080p-GRP"
+      }],
+      dryRun: true
+    });
+    assert.equal(dryCandidateSuppression.suppressed, false);
+    assert.equal(dryCandidateSuppression.strategy, "exact_release_title_custom_format");
+    assert.equal(dryCandidateSuppression.nativeBlocklistInsertSupported, false);
+    assert.equal(dryCandidateSuppression.matchedCandidates.length, 1);
+    assert.equal(dryCandidateSuppression.customFormatPlan.titleTests.records[0].matches, true);
+    assert.equal(calls.slice(beforeCandidateSuppressionMutations).some(call =>
+      (call.method === "POST" && call.path === "customformat")
+      || (call.method === "PUT" && call.path.startsWith("qualityprofile/"))
+    ), false);
+
+    const postReleaseBeforeSuppression = postReleaseCallCount();
+    const candidateSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      seasonNumber: 1,
+      candidates: [{
+        guid: "sonarr-season-guid",
+        indexerId: 11,
+        title: "Show.S01.1080p-GRP"
+      }],
+      dryRun: false
+    });
+    assert.equal(candidateSuppression.suppressed, true);
+    assert.equal(candidateSuppression.verification.status, "passed");
+    assert.equal(candidateSuppression.verification.candidatesRejected, true);
+    assert.match(candidateSuppression.verification.candidates[0].rejections[0], /below minimum/);
+    assert.equal(candidateSuppression.qualityProfile.id, 1);
+    assert.equal(candidateSuppression.qualityProfile.suppressionScore, -10000);
+    assert.equal(postReleaseCallCount(), postReleaseBeforeSuppression);
+    const suppressionFormat = customFormats.sonarr.find(format => format.name === "Media Issue Agent - Suppressed Releases");
+    assert.ok(suppressionFormat);
+    assert.equal(suppressionFormat.specifications[0].fields[0].value, "(?i)^Show\\.S01\\.1080p-GRP$");
+    assert.equal(qualityProfiles.sonarr[0].formatItems.find(item => item.format === suppressionFormat.id).score, -10000);
+    const beforeRepeatedSuppression = calls.length;
+    const repeatedSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      seasonNumber: 1,
+      candidates: [{
+        guid: "sonarr-season-guid",
+        indexerId: 11,
+        title: "Show.S01.1080p-GRP"
+      }],
+      dryRun: false
+    });
+    assert.equal(repeatedSuppression.suppressed, true);
+    assert.equal(calls.slice(beforeRepeatedSuppression).some(call =>
+      (call.method === "POST" && call.path === "customformat")
+      || (call.method === "PUT" && (call.path.startsWith("customformat/") || call.path.startsWith("qualityprofile/")))
+    ), false);
+
+    const missingCandidateSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      seasonNumber: 1,
+      candidates: [{
+        guid: "missing-guid",
+        indexerId: 11,
+        title: "Missing.Release"
+      }],
+      dryRun: false
+    });
+    assert.equal(missingCandidateSuppression.suppressed, false);
+    assert.equal(missingCandidateSuppression.blockers[0].type, "candidate_not_in_current_search");
+
+    const crossSeriesSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      episodeIds: [999],
+      candidates: [{
+        guid: "sonarr-season-guid",
+        indexerId: 11,
+        title: "Show.S01.1080p-GRP"
+      }],
+      dryRun: false
+    });
+    assert.equal(crossSeriesSuppression.suppressed, false);
+    assert.ok(crossSeriesSuppression.blockers.some(blocker => blocker.type === "episode_scope_mismatch"));
+
+    const wrongProfileSuppression = await tool("sonarr_blocklist_release_candidates", {
+      seriesId: 10,
+      seasonNumber: 1,
+      qualityProfileId: 2,
+      candidates: [{
+        guid: "sonarr-season-guid",
+        indexerId: 11,
+        title: "Show.S01.1080p-GRP"
+      }],
+      dryRun: false
+    });
+    assert.equal(wrongProfileSuppression.suppressed, false);
+    assert.ok(wrongProfileSuppression.blockers.some(blocker => blocker.type === "quality_profile_scope_mismatch"));
+
+    const noRetryDryRun = await tool("sonarr_blocklist_history_without_retry", {
+      seriesId: 10,
+      episodeIds: [101],
+      sourceTitle: "Show.S01E01.1080p-GRP",
+      settleMs: 0,
+      dryRun: true
+    });
+    assert.equal(noRetryDryRun.blocklisted, false);
+    assert.equal(noRetryDryRun.replacementCleanup.skipRedownload, true);
+
+    const noRetryBlocklist = await tool("sonarr_blocklist_history_without_retry", {
+      seriesId: 10,
+      episodeIds: [101],
+      sourceTitle: "Show.S01E01.1080p-GRP",
+      settleMs: 0,
+      dryRun: false
+    });
+    assert.equal(noRetryBlocklist.blocklisted, true);
+    assert.equal(noRetryBlocklist.replacementQueueItems.length, 2);
+    assert.equal(noRetryBlocklist.replacementSuppressed, true);
+    assert.equal(noRetryBlocklist.verification.status, "passed");
+    const replacementDelete = calls.findLast(call => call.method === "DELETE" && call.path.startsWith("queue/"));
+    assert.deepEqual(replacementDelete.query, {
+      removeFromClient: "true",
+      blocklist: "true",
+      skipRedownload: "true"
+    });
+
     const beforeDryCancel = calls.length;
     const dryCancel = await tool("sonarr_command_cancel", { commandId: 777, dryRun: true });
     assert.equal(dryCancel.wouldCancelCommandId, 777);
@@ -1450,6 +1690,45 @@ async function run() {
     assert.equal(lastCall().service, "nzbget");
     assert.equal(lastCall().path, "editqueue");
     assert.deepEqual(lastCall().params, ["HistoryProcess", 0, [70001]]);
+
+    const queueRemovalDryRun = await tool("nzbget_remove_queue_items", {
+      ids: [71001, 79999],
+      deleteFiles: true,
+      dryRun: true
+    });
+    assert.deepEqual(queueRemovalDryRun.matchedIds, [71001]);
+    assert.deepEqual(queueRemovalDryRun.missingBefore, [79999]);
+    assert.equal(queueRemovalDryRun.command, "GroupDelete");
+    assert.equal(nzbgetQueue.some(record => record.NZBID === 71001), true);
+
+    const queueRemoval = await tool("nzbget_remove_queue_items", {
+      ids: [71001, 79999],
+      deleteFiles: true,
+      dryRun: false
+    });
+    assert.equal(queueRemoval.removed, true);
+    assert.deepEqual(queueRemoval.matchedIds, [71001]);
+    assert.deepEqual(queueRemoval.missingBefore, [79999]);
+    assert.equal(nzbgetQueue.some(record => record.NZBID === 71001), false);
+    assert.equal(lastCall().service, "nzbget");
+    assert.equal(lastCall().path, "listgroups");
+    const queueDeleteCall = calls.findLast(call =>
+      call.service === "nzbget"
+      && call.path === "editqueue"
+      && call.params?.[0] === "GroupDelete"
+    );
+    assert.deepEqual(queueDeleteCall.params, ["GroupDelete", "", [71001]]);
+    const parkedQueueRemoval = await tool("nzbget_remove_queue_items", {
+      downloadIds: ["radarr-queue-download", "missing-download"],
+      deleteFiles: false,
+      dryRun: false
+    });
+    assert.equal(parkedQueueRemoval.command, "GroupParkDelete");
+    assert.equal(parkedQueueRemoval.matchedBefore[0].nzbId, 71002);
+    assert.deepEqual(parkedQueueRemoval.matchedDownloadIds, ["radarr-queue-download"]);
+    assert.deepEqual(parkedQueueRemoval.missingDownloadIds, ["missing-download"]);
+    assert.equal(parkedQueueRemoval.removed, true);
+    assert.equal(nzbgetQueue.some(record => record.NZBID === 71002), false);
 
     const ambiguousMessage = await toolError("nzbget_retry_postprocess", { name: "Ambiguous.Release", dryRun: true });
     assert.match(ambiguousMessage, /ambiguous/i);
