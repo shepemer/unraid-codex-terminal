@@ -3198,6 +3198,7 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /data-improvement-filter="investigation_prompt"/);
     assert.match(pageText, /id="runner-settings-backdrop"/);
     assert.match(pageText, /id="activity-drawer-backdrop"/);
+    assert.match(pageText, /id="activity-popups"/);
     assert.match(pageText, /id="live-logs-open-button"/);
     assert.match(pageText, /id="live-logs-dialog"/);
     assert.match(pageText, /id="live-logs-output"/);
@@ -3224,6 +3225,10 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /\.token-usage/);
     assert.match(cssText, /\.work-area\.detail-open/);
     assert.match(cssText, /\.detail-band\.processing::before/);
+    assert.match(cssText, /\.activity-popups/);
+    assert.match(cssText, /\.activity-popup/);
+    assert.match(cssText, /\.activity-spinner/);
+    assert.match(cssText, /@keyframes activityProgress/);
     assert.match(cssText, /\.investigation-review/);
     assert.match(cssText, /\.investigation-next-steps/);
     assert.match(cssText, /\.investigation-full-details/);
@@ -3297,6 +3302,15 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function formatTokenCount/);
     assert.match(jsText, /function renderTokenUsage/);
     assert.match(jsText, /function setActivityDrawerOpen/);
+    assert.match(jsText, /function beginActivity/);
+    assert.match(jsText, /function finishActivity/);
+    assert.match(jsText, /function runActivity/);
+    assert.match(jsText, /function syncJobActivities/);
+    assert.match(jsText, /function refreshTrackedJobs/);
+    assert.match(jsText, /function scheduleActivityJobRefresh/);
+    assert.match(jsText, /Repair in progress/);
+    assert.match(jsText, /Learning from resolved issue/);
+    assert.match(jsText, /Checking improvements/);
     assert.match(jsText, /function setRunnerSettingsOpen/);
     assert.match(jsText, /function checkImprovements/);
     assert.match(jsText, /function mcpGapReportMarkdown/);
