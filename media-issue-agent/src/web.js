@@ -304,6 +304,7 @@ const HTML = `<!doctype html>
   </div>
   <div id="runner-settings-backdrop" class="drawer-backdrop hidden"></div>
   <div id="activity-drawer-backdrop" class="drawer-backdrop hidden"></div>
+  <aside id="activity-popups" class="activity-popups" aria-label="Active operations" aria-live="polite" aria-relevant="additions text"></aside>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
 </body>
@@ -1756,10 +1757,184 @@ pre {
   display: none;
 }
 
+.activity-popups {
+  position: fixed;
+  right: 18px;
+  bottom: 72px;
+  z-index: 40;
+  display: flex;
+  width: min(370px, calc(100vw - 36px));
+  max-height: min(58vh, 520px);
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  pointer-events: none;
+  scrollbar-width: thin;
+}
+
+.activity-popups:empty {
+  display: none;
+}
+
+.activity-popup {
+  position: relative;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  overflow: hidden;
+  flex: 0 0 auto;
+  min-height: 76px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
+  pointer-events: none;
+  animation: activityPopupEnter 180ms ease-out;
+}
+
+.activity-popup.success {
+  border-color: color-mix(in srgb, var(--success) 52%, var(--line));
+}
+
+.activity-popup.error {
+  border-color: color-mix(in srgb, var(--danger) 62%, var(--line));
+}
+
+.activity-popup-indicator {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 15px;
+  font-weight: 850;
+}
+
+.activity-popup.success .activity-popup-indicator {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.activity-popup.error .activity-popup-indicator {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.activity-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-top-color: var(--accent-strong);
+  border-radius: 50%;
+  animation: activitySpinner 720ms linear infinite;
+}
+
+.activity-popup-copy {
+  min-width: 0;
+}
+
+.activity-popup-title {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-popup-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.activity-popup-meta {
+  display: block;
+  margin-top: 5px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.activity-popup-dismiss {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  pointer-events: auto;
+}
+
+.activity-popup-dismiss:hover {
+  border-color: transparent;
+  background: var(--panel-2);
+  color: var(--text);
+  transform: none;
+}
+
+.activity-progress {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.activity-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 42%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: activityProgress 1.35s ease-in-out infinite;
+}
+
+@keyframes activityPopupEnter {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes activitySpinner {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes activityProgress {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(260%); }
+}
+
 #toast {
   position: fixed;
   right: 18px;
   bottom: 18px;
+  z-index: 41;
   max-width: min(460px, calc(100vw - 36px));
   min-height: 42px;
   border: 1px solid var(--line);
@@ -2197,6 +2372,19 @@ pre {
     bottom: 10px;
     max-width: calc(100vw - 20px);
   }
+
+  .activity-popups {
+    right: auto;
+    bottom: 64px;
+    left: 10px;
+    width: min(370px, calc(100dvw - 20px));
+    max-height: min(52dvh, 410px);
+  }
+
+  .activity-popup {
+    min-height: 72px;
+    padding: 11px;
+  }
 }
 
 @media (max-width: 560px) {
@@ -2228,6 +2416,14 @@ pre {
   .stats-grid {
     grid-template-columns: 1fr;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-popup,
+  .activity-spinner,
+  .activity-progress::after {
+    animation: none;
+  }
 }`;
 
 const JS = `const state = {
@@ -2253,7 +2449,11 @@ const JS = `const state = {
   liveLogsTimer: null,
   liveLogsPaused: false,
   liveLogsCursor: 0,
-  liveLogSeenKeys: new Set()
+  liveLogSeenKeys: new Set(),
+  activities: new Map(),
+  activityClockTimer: null,
+  activityJobTimer: null,
+  activityJobRefreshPending: false
 };
 
 const el = {
@@ -2347,6 +2547,7 @@ const el = {
   closeComment: document.getElementById("close-comment"),
   closeCancelButton: document.getElementById("close-cancel-button"),
   closeConfirmButton: document.getElementById("close-confirm-button"),
+  activityPopups: document.getElementById("activity-popups"),
   toast: document.getElementById("toast"),
   themeButtons: [...document.querySelectorAll("[data-theme-choice]")]
 };
@@ -2358,6 +2559,259 @@ const PROCESSING_JOB_STATES = new Set([
   "closing_issue",
   "reopening_issue"
 ]);
+
+const JOB_ACTIVITY_PRESENTATION = {
+  queued_for_investigation: {
+    title: "Investigation queued",
+    detail: "Waiting to begin evidence review."
+  },
+  investigating: {
+    title: "Investigating issue",
+    detail: "Codex is reviewing evidence and building a repair plan."
+  },
+  approved_for_execution: {
+    title: "Repair queued",
+    detail: "The approved repair is waiting to start."
+  },
+  executing: {
+    title: "Repair in progress",
+    detail: "Codex is using media tools and verifying the result."
+  },
+  drafting_comment: {
+    title: "Preparing resolution",
+    detail: "The repair finished; Codex is preparing the result for review."
+  },
+  closing_issue: {
+    title: "Closing issue",
+    detail: "Posting the approved resolution and closing the report."
+  },
+  reopening_issue: {
+    title: "Re-opening issue",
+    detail: "Restoring the report to the active triage queue."
+  }
+};
+
+function activityElapsed(startedAt) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Number(startedAt || Date.now())) / 1000));
+  if (seconds < 5) return "Just started";
+  if (seconds < 60) return \`\${seconds}s elapsed\`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? \`\${minutes}m \${remainder}s elapsed\` : \`\${minutes}m elapsed\`;
+}
+
+function renderActivityDurations() {
+  for (const node of el.activityPopups.querySelectorAll("[data-activity-started-at]")) {
+    node.textContent = activityElapsed(node.dataset.activityStartedAt);
+  }
+}
+
+function renderActivities() {
+  const activities = [...state.activities.values()]
+    .sort((left, right) => Number(left.startedAt) - Number(right.startedAt));
+  el.activityPopups.innerHTML = activities.map(activity => {
+    const active = activity.status === "active";
+    const icon = active ? '<span class="activity-spinner"></span>' : activity.status === "success" ? "✓" : "!";
+    const meta = active
+      ? \`<span class="activity-popup-meta" data-activity-started-at="\${activity.startedAt}">\${escapeHtml(activityElapsed(activity.startedAt))}</span>\`
+      : \`<span class="activity-popup-meta">\${activity.status === "success" ? "Completed" : "Needs attention"}</span>\`;
+    return \`
+      <article class="activity-popup \${escapeHtml(activity.status)}" data-activity-id="\${escapeHtml(activity.id)}" role="status">
+        <span class="activity-popup-indicator" aria-hidden="true">\${icon}</span>
+        <div class="activity-popup-copy">
+          <strong class="activity-popup-title" title="\${escapeHtml(activity.title)}">\${escapeHtml(activity.title)}</strong>
+          <p class="activity-popup-detail" title="\${escapeHtml(activity.detail)}">\${escapeHtml(activity.detail)}</p>
+          \${meta}
+        </div>
+        \${active ? "" : \`<button class="activity-popup-dismiss" type="button" data-dismiss-activity="\${escapeHtml(activity.id)}" aria-label="Dismiss \${escapeHtml(activity.title)}" title="Dismiss">×</button>\`}
+        \${active ? '<span class="activity-progress" aria-hidden="true"></span>' : ""}
+      </article>
+    \`;
+  }).join("");
+  if (activities.some(activity => activity.status === "active") && !state.activityClockTimer) {
+    state.activityClockTimer = setInterval(renderActivityDurations, 1000);
+  } else if (!activities.some(activity => activity.status === "active") && state.activityClockTimer) {
+    clearInterval(state.activityClockTimer);
+    state.activityClockTimer = null;
+  }
+}
+
+function beginActivity(id, { title, detail, source = "request", requestPending = false }) {
+  const existing = state.activities.get(id);
+  if (existing?.status === "active"
+    && existing.title === title
+    && existing.detail === detail
+    && existing.source === source
+    && (!requestPending || existing.requestPending === true)) {
+    return;
+  }
+  if (existing?.dismissTimer) {
+    clearTimeout(existing.dismissTimer);
+  }
+  state.activities.set(id, {
+    id,
+    title,
+    detail,
+    source,
+    status: "active",
+    startedAt: existing?.status === "active" ? existing.startedAt : Date.now(),
+    requestPending: requestPending || existing?.requestPending === true,
+    dismissTimer: null
+  });
+  renderActivities();
+}
+
+function finishActivity(id, status, detail) {
+  const existing = state.activities.get(id);
+  if (!existing) {
+    return;
+  }
+  if (existing.dismissTimer) {
+    clearTimeout(existing.dismissTimer);
+  }
+  const activity = {
+    ...existing,
+    status,
+    detail: detail || existing.detail,
+    requestPending: false,
+    dismissTimer: null
+  };
+  state.activities.set(id, activity);
+  renderActivities();
+  scheduleActivityJobRefresh();
+  activity.dismissTimer = setTimeout(() => {
+    if (state.activities.get(id) === activity) {
+      state.activities.delete(id);
+      renderActivities();
+    }
+  }, status === "success" ? 4200 : 7200);
+}
+
+function dismissActivity(id) {
+  const activity = state.activities.get(id);
+  if (activity?.dismissTimer) {
+    clearTimeout(activity.dismissTimer);
+  }
+  state.activities.delete(id);
+  renderActivities();
+}
+
+function activityErrorDetail(error) {
+  const message = String(error?.message || "The operation did not complete.");
+  return message.length > 180 ? message.slice(0, 177) + "..." : message;
+}
+
+async function runActivity(activity, operation) {
+  beginActivity(activity.id, { ...activity, requestPending: true });
+  try {
+    const result = await operation();
+    const detail = typeof activity.successDetail === "function"
+      ? activity.successDetail(result)
+      : activity.successDetail || "The operation completed.";
+    finishActivity(activity.id, "success", detail);
+    return result;
+  } catch (error) {
+    finishActivity(activity.id, "error", activityErrorDetail(error));
+    throw error;
+  }
+}
+
+function issueActivitySubject(index) {
+  const entry = state.entries.find(row => Number(row.idx) === Number(index));
+  return entry?.mediaTitle || entry?.description || (entry?.source ? \`\${sourceLabel(entry.source)} issue\` : "Selected issue");
+}
+
+function jobActivitySubject(job) {
+  const entry = state.entries.find(row => Number(row.jobId) === Number(job.id)
+    || (row.source === job.source && String(row.issueId) === String(job.issueId)));
+  return entry?.mediaTitle || jobContextLabel(job);
+}
+
+function completedJobActivity(job) {
+  if (job.state === "awaiting_action_approval") {
+    return { status: "success", detail: "Investigation ready for your review." };
+  }
+  if (job.state === "awaiting_resolution_approval") {
+    return { status: "success", detail: "Repair complete and ready for final approval." };
+  }
+  if (job.state === "closed") {
+    return { status: "success", detail: "Issue workflow completed." };
+  }
+  if (job.state === "detected") {
+    return { status: "success", detail: "Issue is back in the active triage queue." };
+  }
+  if (["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(job.state)) {
+    return { status: "error", detail: activityErrorDetail({ message: job.lastError || "The operation stopped and needs review." }) };
+  }
+  return { status: "success", detail: "The active operation finished." };
+}
+
+function syncJobActivities(jobs) {
+  const jobsById = new Map(jobs.map(job => [Number(job.id), job]));
+  for (const job of jobs) {
+    const presentation = JOB_ACTIVITY_PRESENTATION[job.state];
+    if (!presentation) {
+      continue;
+    }
+    const id = \`job:\${job.id}\`;
+    const subject = jobActivitySubject(job);
+    const detail = subject ? \`\${presentation.detail} \${subject}\` : presentation.detail;
+    const existing = state.activities.get(id);
+    if (!existing || existing.status !== "active" || existing.title !== presentation.title || existing.detail !== detail) {
+      beginActivity(id, {
+        title: presentation.title,
+        detail,
+        source: "job"
+      });
+    }
+  }
+  for (const activity of [...state.activities.values()]) {
+    if (activity.source !== "job"
+      || activity.status !== "active"
+      || activity.requestPending
+      || !activity.id.startsWith("job:")) {
+      continue;
+    }
+    const job = jobsById.get(Number(activity.id.slice(4)));
+    if (!job) {
+      finishActivity(activity.id, "success", "The job is no longer active.");
+      continue;
+    }
+    if (JOB_ACTIVITY_PRESENTATION[job.state]) {
+      continue;
+    }
+    const completed = completedJobActivity(job);
+    finishActivity(activity.id, completed.status, completed.detail);
+  }
+  scheduleActivityJobRefresh();
+}
+
+async function refreshTrackedJobs() {
+  if (state.activityJobRefreshPending) {
+    return;
+  }
+  state.activityJobRefreshPending = true;
+  try {
+    const result = await api("/api/jobs");
+    state.jobs = sortJobs(result.jobs || []);
+    syncJobActivities(state.jobs);
+  } catch {
+    // A regular dashboard refresh or the next activity tick will retry.
+  } finally {
+    state.activityJobRefreshPending = false;
+  }
+}
+
+function scheduleActivityJobRefresh() {
+  const hasActiveJob = [...state.activities.values()]
+    .some(activity => activity.source === "job" && activity.status === "active");
+  if (hasActiveJob && !state.activityJobTimer) {
+    state.activityJobTimer = setInterval(refreshTrackedJobs, 2500);
+  } else if (!hasActiveJob && state.activityJobTimer) {
+    clearInterval(state.activityJobTimer);
+    state.activityJobTimer = null;
+  }
+}
 
 function autoResizeSteerInput() {
   if (!el.steerInput) {
@@ -2696,6 +3150,7 @@ function renderTokenUsage(usage = {}) {
 function renderJobs(jobs) {
   const orderedJobs = sortJobs(jobs);
   state.jobs = orderedJobs;
+  syncJobActivities(orderedJobs);
   if (!orderedJobs.length) {
     el.jobList.innerHTML = '<div class="empty">No jobs yet.</div>';
     return;
@@ -2925,6 +3380,20 @@ function setRepairRetryVisible(visible) {
 function renderAuth(auth, login) {
   state.authOk = Boolean(auth?.ok);
   state.loginRunning = login?.status === "running";
+  const loginActivity = state.activities.get("auth:login");
+  if (state.loginRunning) {
+    beginActivity("auth:login", {
+      title: "Connecting ChatGPT",
+      detail: "Waiting for the Codex device login to complete.",
+      source: "auth"
+    });
+  } else if (loginActivity?.status === "active") {
+    finishActivity(
+      "auth:login",
+      state.authOk ? "success" : "error",
+      state.authOk ? "ChatGPT authentication is ready." : "Login ended before authentication completed."
+    );
+  }
   el.authPanel.classList.toggle("hidden", state.authOk && !state.loginRunning);
   el.authPanel.classList.toggle("connected", state.authOk && !state.loginRunning);
   el.authHeading.textContent = state.authOk ? "ChatGPT Connected" : "Connect ChatGPT";
@@ -3135,10 +3604,20 @@ async function generateIssueImprovements(index) {
   }
   setBusy(true);
   try {
-    const response = await api(\`/api/issues/\${state.snapshotId}/\${index}/improvements\`, {
+    const response = await runActivity({
+      id: \`issue:\${state.snapshotId}:\${index}:learn\`,
+      title: "Learning from resolved issue",
+      detail: \`Reviewing the investigation and operator steering for \${issueActivitySubject(index)}.\`,
+      successDetail: result => {
+        const count = Array.isArray(result?.result?.improvements) ? result.result.improvements.length : 0;
+        return count
+          ? \`Added or refreshed \${count} reusable improvement\${count === 1 ? "" : "s"}.\`
+          : "Review complete; no reusable improvement was suggested.";
+      }
+    }, () => api(\`/api/issues/\${state.snapshotId}/\${index}/improvements\`, {
       method: "POST",
       body: "{}"
-    });
+    }));
     const result = response.result || {};
     const count = Array.isArray(result.improvements) ? result.improvements.length : 0;
     if (result.status === "completed") {
@@ -3592,7 +4071,18 @@ async function checkImprovements() {
   el.mcpGapsCheckButton.disabled = true;
   el.mcpGapsCheckButton.textContent = "Checking...";
   try {
-    const result = await api("/api/improvements/check", { method: "POST", body: "{}" });
+    const result = await runActivity({
+      id: "improvements:check",
+      title: "Checking improvements",
+      detail: "Comparing requested capabilities and prompt changes with the current implementation.",
+      successDetail: response => {
+        const entries = response?.results || [];
+        const implemented = entries.filter(entry => entry.implemented === true || entry.detected === true).length;
+        return entries.length
+          ? \`Checked \${entries.length}; \${implemented} implemented or detected.\`
+          : "No active improvements needed checking.";
+      }
+    }, () => api("/api/improvements/check", { method: "POST", body: "{}" }));
     const detections = {};
     for (const entry of result.results || []) {
       if (entry.itemId !== undefined && entry.itemId !== null) {
@@ -3618,8 +4108,14 @@ async function checkImprovements() {
 
 async function removeMcpGap(itemId) {
   setBusy(true);
+  const item = state.mcpGapItems.find(candidate => Number(candidate.id) === Number(itemId));
   try {
-    await api(\`/api/improvements/\${itemId}\`, { method: "DELETE" });
+    await runActivity({
+      id: \`improvement:\${itemId}:remove\`,
+      title: "Removing improvement",
+      detail: item?.title || "Removing the selected backlog item.",
+      successDetail: "Improvement removed from the backlog."
+    }, () => api(\`/api/improvements/\${itemId}\`, { method: "DELETE" }));
     toast("Improvement removed");
     delete state.mcpGapDetections[String(itemId)];
     await loadMcpGaps();
@@ -4583,10 +5079,31 @@ async function refresh() {
   scheduleAuthRefresh();
 }
 
+async function reloadDashboard() {
+  setBusy(true);
+  try {
+    await runActivity({
+      id: "dashboard:reload",
+      title: "Refreshing dashboard",
+      detail: "Loading current issue, job, authentication, and runner state.",
+      successDetail: "Dashboard refreshed."
+    }, refresh);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function saveCodexSettings(options = {}) {
   setBusy(true);
   try {
-    const result = await api("/api/settings/codex", {
+    const result = await runActivity({
+      id: "settings:codex",
+      title: "Saving runner settings",
+      detail: "Updating the model, reasoning, speed, and repair context.",
+      successDetail: "Runner settings saved."
+    }, () => api("/api/settings/codex", {
       method: "POST",
       body: JSON.stringify({
         model: el.codexModel.value,
@@ -4595,7 +5112,7 @@ async function saveCodexSettings(options = {}) {
         serviceTier: el.codexServiceTier.value,
         repairContext: el.codexRepairContext.value
       })
-    });
+    }));
     renderCodexSettings(result.settings);
     if (options.closeRepairContextDialog) {
       closeRepairContextDialog({ revert: false });
@@ -4645,12 +5162,18 @@ function scheduleAuthRefresh() {
 
 async function startLogin() {
   setBusy(true);
+  beginActivity("auth:login", {
+    title: "Connecting ChatGPT",
+    detail: "Waiting for the Codex device login to complete.",
+    source: "auth"
+  });
   try {
     const result = await api("/api/auth/login", { method: "POST", body: "{}" });
     renderAuth(result.auth, result.login);
     toast("Codex login started");
     scheduleAuthRefresh();
   } catch (error) {
+    finishActivity("auth:login", "error", activityErrorDetail(error));
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
@@ -4661,7 +5184,12 @@ async function startLogin() {
 async function poll() {
   setBusy(true);
   try {
-    const result = await api("/api/poll", { method: "POST", body: "{}" });
+    const result = await runActivity({
+      id: "issues:poll",
+      title: "Polling issue sources",
+      detail: "Checking Plex and Seerr for current issue activity.",
+      successDetail: response => \`Snapshot \${response?.result?.snapshotId || "updated"} recorded.\`
+    }, () => api("/api/poll", { method: "POST", body: "{}" }));
     toast(\`Snapshot \${result.result.snapshotId} recorded\`);
     await refresh();
   } catch (error) {
@@ -4693,10 +5221,15 @@ async function closeIssueFromDialog() {
   setDetailOpen(true);
   setDetailProcessing(true, "Closing");
   try {
-    const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/close\`, {
+    const result = await runActivity({
+      id: \`issue:\${state.snapshotId}:\${index}:close\`,
+      title: "Closing issue",
+      detail: \`Posting the closure and learning from the resolved workflow for \${issueActivitySubject(index)}.\`,
+      successDetail: "Issue closed and workflow learning completed."
+    }, () => api(\`/api/issues/\${state.snapshotId}/\${index}/close\`, {
       method: "POST",
       body: JSON.stringify({ comment })
-    });
+    }));
     applyIssueMutation(index, result.result);
     closeCloseDialog();
     toast("Issue closed");
@@ -4718,10 +5251,15 @@ async function reopenIssue() {
   setBusy(true);
   setDetailProcessing(true, "Re-opening");
   try {
-    const result = await api(\`/api/issues/\${state.snapshotId}/\${index}/reopen\`, {
+    const result = await runActivity({
+      id: \`issue:\${state.snapshotId}:\${index}:reopen\`,
+      title: "Re-opening issue",
+      detail: \`Returning \${issueActivitySubject(index)} to active triage.\`,
+      successDetail: "Issue re-opened and returned to triage."
+    }, () => api(\`/api/issues/\${state.snapshotId}/\${index}/reopen\`, {
       method: "POST",
       body: "{}"
-    });
+    }));
     applyIssueMutation(index, result.result);
     toast("Issue re-opened");
     await refresh();
@@ -4750,10 +5288,15 @@ async function investigate(index, force = false) {
   setRepairRetryVisible(false);
   setRetrySameRepairVisible(false);
   try {
-    const result = await api("/api/investigate", {
+    const result = await runActivity({
+      id: \`issue:\${state.snapshotId}:\${index}:investigate\`,
+      title: force ? "Re-investigating issue" : "Investigating issue",
+      detail: \`Codex is reviewing evidence for \${issueActivitySubject(index)}.\`,
+      successDetail: "Investigation ready for review."
+    }, () => api("/api/investigate", {
       method: "POST",
       body: JSON.stringify({ snapshotId: state.snapshotId, index, force })
-    });
+    }));
     state.activeJobId = result.result.jobId;
     el.output.textContent = result.result.summary;
     el.approvalActions.classList.toggle("hidden", !result.result.approvalId);
@@ -4771,6 +5314,11 @@ async function investigate(index, force = false) {
 
 async function approval(action) {
   if (!state.activeJobId) return;
+  const jobId = state.activeJobId;
+  const resolutionApproval = state.activeJobState === "awaiting_resolution_approval";
+  const activityTitle = action === "reject"
+    ? "Rejecting approval"
+    : resolutionApproval ? "Finalizing issue" : "Running approved repair";
   setBusy(true);
   setDetailOpen(true);
   setDetailProcessing(true, action === "approve" ? "Processing approval" : "Rejecting");
@@ -4780,7 +5328,18 @@ async function approval(action) {
     }
   }, 1500);
   try {
-    const result = await api(\`/api/jobs/\${state.activeJobId}/\${action}\`, { method: "POST", body: "{}" });
+    const result = await runActivity({
+      id: \`job:\${jobId}\`,
+      title: activityTitle,
+      detail: action === "reject"
+        ? \`Rejecting the pending decision for job \${jobId}.\`
+        : resolutionApproval
+          ? \`Posting the approved result, closing job \${jobId}, and learning from the resolved workflow.\`
+          : \`Codex is executing and verifying the approved repair for job \${jobId}.\`,
+      successDetail: action === "reject"
+        ? "Approval rejected."
+        : resolutionApproval ? "Resolution approved and closure completed." : "Approved repair run completed."
+    }, () => api(\`/api/jobs/\${jobId}/\${action}\`, { method: "POST", body: "{}" }));
     toast(\`Job \${state.activeJobId} \${action}d\`);
     el.approvalActions.classList.add("hidden");
     el.output.textContent = result.result?.message || formatJson(result.result);
@@ -4798,6 +5357,7 @@ async function approval(action) {
 
 async function continueJob() {
   if (!state.activeJobId) return;
+  const jobId = state.activeJobId;
   setBusy(true);
   setDetailOpen(true);
   setDetailProcessing(true, "Executing");
@@ -4807,7 +5367,12 @@ async function continueJob() {
     }
   }, 1500);
   try {
-    const result = await api(\`/api/jobs/\${state.activeJobId}/continue\`, { method: "POST", body: "{}" });
+    const result = await runActivity({
+      id: \`job:\${jobId}\`,
+      title: "Continuing repair",
+      detail: \`Resuming the approved workflow for job \${jobId}.\`,
+      successDetail: "Repair workflow continued."
+    }, () => api(\`/api/jobs/\${jobId}/continue\`, { method: "POST", body: "{}" }));
     toast(\`Job \${state.activeJobId} continued\`);
     el.output.textContent = result.result?.message || formatJson(result.result);
     await refresh();
@@ -4824,6 +5389,7 @@ async function continueJob() {
 
 async function retryRepair() {
   if (!state.activeJobId) return;
+  const jobId = state.activeJobId;
   const note = el.repairRetryInput.value.trim();
   if (!note) return;
   setBusy(true);
@@ -4835,10 +5401,15 @@ async function retryRepair() {
     }
   }, 1500);
   try {
-    const result = await api(\`/api/jobs/\${state.activeJobId}/retry-repair\`, {
+    const result = await runActivity({
+      id: \`job:\${jobId}\`,
+      title: "Retrying repair",
+      detail: \`Codex is retrying job \${jobId} with your guidance.\`,
+      successDetail: "Repair retry completed."
+    }, () => api(\`/api/jobs/\${jobId}/retry-repair\`, {
       method: "POST",
       body: JSON.stringify({ note })
-    });
+    }));
     el.repairRetryInput.value = "";
     toast(\`Job \${state.activeJobId} repair retried\`);
     el.output.textContent = result.result?.message || formatJson(result.result);
@@ -4856,6 +5427,7 @@ async function retryRepair() {
 
 async function retrySameRepair() {
   if (!state.activeJobId) return;
+  const jobId = state.activeJobId;
   setBusy(true);
   setDetailOpen(true);
   setDetailProcessing(true, "Retrying repair");
@@ -4865,10 +5437,15 @@ async function retrySameRepair() {
     }
   }, 1500);
   try {
-    const result = await api(\`/api/jobs/\${state.activeJobId}/retry-repair\`, {
+    const result = await runActivity({
+      id: \`job:\${jobId}\`,
+      title: "Retrying repair",
+      detail: \`Codex is retrying the approved plan for job \${jobId}.\`,
+      successDetail: "Repair retry completed."
+    }, () => api(\`/api/jobs/\${jobId}/retry-repair\`, {
       method: "POST",
       body: JSON.stringify({ note: "" })
-    });
+    }));
     toast(\`Job \${state.activeJobId} repair retried\`);
     el.output.textContent = result.result?.message || formatJson(result.result);
     await refresh();
@@ -4885,14 +5462,20 @@ async function retrySameRepair() {
 
 async function abortRepair() {
   if (!state.activeJobId) return;
+  const jobId = state.activeJobId;
   setBusy(true);
   setDetailOpen(true);
   setDetailProcessing(true, "Aborting repair");
   try {
-    const result = await api("/api/jobs/" + state.activeJobId + "/abort-repair", {
+    const result = await runActivity({
+      id: \`job:\${jobId}\`,
+      title: "Aborting repair",
+      detail: \`Stopping the active Codex runner for job \${jobId}.\`,
+      successDetail: "Abort request accepted."
+    }, () => api("/api/jobs/" + jobId + "/abort-repair", {
       method: "POST",
       body: "{}"
-    });
+    }));
     toast("Job " + state.activeJobId + " abort requested");
     el.output.textContent = result.result?.message || formatJson(result.result);
     await refresh();
@@ -4919,10 +5502,15 @@ async function steerInvestigation() {
   el.output.textContent = "Revising investigation...";
   el.approvalActions.classList.add("hidden");
   try {
-    const result = await api(\`/api/jobs/\${state.activeJobId}/steer\`, {
+    const result = await runActivity({
+      id: \`job:\${state.activeJobId}\`,
+      title: "Revising investigation",
+      detail: "Codex is applying your steering and updating the repair plan.",
+      successDetail: "Investigation updated with your guidance."
+    }, () => api(\`/api/jobs/\${state.activeJobId}/steer\`, {
       method: "POST",
       body: JSON.stringify({ message })
-    });
+    }));
     el.output.textContent = result.result.summary;
     toast("Investigation revised");
     await refresh();
@@ -4941,7 +5529,7 @@ async function steerInvestigation() {
 }
 
 el.pollButton.addEventListener("click", poll);
-el.reloadButton.addEventListener("click", () => refresh().catch(error => toast(error.message)));
+el.reloadButton.addEventListener("click", reloadDashboard);
 el.loginButton.addEventListener("click", startLogin);
 el.codexSettingsSave.addEventListener("click", saveCodexSettings);
 el.runnerSettingsButton.addEventListener("click", () => setRunnerSettingsOpen(!state.runnerSettingsOpen));
@@ -5073,6 +5661,12 @@ el.closeConfirmButton.addEventListener("click", closeIssueFromDialog);
 el.closeDialog.addEventListener("click", event => {
   if (event.target === el.closeDialog) {
     closeCloseDialog();
+  }
+});
+el.activityPopups.addEventListener("click", event => {
+  const button = event.target.closest("[data-dismiss-activity]");
+  if (button) {
+    dismissActivity(button.dataset.dismissActivity);
   }
 });
 el.jobList.addEventListener("click", event => {

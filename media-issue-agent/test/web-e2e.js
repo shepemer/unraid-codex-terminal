@@ -391,7 +391,13 @@ async function testIssueStateActionMatrix(browser) {
     await expect(page.locator(".mcp-improvement")).toHaveCount(0);
     await page.locator('[data-improvement-filter="all"]').click();
     await page.locator("#mcp-gaps-check-button").click();
+    const improvementCheckActivity = page.locator('[data-activity-id="improvements:check"]');
+    await expect(improvementCheckActivity).toHaveClass(/active/);
+    await expect(improvementCheckActivity.locator(".activity-popup-title")).toHaveText("Checking improvements");
+    await expect(improvementCheckActivity.locator(".activity-spinner")).toBeVisible();
     await expect(page.locator(".mcp-improvement .mcp-gap-detected")).toHaveText("DETECTED");
+    await expect(improvementCheckActivity).toHaveClass(/success/);
+    await expect(improvementCheckActivity).toContainText("Checked 3; 2 implemented or detected.");
     await expect(page.locator(".mcp-improvement .mcp-gap-detected")).toHaveAttribute("type", "button");
     await expect(page.locator(".prompt-improvement .mcp-gap-detected")).toHaveText("IMPLEMENTED");
     await expect(page.locator(".mcp-gap-not-detected")).toHaveText("NOT DETECTED");
@@ -485,7 +491,12 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 7).getByRole("button", { name: "Close" })).toHaveCount(0);
     await expect(row(page, 5).getByRole("button", { name: "Learn" })).toBeVisible();
     await row(page, 5).getByRole("button", { name: "Learn" }).click();
+    const learningActivity = page.locator(".activity-popup", { hasText: "Learning from resolved issue" });
+    await expect(learningActivity).toHaveClass(/active/);
+    await expect(learningActivity.locator(".activity-spinner")).toBeVisible();
     await expect(page.locator("#mcp-gaps-dialog")).toBeVisible();
+    await expect(learningActivity).toHaveClass(/success/);
+    await expect(learningActivity).toContainText("Added or refreshed 1 reusable improvement.");
     await expect(page.locator('[data-improvement-filter="investigation_prompt"]')).toHaveClass(/active/);
     await expect(page.locator("#mcp-gaps-list")).toContainText("Verify fixture state before repair");
     await page.locator("#mcp-gaps-close-button").click();
@@ -734,6 +745,10 @@ async function testFullBrowserWorkflow(browser) {
     await expect(row(page, 1).getByRole("button", { name: "Close" })).toBeVisible();
 
     await row(page, 1).getByRole("button", { name: "Investigate" }).click();
+    const investigationActivity = page.locator('[data-activity-id$=":investigate"]');
+    await expect(investigationActivity).toHaveClass(/active/);
+    await expect(investigationActivity.locator(".activity-popup-title")).toHaveText("Investigating issue");
+    await expect(investigationActivity.locator(".activity-spinner")).toBeVisible();
     await expect(page.locator("#detail-processing")).toBeVisible();
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
@@ -754,6 +769,8 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
     await expect(page.locator("#detail-processing")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
+    await expect(investigationActivity).toHaveClass(/success/);
+    await expect(investigationActivity).toContainText("Investigation ready for review.");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 1);
 
     await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
@@ -979,6 +996,7 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     context = pageHandle.context;
     const page = pageHandle.page;
     const jobRow = page.locator(`[data-job-id="${job.id}"]`);
+    const repairActivity = page.locator(`[data-activity-id="job:${job.id}"]`);
 
     await expect(jobRow).toContainText("Executing repair");
     await expect(jobRow).not.toContainText("Needs approval");
@@ -986,6 +1004,10 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     await expect(row(page, 1)).toHaveClass(/issue-processing/);
     await expect(row(page, 1).getByRole("button", { name: "View repair" })).toBeVisible();
     await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toHaveCount(0);
+    await expect(repairActivity).toHaveClass(/active/);
+    await expect(repairActivity.locator(".activity-popup-title")).toHaveText("Repair in progress");
+    await expect(repairActivity).toContainText("Codex is using media tools and verifying the result.");
+    await expect(repairActivity.locator(".activity-spinner")).toBeVisible();
 
     await row(page, 1).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
@@ -996,6 +1018,11 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#abort-repair-button")).toBeVisible();
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
+
+    await page.locator("#detail-close-button").click();
+    transitionJob(dbPath, job.id, "executing", "failed_retryable", "Fixture repair stopped after verification failed.");
+    await expect(repairActivity).toHaveClass(/error/, { timeout: 6_000 });
+    await expect(repairActivity).toContainText("Fixture repair stopped after verification failed.");
   } finally {
     await context?.close();
     await harness?.close();
@@ -1281,6 +1308,21 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await expect(page.locator(".table-wrap")).toBeHidden();
     await expect(card(page, 1)).toContainText("Mobile Detail Fixture");
     await card(page, 1).getByRole("button", { name: "Investigate" }).click();
+    const mobileActivity = page.locator('[data-activity-id$=":investigate"]');
+    await expect(mobileActivity).toHaveClass(/active/);
+    const mobileActivityBounds = await mobileActivity.evaluate(element => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        left: bounds.left,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight
+      };
+    });
+    assert.ok(mobileActivityBounds.left >= 0, JSON.stringify(mobileActivityBounds));
+    assert.ok(mobileActivityBounds.right <= mobileActivityBounds.viewportWidth, JSON.stringify(mobileActivityBounds));
+    assert.ok(mobileActivityBounds.bottom <= mobileActivityBounds.viewportHeight, JSON.stringify(mobileActivityBounds));
     await expect(page.locator("#detail-processing")).toContainText("Investigating");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#investigation-review")).toBeVisible();
