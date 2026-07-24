@@ -11,6 +11,7 @@ const TEXT_PATTERNS = [
   [new RegExp(`\\b((?:authorization|x-plex-token|x-api-key)\\s*:\\s*)[^\\r\\n]+`, "gi"), "$1[REDACTED]"],
   [/\bBearer\s+[A-Za-z0-9._~+/\-=]+/gi, "Bearer [REDACTED]"],
   [/\b(?:sk-[A-Za-z0-9_-]{8,}|(?:gho|ghp|github_pat)_[A-Za-z0-9_=-]{8,})\b/g, "[REDACTED_TOKEN]"],
+  [/\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{8,}\b/gi, "[REDACTED_SLACK_TOKEN]"],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]"],
   [/\b[A-Za-z0-9_]*API[_-]?KEY[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "API_KEY=[REDACTED]"],
   [/\b[A-Za-z0-9_]*TOKEN[A-Za-z0-9_]*\s*=\s*[^\s]+/gi, "TOKEN=[REDACTED]"],

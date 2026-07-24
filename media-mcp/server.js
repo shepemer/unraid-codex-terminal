@@ -5911,6 +5911,32 @@ async function plexOverview() {
   };
 }
 
+async function plexAvailability() {
+  if (!configuredServices.plex) {
+    return {
+      configured: false,
+      online: false,
+      activeStreamCount: 0
+    };
+  }
+  try {
+    const sessions = await plexApi("status/sessions");
+    const records = plexSessionRecords(sessions);
+    const reportedSize = Number(sessions?.MediaContainer?.size);
+    return {
+      configured: true,
+      online: true,
+      activeStreamCount: Number.isFinite(reportedSize) ? reportedSize : records.length
+    };
+  } catch {
+    return {
+      configured: true,
+      online: false,
+      activeStreamCount: 0
+    };
+  }
+}
+
 async function seerrOverview() {
   const [issueCounts, pendingRequests] = await Promise.all([
     seerrApi("issue/count"),
@@ -9652,6 +9678,67 @@ async function diagnoseIssue(source, issueId, verbose = false) {
   throw new Error(`issue source ${source} is not supported`);
 }
 
+function plexSearchMatches(body, limit = 10) {
+  const hubs = Array.isArray(body?.MediaContainer?.Hub) ? body.MediaContainer.Hub : [];
+  return hubs
+    .flatMap(hub => Array.isArray(hub?.Metadata) ? hub.Metadata : [])
+    .slice(0, Math.max(1, Math.min(Number(limit || 10), 25)))
+    .map(item => compactObject({
+      ratingKey: item.ratingKey,
+      type: item.type,
+      title: plexMetadataDisplayTitle(item),
+      itemTitle: item.title,
+      parentTitle: item.parentTitle,
+      grandparentTitle: item.grandparentTitle,
+      year: item.year,
+      index: item.index,
+      parentIndex: item.parentIndex,
+      librarySectionID: item.librarySectionID,
+      librarySectionTitle: item.librarySectionTitle
+    }));
+}
+
+async function diagnoseReport(mediaTitleValue, description, verbose = false) {
+  const mediaTitle = String(mediaTitleValue || "").trim();
+  const report = {
+    source: "external_report",
+    mediaTitle,
+    description: String(description || "").trim()
+  };
+  let matches = [];
+  let searchError;
+  if (configuredServices.plex) {
+    try {
+      matches = plexSearchMatches(await plexApi("hubs/search", {
+        query: { query: mediaTitle }
+      }));
+    } catch (error) {
+      searchError = error.message;
+    }
+  }
+  const bestMatch = matches[0];
+  const contextualIssue = bestMatch
+    ? { ...report, plexRatingKey: bestMatch.ratingKey, mediaType: bestMatch.type }
+    : report;
+  const [plex, tautulli, tracearr] = await Promise.all([
+    plexIssueContext(contextualIssue),
+    tautulliIssueContext(contextualIssue),
+    tracearrIssueContext(contextualIssue)
+  ]);
+  return compactObject({
+    issue: verbose ? report : compactObject(report),
+    plexSearch: {
+      configured: Boolean(configuredServices.plex),
+      query: mediaTitle,
+      matches,
+      error: searchError
+    },
+    plex,
+    tautulli,
+    tracearr
+  });
+}
+
 async function prowlarrIndexerHealth(limit) {
   const [indexers, health, history] = await Promise.all([
     arrApi("prowlarr", "v1", "indexer"),
@@ -10387,6 +10474,16 @@ function createServer() {
     }
   }, async ({ source, issueId, verbose }) => jsonText(await diagnoseIssue(source, issueId, verbose)));
 
+  server.registerTool("media_diagnose_report", {
+    title: "Media Diagnose External Report",
+    description: "Diagnose a sanitized external media report by title and description with optional Plex, Tautulli, and Tracearr context.",
+    inputSchema: {
+      mediaTitle: z.string().min(1).max(200),
+      description: z.string().min(1).max(4000),
+      verbose: z.boolean().default(false)
+    }
+  }, async ({ mediaTitle, description, verbose }) => jsonText(await diagnoseReport(mediaTitle, description, verbose)));
+
   server.registerTool("media_request_triage", {
     title: "Media Request Triage",
     description: "Summarize one Seerr-family request and the matching Sonarr or Radarr operational context.",
@@ -10405,6 +10502,11 @@ function createServer() {
     status: await plexApi(),
     sessions: await plexApi("status/sessions")
   }));
+
+  server.registerTool("plex_availability", {
+    title: "Plex Availability",
+    description: "Check whether Plex is reachable and return only its active stream count."
+  }, async () => jsonText(await plexAvailability()));
 
   server.registerTool("plex_list_libraries", {
     title: "Plex List Libraries",

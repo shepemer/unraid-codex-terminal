@@ -1,7 +1,7 @@
 import { MediaMcpClient } from "./mcp-client.js";
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
-import { issueLifecycleFromComments, issueQueue, issueTableMarkdown } from "./issues.js";
+import { issueLifecycleFromComments, issueQueue, issueTableMarkdown, normalizeIssue } from "./issues.js";
 import {
   completeAgentRun,
   createAgentRun,
@@ -19,7 +19,9 @@ import {
   latestApprovalForJob,
   latestSnapshot,
   listApprovals,
+  listSlackIssueRecords,
   listJobs,
+  markSlackIssueInvestigated,
   markPlannedActionExecuted,
   pendingApprovalForJob,
   pendingApprovalForJobAnyKind,
@@ -32,6 +34,10 @@ import {
   reconcileJobLifecycle,
   recoverInterruptedAgentRuns,
   setSetting,
+  setSlackIssueStatus,
+  slackIssueDetails,
+  slackIssueForId,
+  slackQueueStatus,
   snapshotEntries,
   snapshotEntry,
   statusSummary,
@@ -56,6 +62,7 @@ import {
   runCodexMcpCapabilityCheck,
   runCodexPromptImprovementCheck,
   runCodexRepair,
+  runCodexSlackIntent,
   runCodexWorkflowImprovementAnalysis,
   steeredInvestigationPrompt
 } from "./codex.js";
@@ -64,6 +71,7 @@ import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, vali
 import { redactText, sanitizeValue } from "./redact.js";
 import { createDiagnosticLogger } from "./diagnostic-log.js";
 import { pushoverConfigured, sendPushoverMessage } from "./pushover.js";
+import { parseSlackIntentResult, queueSlackIssueMessage, SlackService } from "./slack.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -471,6 +479,12 @@ function addActionSummaries(details) {
 
 function fallbackDraftComment(source, executionResult = null) {
   const outcome = executionResult?.outcome || "";
+  if (source === "slack") {
+    if (outcome === "client_side") {
+      return "I reviewed this report as a client-side issue. No server-side media change was needed.";
+    }
+    return "I completed the approved follow-up for this media issue.";
+  }
   if (source === "plex") {
     if (outcome === "client_side") {
       return `Reviewed this report as client-side. ${AUTOMATED_SUFFIX}`;
@@ -486,7 +500,9 @@ function fallbackDraftComment(source, executionResult = null) {
 function normalizeDraftComment(source, draft, executionResult = null) {
   let message = String(draft || "").trim();
   message = message.replace(/^```(?:text|markdown)?\s*/i, "").replace(/```$/i, "").trim();
-  if (!message.endsWith(AUTOMATED_SUFFIX)) {
+  if (source === "slack" && message.endsWith(AUTOMATED_SUFFIX)) {
+    message = message.slice(0, -AUTOMATED_SUFFIX.length).trim();
+  } else if (source !== "slack" && !message.endsWith(AUTOMATED_SUFFIX)) {
     message = `${message.replace(/\s+$/g, "")}\n${AUTOMATED_SUFFIX}`;
   }
   if (!validateDraftComment(source, message).valid) {
@@ -1388,6 +1404,12 @@ function normalizeCodexSettings(values = {}, defaults = {}) {
 }
 
 function closeActionsFor(source, issueId, message) {
+  if (source === "slack") {
+    return [
+      { toolName: "slack_post_issue_message", args: { issueId: String(issueId), message } },
+      { toolName: "slack_close_issue", args: { issueId: String(issueId), message: CLOSED_MARKER } }
+    ];
+  }
   if (source === "plex") {
     return [
       { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message, dryRun: false, verbose: false } },
@@ -1405,6 +1427,11 @@ function closeActionsFor(source, issueId, message) {
 }
 
 function commentActionsFor(source, issueId, message) {
+  if (source === "slack") {
+    return [
+      { toolName: "slack_post_issue_message", args: { issueId: String(issueId), message } }
+    ];
+  }
   if (source === "plex") {
     return [
       { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message, dryRun: false, verbose: false } }
@@ -1420,6 +1447,12 @@ function commentActionsFor(source, issueId, message) {
 
 function directCloseActionsFor(source, issueId, comment = "") {
   const trimmed = String(comment || "").trim();
+  if (source === "slack") {
+    return [
+      ...(trimmed ? [{ toolName: "slack_post_issue_message", args: { issueId: String(issueId), message: trimmed } }] : []),
+      { toolName: "slack_close_issue", args: { issueId: String(issueId), message: CLOSED_MARKER } }
+    ];
+  }
   if (source === "plex") {
     return [
       ...(trimmed ? [{ toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: trimmed, dryRun: false, verbose: false } }] : []),
@@ -1437,6 +1470,11 @@ function directCloseActionsFor(source, issueId, comment = "") {
 }
 
 function reopenActionsFor(source, issueId) {
+  if (source === "slack") {
+    return [
+      { toolName: "slack_reopen_issue", args: { issueId: String(issueId), message: REOPENED_MARKER } }
+    ];
+  }
   if (source === "plex") {
     return [
       { toolName: "plex_add_reported_issue_comment", args: { issueId: String(issueId), message: REOPENED_MARKER, dryRun: false, verbose: false } }
@@ -1675,6 +1713,8 @@ export class MediaIssueAgent {
     this.diagnosticLogger = createDiagnosticLogger(config);
     this.activeRepairRuns = new Map();
     this.pollPromise = null;
+    this.slackService = options.slackService || null;
+    this.slackServiceFactory = options.slackServiceFactory || ((agent, slackConfig) => new SlackService(agent, slackConfig));
   }
 
   diagnostic(level, event, payload = {}) {
@@ -1779,6 +1819,7 @@ export class MediaIssueAgent {
     const records = [];
     const seen = new Set();
     let skip = 0;
+    let reachedEnd = false;
     for (let pageNumber = 0; pageNumber < MAX_ISSUE_POLL_PAGES; pageNumber += 1) {
       const listed = await this.client.callTool("plex_reported_issues", {
         status: "all",
@@ -1798,14 +1839,25 @@ export class MediaIssueAgent {
         }
       }
       if (page.length < ISSUE_POLL_PAGE_SIZE) {
-        return records;
+        reachedEnd = true;
+        break;
       }
       if (added === 0) {
         throw new Error(`Issue polling pagination did not advance at offset ${skip}; refusing to publish a truncated snapshot.`);
       }
       skip += ISSUE_POLL_PAGE_SIZE;
     }
-    throw new Error(`Issue polling exceeded ${MAX_ISSUE_POLL_PAGES * ISSUE_POLL_PAGE_SIZE} records; refusing to publish a truncated snapshot.`);
+    if (!reachedEnd) {
+      throw new Error(`Issue polling exceeded ${MAX_ISSUE_POLL_PAGES * ISSUE_POLL_PAGE_SIZE} records; refusing to publish a truncated snapshot.`);
+    }
+    for (const record of listSlackIssueRecords(this.config.dbPath)) {
+      const key = issueIdentity(record);
+      if (!seen.has(key)) {
+        seen.add(key);
+        records.push(record);
+      }
+    }
+    return records;
   }
 
   async pollOnce() {
@@ -1826,9 +1878,14 @@ export class MediaIssueAgent {
     const records = await this.listReportedIssues();
     const previousEntries = lastSnapshotEntriesByIssue(this.config.dbPath);
     const detailFailures = [];
-    const queuedIssues = await issueQueue(records, this.client, {
+    let queuedIssues = await issueQueue(records, this.client, {
       onDetailError: failure => detailFailures.push(failure)
     });
+    const currentSlackIssues = listSlackIssueRecords(this.config.dbPath).map(normalizeIssue);
+    queuedIssues = sortIssueQueue([
+      ...queuedIssues.filter(issue => issue.source !== "slack"),
+      ...currentSlackIssues
+    ]);
     const reconciled = preserveLastKnownLifecycleForDetailFailures(
       queuedIssues,
       previousEntries
@@ -1893,17 +1950,18 @@ export class MediaIssueAgent {
   }
 
   async notifyNewOpenIssues(issues, snapshotId) {
-    if (!issues.length || !pushoverConfigured(this.config)) {
+    const notificationIssues = issues.filter(issue => issue.source !== "slack");
+    if (!notificationIssues.length || !pushoverConfigured(this.config)) {
       return;
     }
     this.diagnostic("info", "new_open_issue_notifications_started", {
       backend: "pushover",
       snapshotId,
-      issueCount: issues.length
+      issueCount: notificationIssues.length
     });
     let sentCount = 0;
     let failedCount = 0;
-    for (const issue of issues) {
+    for (const issue of notificationIssues) {
       try {
         await sendPushoverMessage(this.config, issue, this.fetch);
         sentCount += 1;
@@ -1927,7 +1985,7 @@ export class MediaIssueAgent {
     this.diagnostic("info", "new_open_issue_notifications_completed", {
       backend: "pushover",
       snapshotId,
-      issueCount: issues.length,
+      issueCount: notificationIssues.length,
       sentCount,
       failedCount
     });
@@ -2380,7 +2438,14 @@ export class MediaIssueAgent {
   status() {
     return {
       ...statusSummary(this.config.dbPath),
-      webEnabled: this.config.webEnabled
+      webEnabled: this.config.webEnabled,
+      slack: this.slackService?.publicStatus?.() || {
+        enabled: Boolean(this.config.slackEnabled),
+        connected: false,
+        channelId: this.config.slackEnabled ? this.config.slackChannelId : "",
+        queue: this.config.slackEnabled ? slackQueueStatus(this.config.dbPath) : null,
+        lastError: ""
+      }
     };
   }
 
@@ -2411,6 +2476,222 @@ export class MediaIssueAgent {
     return inspectCodexAuth(this.config.codexHome);
   }
 
+  async startSlack() {
+    if (!this.config.slackEnabled) {
+      return { enabled: false, connected: false };
+    }
+    if (!this.slackService) {
+      this.slackService = this.slackServiceFactory(this, this.config);
+    }
+    return this.slackService.start();
+  }
+
+  async stopSlack() {
+    if (this.slackService) {
+      await this.slackService.stop();
+    }
+  }
+
+  async classifySlackIntent(context, metadata = {}) {
+    await validateCodexHome(this.config.codexHome);
+    const settings = this.codexSettings().effective;
+    this.diagnostic("info", "slack_intent_classification_started", {
+      threadId: metadata.threadId || null,
+      slackIssueId: metadata.slackIssueId || null,
+      messageLength: String(context?.newestMessage || "").length,
+      historyCount: Array.isArray(context?.recentMessages) ? context.recentMessages.length : 0
+    });
+    const output = await runCodexSlackIntent(this.config, context, settings, {
+      onEvent: event => this.recordCodexTokenUsage(event, {
+        source: "slack_intent",
+        settings
+      })
+    });
+    const result = parseSlackIntentResult(output);
+    this.diagnostic("info", "slack_intent_classification_completed", {
+      threadId: metadata.threadId || null,
+      slackIssueId: metadata.slackIssueId || null,
+      intent: result.intent,
+      confidence: result.confidence
+    });
+    return result;
+  }
+
+  async slackPlexStatus() {
+    try {
+      const result = await this.client.callTool("plex_availability", {});
+      if (result?.configured === false) {
+        throw new Error("Plex is not configured in media-mcp.");
+      }
+      const activeStreamCount = Number(result?.activeStreamCount);
+      return {
+        up: result?.online === true,
+        activeStreamCount: Number.isFinite(activeStreamCount) ? activeStreamCount : 0
+      };
+    } catch (error) {
+      this.diagnostic("warn", "slack_plex_status_unavailable", {
+        error: error.message
+      });
+      throw new Error("Plex status could not be verified through media-mcp.");
+    }
+  }
+
+  latestSnapshotLocationFor(source, issueId) {
+    const snapshot = this.latestWithEntries();
+    if (!snapshot) {
+      return null;
+    }
+    const entry = snapshot.entries.find(candidate => (
+      candidate.source === source && String(candidate.issueId) === String(issueId)
+    ));
+    return entry ? { snapshotId: snapshot.id, index: entry.index || entry.idx } : null;
+  }
+
+  scheduleSlackPoll(reason, issueId) {
+    queueMicrotask(() => {
+      this.pollOnce().catch(error => {
+        this.diagnostic("error", "slack_issue_poll_failed", {
+          reason,
+          slackIssueId: issueId,
+          error: error.message
+        });
+      });
+    });
+  }
+
+  async onSlackIssueCreated(issue) {
+    const job = ensureJob(this.config.dbPath, "slack", String(issue.id));
+    recordAudit(this.config.dbPath, "slack_issue_created", sanitizeValue({
+      evidenceVersion: issue.evidenceVersion,
+      deliveryStatus: issue.deliveryStatus
+    }), job.id);
+    this.diagnostic("info", "slack_issue_created", {
+      jobId: job.id,
+      slackIssueId: issue.id,
+      evidenceVersion: issue.evidenceVersion
+    });
+    this.scheduleSlackPoll("issue_created", issue.id);
+    return { jobId: job.id };
+  }
+
+  async onSlackIssueEvidenceUpdated(issue) {
+    const job = ensureJob(this.config.dbPath, "slack", String(issue.id));
+    const busyStates = new Set([
+      "investigating",
+      "approved_for_execution",
+      "executing",
+      "drafting_comment",
+      "closing_issue",
+      "reopening_issue"
+    ]);
+    const currentJob = jobForId(this.config.dbPath, job.id);
+    const busy = Boolean(currentJob && busyStates.has(currentJob.state));
+    if (!busy) {
+      supersedeAllPendingApprovals(this.config.dbPath, job.id);
+    }
+    let currentIssue = issue;
+    if (issue.status === "closed" && currentJob?.state !== "reopening_issue") {
+      currentIssue = setSlackIssueStatus(this.config.dbPath, issue.id, "open");
+      queueSlackIssueMessage(
+        this.config.dbPath,
+        issue.id,
+        "issue_reopened_by_followup",
+        `slack-followup-reopened:${issue.id}:${issue.evidenceVersion}`,
+        REOPENED_MARKER
+      );
+    }
+    if (currentJob && !busy && currentJob.state !== "detected") {
+      transitionJob(this.config.dbPath, job.id, [currentJob.state], "detected");
+    }
+    recordAudit(this.config.dbPath, "slack_issue_evidence_updated", sanitizeValue({
+      evidenceVersion: currentIssue.evidenceVersion,
+      investigatedEvidenceVersion: currentIssue.investigatedEvidenceVersion,
+      deferredForBusyJob: busy
+    }), job.id);
+    this.diagnostic("info", "slack_issue_evidence_updated", {
+      jobId: job.id,
+      slackIssueId: issue.id,
+      evidenceVersion: currentIssue.evidenceVersion,
+      jobState: currentJob?.state || null,
+      deferredForBusyJob: busy
+    });
+    this.scheduleSlackPoll("evidence_updated", issue.id);
+    return { jobId: job.id };
+  }
+
+  queueSlackJobUpdate(jobId, kind, dedupeKey, message) {
+    const job = jobForId(this.config.dbPath, jobId);
+    if (!job || job.source !== "slack") {
+      return null;
+    }
+    try {
+      return queueSlackIssueMessage(
+        this.config.dbPath,
+        Number(job.issueId),
+        kind,
+        dedupeKey,
+        message
+      );
+    } catch (error) {
+      this.diagnostic("warn", "slack_job_update_queue_failed", {
+        jobId,
+        kind,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async refreshStaleSlackInvestigation(jobId, actor, reason) {
+    const details = this.jobDetails(jobId);
+    if (details?.job?.source !== "slack" || !details.investigation) {
+      return null;
+    }
+    const issue = slackIssueForId(this.config.dbPath, Number(details.job.issueId));
+    if (!issue) {
+      throw new Error(`Slack issue ${details.job.issueId} was not found`);
+    }
+    const investigatedVersion = Number(
+      details.investigation.evidence?.slackEvidenceVersion
+      || issue.investigatedEvidenceVersion
+      || 0
+    );
+    if (Number(issue.evidenceVersion || 0) <= investigatedVersion) {
+      return null;
+    }
+    supersedeAllPendingApprovals(this.config.dbPath, jobId);
+    const currentJob = jobForId(this.config.dbPath, jobId);
+    if (currentJob?.state !== "detected") {
+      transitionJob(this.config.dbPath, jobId, [currentJob.state], "detected");
+    }
+    this.diagnostic("info", "slack_stale_investigation_refresh_started", {
+      jobId,
+      slackIssueId: issue.id,
+      actor,
+      reason,
+      investigatedEvidenceVersion: investigatedVersion,
+      currentEvidenceVersion: issue.evidenceVersion
+    });
+    recordAudit(this.config.dbPath, "slack_stale_investigation_refresh_started", sanitizeValue({
+      actor,
+      reason,
+      investigatedEvidenceVersion: investigatedVersion,
+      currentEvidenceVersion: issue.evidenceVersion
+    }), jobId);
+    let location = this.latestSnapshotLocationFor("slack", issue.id);
+    if (!location) {
+      await this.pollOnce();
+      location = this.latestSnapshotLocationFor("slack", issue.id);
+    }
+    if (!location) {
+      throw new Error(`Slack issue ${issue.id} is not present in the latest triage snapshot`);
+    }
+    return this.investigate(location.snapshotId, location.index, {
+      force: true,
+      evidenceRefreshAttempt: 1
+    });
+  }
+
   async issueSummary(snapshotId, index) {
     await this.init();
     const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
@@ -2420,11 +2701,18 @@ export class MediaIssueAgent {
     let details = null;
     let detailError = "";
     try {
-      details = await this.client.callTool("plex_issue_details", {
-        source: entry.source,
-        issueId: entry.issueId,
-        verbose: false
-      });
+      if (entry.source === "slack") {
+        details = slackIssueDetails(this.config.dbPath, Number(entry.issueId));
+        if (!details) {
+          throw new Error(`Slack issue ${entry.issueId} was not found`);
+        }
+      } else {
+        details = await this.client.callTool("plex_issue_details", {
+          source: entry.source,
+          issueId: entry.issueId,
+          verbose: false
+        });
+      }
     } catch (error) {
       detailError = redactText(error.message);
       this.diagnostic("warn", "issue_summary_detail_unavailable", {
@@ -2447,6 +2735,12 @@ export class MediaIssueAgent {
       `Media/title: ${entry.mediaTitle || "(unknown)"}`,
       `Reporter: ${entry.reporter || "(unknown)"}`
     ];
+    if (entry.source === "slack") {
+      lines.push(`Slack delivery: ${details?.issue?.deliveryStatus || "unknown"}`);
+      if (details?.issue?.deliveryError) {
+        lines.push(`Slack delivery error: ${redactText(details.issue.deliveryError)}`);
+      }
+    }
     if (hasLocalHistory) {
       lines.push("", "Local workflow history:");
       if (jobDetail?.job) {
@@ -2469,6 +2763,9 @@ export class MediaIssueAgent {
       }
     } else {
       lines.push("", "No local workflow history exists. Summary derived from issue comments:", commentSummary(comments));
+    }
+    if (entry.source === "slack" && hasLocalHistory) {
+      lines.push("", "Archived Slack conversation:", commentSummary(comments));
     }
     if (detailError) {
       lines.push("", `Current source details were unavailable: ${detailError}`);
@@ -2513,12 +2810,43 @@ export class MediaIssueAgent {
     return this.diagnosticLogger.recent(options);
   }
 
+  async executeIssueAction(jobId, planned, action) {
+    if (!action.toolName.startsWith("slack_")) {
+      return this.client.callTool(action.toolName, action.args);
+    }
+    if (!["slack_post_issue_message", "slack_close_issue", "slack_reopen_issue"].includes(action.toolName)) {
+      throw new Error(`Unsupported Slack lifecycle action ${action.toolName}`);
+    }
+    const issueId = Number(action.args?.issueId);
+    if (!Number.isInteger(issueId) || issueId <= 0) {
+      throw new Error(`Slack action ${action.toolName} requires a valid issueId`);
+    }
+    const message = String(action.args?.message || "").trim();
+    if (!message) {
+      throw new Error(`Slack action ${action.toolName} requires a message`);
+    }
+    const outbox = queueSlackIssueMessage(
+      this.config.dbPath,
+      issueId,
+      action.toolName,
+      `job:${jobId}:planned-action:${planned.id}`,
+      message
+    );
+    const issue = slackIssueForId(this.config.dbPath, issueId);
+    return {
+      queued: true,
+      outboxId: outbox.id,
+      deliveryStatus: outbox.status,
+      issueStatus: issue?.status || "unknown"
+    };
+  }
+
   async runIssueActions(jobId, actions, auditPrefix, actor) {
     const results = [];
     for (const action of actions) {
       const planned = createPlannedAction(this.config.dbPath, jobId, action.toolName, action.args, auditPrefix);
       recordAudit(this.config.dbPath, `${auditPrefix}_action_started`, sanitizeValue({ actor, action: planned }), jobId);
-      const result = await this.client.callTool(action.toolName, action.args);
+      const result = await this.executeIssueAction(jobId, planned, action);
       const sanitized = sanitizeValue(result);
       markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
       results.push({ action: planned, result: sanitized });
@@ -2537,6 +2865,9 @@ export class MediaIssueAgent {
     }
     const message = validateOperatorComment(entry.source, comment);
     const job = ensureJob(this.config.dbPath, entry.source, entry.issueId);
+    const slackEvidenceVersion = entry.source === "slack"
+      ? Number(slackIssueForId(this.config.dbPath, Number(entry.issueId))?.evidenceVersion || 0)
+      : null;
     transitionJob(this.config.dbPath, job.id, [
       "detected",
       "queued_for_investigation",
@@ -2551,7 +2882,37 @@ export class MediaIssueAgent {
     try {
       const results = await this.runIssueActions(job.id, directCloseActionsFor(entry.source, entry.issueId, message), "direct_close", actor);
       transitionJob(this.config.dbPath, job.id, ["closing_issue"], "closed");
+      if (entry.source === "slack") {
+        setSlackIssueStatus(this.config.dbPath, Number(entry.issueId), "closed");
+        const latestIssue = slackIssueForId(this.config.dbPath, Number(entry.issueId));
+        if (Number(latestIssue?.evidenceVersion || 0) > slackEvidenceVersion) {
+          setSlackIssueStatus(this.config.dbPath, Number(entry.issueId), "open");
+          transitionJob(this.config.dbPath, job.id, ["closed"], "detected");
+          queueSlackIssueMessage(
+            this.config.dbPath,
+            Number(entry.issueId),
+            "issue_reopened_after_concurrent_followup",
+            `concurrent-followup-reopened:${entry.issueId}:${latestIssue.evidenceVersion}`,
+            REOPENED_MARKER
+          );
+          recordAudit(this.config.dbPath, "slack_close_reversed_for_new_evidence", sanitizeValue({
+            actor,
+            approvedEvidenceVersion: slackEvidenceVersion,
+            currentEvidenceVersion: latestIssue.evidenceVersion
+          }), job.id);
+          this.scheduleSlackPoll("concurrent_followup_after_direct_close", entry.issueId);
+          return {
+            jobId: job.id,
+            status: "open",
+            results,
+            reopenedForNewEvidence: true
+          };
+        }
+      }
       recordAudit(this.config.dbPath, "direct_close_completed", sanitizeValue({ actor, results }), job.id);
+      if (entry.source === "slack") {
+        this.scheduleSlackPoll("direct_close", entry.issueId);
+      }
       const improvementAnalysis = await this.captureResolvedWorkflowImprovements(job.id, actor, "direct_close");
       return {
         jobId: job.id,
@@ -2566,6 +2927,12 @@ export class MediaIssueAgent {
         transitionJob(this.config.dbPath, job.id, ["closing_issue"], "failed_retryable", messageText);
       }
       recordAudit(this.config.dbPath, "direct_close_failed", sanitizeValue({ actor, error: error.message }), job.id);
+      this.queueSlackJobUpdate(
+        job.id,
+        "closure_failed",
+        `closure-failed:${job.id}:${Date.now()}`,
+        "I could not complete the requested issue closure. The issue remains open for operator review."
+      );
       throw error;
     }
   }
@@ -2592,7 +2959,13 @@ export class MediaIssueAgent {
     try {
       const results = await this.runIssueActions(job.id, reopenActionsFor(entry.source, entry.issueId), "reopen", actor);
       transitionJob(this.config.dbPath, job.id, ["reopening_issue"], "detected");
+      if (entry.source === "slack") {
+        setSlackIssueStatus(this.config.dbPath, Number(entry.issueId), "open");
+      }
       recordAudit(this.config.dbPath, "reopen_completed", sanitizeValue({ actor, results }), job.id);
+      if (entry.source === "slack") {
+        this.scheduleSlackPoll("reopen", entry.issueId);
+      }
       return {
         jobId: job.id,
         status: "open",
@@ -2605,6 +2978,12 @@ export class MediaIssueAgent {
         transitionJob(this.config.dbPath, job.id, ["reopening_issue"], "failed_retryable", messageText);
       }
       recordAudit(this.config.dbPath, "reopen_failed", sanitizeValue({ actor, error: error.message }), job.id);
+      this.queueSlackJobUpdate(
+        job.id,
+        "reopen_failed",
+        `reopen-failed:${job.id}:${Date.now()}`,
+        "I could not complete the requested reopen operation. An operator needs to review the issue."
+      );
       throw error;
     }
   }
@@ -2626,7 +3005,14 @@ export class MediaIssueAgent {
       force: Boolean(options.force)
     });
     const cached = investigationForJob(this.config.dbPath, job.id);
-    if (cached && !options.force) {
+    const slackIssue = entry.source === "slack"
+      ? slackIssueForId(this.config.dbPath, Number(entry.issueId))
+      : null;
+    const slackEvidenceStale = Boolean(
+      slackIssue
+      && Number(cached?.evidence?.slackEvidenceVersion || 0) < Number(slackIssue.evidenceVersion || 0)
+    );
+    if (cached && !options.force && !slackEvidenceStale) {
       const approval = pendingApprovalForJob(this.config.dbPath, job.id);
       this.diagnostic("info", "investigation_cache_hit", {
         jobId: job.id,
@@ -2649,24 +3035,36 @@ export class MediaIssueAgent {
       "blocked_needs_human",
       "failed_retryable"
     ], "investigating");
-    if (options.force) {
+    if (options.force || slackEvidenceStale) {
       supersedePendingApprovals(this.config.dbPath, job.id);
     }
     let details;
     let diagnosis;
     try {
-      [details, diagnosis] = await Promise.all([
-        this.client.callTool("plex_issue_details", {
-          source: entry.source,
-          issueId: entry.issueId,
+      if (entry.source === "slack") {
+        details = slackIssueDetails(this.config.dbPath, Number(entry.issueId));
+        if (!details) {
+          throw new Error(`Slack issue ${entry.issueId} was not found`);
+        }
+        diagnosis = await this.client.callTool("media_diagnose_report", {
+          mediaTitle: details.issue.mediaTitle,
+          description: details.issue.description,
           verbose: false
-        }),
-        this.client.callTool("media_diagnose_issue", {
-          source: entry.source,
-          issueId: entry.issueId,
-          verbose: false
-        })
-      ]);
+        });
+      } else {
+        [details, diagnosis] = await Promise.all([
+          this.client.callTool("plex_issue_details", {
+            source: entry.source,
+            issueId: entry.issueId,
+            verbose: false
+          }),
+          this.client.callTool("media_diagnose_issue", {
+            source: entry.source,
+            issueId: entry.issueId,
+            verbose: false
+          })
+        ]);
+      }
     } catch (error) {
       const message = redactText(error.message);
       const evidence = sanitizeValue({ entry, collectionError: message });
@@ -2689,6 +3087,12 @@ export class MediaIssueAgent {
         error: error.message
       });
       recordAudit(this.config.dbPath, "investigation_evidence_collection_failed", sanitizeValue({ error: error.message }), job.id);
+      this.queueSlackJobUpdate(
+        job.id,
+        "investigation_failed",
+        `investigation-evidence-failed:${job.id}:${Date.now()}`,
+        "I could not collect enough media diagnostics to investigate this report. The issue remains open for retry."
+      );
       return {
         jobId: job.id,
         approvalId: null,
@@ -2699,15 +3103,18 @@ export class MediaIssueAgent {
         error: message
       };
     }
-    const ownerGuidance = trustedServerOwnerGuidance(
-      entry,
-      details,
-      this.config.serverOwnerReporterUsername
-    );
+    const ownerGuidance = entry.source === "slack"
+      ? ""
+      : trustedServerOwnerGuidance(
+        entry,
+        details,
+        this.config.serverOwnerReporterUsername
+      );
     const evidence = sanitizeValue({
       entry,
       details,
       diagnosis,
+      slackEvidenceVersion: slackIssue?.evidenceVersion || null,
       trustedReporterGuidance: ownerGuidance ? {
         source: "configured_server_owner_reporter",
         message: ownerGuidance
@@ -2759,7 +3166,55 @@ export class MediaIssueAgent {
       });
       transitionJob(this.config.dbPath, job.id, ["investigating"], "failed_retryable", message);
       recordAudit(this.config.dbPath, "codex_investigation_failed", sanitizeValue({ error: error.message }), job.id);
+      this.queueSlackJobUpdate(
+        job.id,
+        "investigation_failed",
+        `investigation-agent-failed:${job.id}:${Date.now()}`,
+        "The investigation could not be completed automatically. The issue remains open for retry."
+      );
       return { jobId: job.id, approvalId: null, summary, evidence, status: investigation.status, cached: false, error: message };
+    }
+    if (slackIssue) {
+      const latestIssue = slackIssueForId(this.config.dbPath, slackIssue.id);
+      if (latestIssue && Number(latestIssue.evidenceVersion) > Number(slackIssue.evidenceVersion)) {
+        const attempt = Number(options.evidenceRefreshAttempt || 0);
+        this.diagnostic("info", "slack_investigation_evidence_changed", {
+          jobId: job.id,
+          slackIssueId: slackIssue.id,
+          investigatedEvidenceVersion: slackIssue.evidenceVersion,
+          currentEvidenceVersion: latestIssue.evidenceVersion,
+          refreshAttempt: attempt + 1
+        });
+        recordAudit(this.config.dbPath, "slack_investigation_evidence_changed", sanitizeValue({
+          investigatedEvidenceVersion: slackIssue.evidenceVersion,
+          currentEvidenceVersion: latestIssue.evidenceVersion,
+          refreshAttempt: attempt + 1
+        }), job.id);
+        transitionJob(this.config.dbPath, job.id, ["investigating"], "detected");
+        if (attempt >= 2) {
+          const message = "Slack issue evidence kept changing during investigation. Retry after the conversation settles.";
+          upsertInvestigation(this.config.dbPath, job.id, {
+            status: "failed",
+            summary: message,
+            evidence,
+            error: message
+          });
+          transitionJob(this.config.dbPath, job.id, ["detected"], "failed_retryable", message);
+          return {
+            jobId: job.id,
+            approvalId: null,
+            summary: message,
+            evidence,
+            status: "failed",
+            cached: false,
+            error: message
+          };
+        }
+        return this.investigate(snapshotId, index, {
+          force: true,
+          evidenceRefreshAttempt: attempt + 1
+        });
+      }
     }
     supersedePendingApprovals(this.config.dbPath, job.id);
     const investigation = upsertInvestigation(this.config.dbPath, job.id, {
@@ -2784,6 +3239,9 @@ export class MediaIssueAgent {
       summaryLength: summary.length
     });
     recordAudit(this.config.dbPath, "investigation_ready", sanitizeValue({ approval, summary }), job.id);
+    if (slackIssue) {
+      markSlackIssueInvestigated(this.config.dbPath, slackIssue.id, slackIssue.evidenceVersion);
+    }
     return { jobId: job.id, approvalId: approval.id, summary, evidence, status: investigation.status, cached: false };
   }
 
@@ -2907,11 +3365,35 @@ export class MediaIssueAgent {
   }
 
   async approve(jobId, actor = "operator") {
+    const refreshedBeforeApproval = await this.refreshStaleSlackInvestigation(
+      jobId,
+      actor,
+      "new Slack thread evidence arrived before approval"
+    );
+    if (refreshedBeforeApproval) {
+      return {
+        ...refreshedBeforeApproval,
+        status: "awaiting_action_approval",
+        refreshedForNewEvidence: true
+      };
+    }
     const pending = pendingApprovalForJobAnyKind(this.config.dbPath, jobId);
     if (!pending) {
       throw new Error(`Job ${jobId} has no pending approval`);
     }
     if (pending.kind === "action") {
+      const refreshed = await this.refreshStaleSlackInvestigation(
+        jobId,
+        actor,
+        "new Slack thread evidence arrived before action approval"
+      );
+      if (refreshed) {
+        return {
+          ...refreshed,
+          status: "awaiting_action_approval",
+          refreshedForNewEvidence: true
+        };
+      }
       const { approvals } = transitionJobAndResolveApproval(
         this.config.dbPath,
         jobId,
@@ -2962,6 +3444,12 @@ export class MediaIssueAgent {
       actor
     });
     recordAudit(this.config.dbPath, "approval_rejected", sanitizeValue({ approvals, actor }), jobId);
+    this.queueSlackJobUpdate(
+      jobId,
+      "operator_review_required",
+      `approval-rejected:${jobId}:${pending.id}`,
+      "The proposed action was not approved. The issue remains open for operator review."
+    );
     return approvals;
   }
 
@@ -3098,6 +3586,12 @@ export class MediaIssueAgent {
       agentRunId: context.agentRunId || null,
       message
     }), jobId);
+    this.queueSlackJobUpdate(
+      jobId,
+      "repair_needs_review",
+      `repair-needs-review:${jobId}:${context.agentRunId || approval.id}`,
+      "The repair could not be completed automatically and needs operator review. The issue remains open."
+    );
     return {
       jobId,
       status: "awaiting_action_approval",
@@ -3152,6 +3646,12 @@ export class MediaIssueAgent {
         error: error.message,
         executionResult
       }), jobId);
+      this.queueSlackJobUpdate(
+        jobId,
+        "resolution_draft_failed",
+        `resolution-draft-failed:${jobId}:${Date.now()}`,
+        "Repair work completed, but the final issue update could not be prepared. The issue remains open for operator review."
+      );
       throw error;
     }
   }
@@ -3497,6 +3997,19 @@ export class MediaIssueAgent {
   }
 
   async draftResolutionApproval(jobId, actor, executionResult, context = {}) {
+    const refreshed = await this.refreshStaleSlackInvestigation(
+      jobId,
+      actor,
+      "new Slack thread evidence arrived while repair work was running"
+    );
+    if (refreshed) {
+      return {
+        ...refreshed,
+        status: "awaiting_action_approval",
+        refreshedForNewEvidence: true,
+        previousExecutionResult: executionResult
+      };
+    }
     const details = this.jobDetails(jobId);
     if (!details.investigation) {
       throw new Error(`Job ${jobId} has no investigation to draft from`);
@@ -3579,6 +4092,9 @@ export class MediaIssueAgent {
       message,
       closeIssue: executionResult?.closeRecommended !== false,
       characterCount: validation.characterCount,
+      slackEvidenceVersion: details.job.source === "slack"
+        ? Number(details.investigation.evidence?.slackEvidenceVersion || 0)
+        : null,
       executionResult
     });
     this.diagnostic("info", "resolution_draft_ready", {
@@ -3589,6 +4105,12 @@ export class MediaIssueAgent {
       closeIssue: approval.payload.closeIssue
     });
     recordAudit(this.config.dbPath, "resolution_draft_ready", sanitizeValue({ approval, characterCount: validation.characterCount, executionResult }), jobId);
+    this.queueSlackJobUpdate(
+      jobId,
+      "repair_result_ready",
+      `repair-result-ready:${jobId}:${approval.id}`,
+      "Repair work has completed and is awaiting final review before this issue is closed."
+    );
     return {
       ...context,
       jobId,
@@ -3601,6 +4123,18 @@ export class MediaIssueAgent {
   }
 
   async closeApprovedIssue(jobId, approval, actor) {
+    const refreshed = await this.refreshStaleSlackInvestigation(
+      jobId,
+      actor,
+      "new Slack thread evidence arrived before final resolution approval"
+    );
+    if (refreshed) {
+      return {
+        ...refreshed,
+        status: "awaiting_action_approval",
+        refreshedForNewEvidence: true
+      };
+    }
     transitionJob(this.config.dbPath, jobId, ["awaiting_resolution_approval", "failed_retryable"], "closing_issue");
     const { source, issueId, message, closeIssue = true } = approval.payload;
     const actions = closeIssue ? closeActionsFor(source, issueId, message) : commentActionsFor(source, issueId, message);
@@ -3628,7 +4162,7 @@ export class MediaIssueAgent {
           toolName: action.toolName
         });
         recordAudit(this.config.dbPath, "closing_action_started", sanitizeValue({ action: planned }), jobId);
-        const result = await this.client.callTool(action.toolName, action.args);
+        const result = await this.executeIssueAction(jobId, planned, action);
         const sanitized = sanitizeValue(result);
         markPlannedActionExecuted(this.config.dbPath, planned.id, sanitized, false);
         results.push({ action: planned, result: sanitized });
@@ -3647,6 +4181,42 @@ export class MediaIssueAgent {
         actor,
         note
       );
+      if (source === "slack" && closeIssue) {
+        setSlackIssueStatus(this.config.dbPath, Number(issueId), "closed");
+        const latestIssue = slackIssueForId(this.config.dbPath, Number(issueId));
+        const approvedEvidenceVersion = Number(approval.payload?.slackEvidenceVersion || 0);
+        if (Number(latestIssue?.evidenceVersion || 0) > approvedEvidenceVersion) {
+          setSlackIssueStatus(this.config.dbPath, Number(issueId), "open");
+          transitionJob(this.config.dbPath, jobId, ["closed"], "detected");
+          queueSlackIssueMessage(
+            this.config.dbPath,
+            Number(issueId),
+            "issue_reopened_after_concurrent_followup",
+            `concurrent-followup-reopened:${issueId}:${latestIssue.evidenceVersion}`,
+            REOPENED_MARKER
+          );
+          recordAudit(this.config.dbPath, "slack_close_reversed_for_new_evidence", sanitizeValue({
+            actor,
+            approvalId: approval.id,
+            approvedEvidenceVersion,
+            currentEvidenceVersion: latestIssue.evidenceVersion
+          }), jobId);
+          this.scheduleSlackPoll("concurrent_followup_after_approved_close", issueId);
+          const refreshed = await this.refreshStaleSlackInvestigation(
+            jobId,
+            actor,
+            "new Slack thread evidence arrived while final closure was running"
+          );
+          return {
+            ...(refreshed || {}),
+            jobId,
+            status: refreshed ? "awaiting_action_approval" : "detected",
+            approvals,
+            results,
+            reopenedForNewEvidence: true
+          };
+        }
+      }
       if (closeIssue) {
         this.diagnostic("info", "issue_closed", {
           jobId,
@@ -3664,6 +4234,9 @@ export class MediaIssueAgent {
         recordAudit(this.config.dbPath, "resolution_comment_posted_without_closure", sanitizeValue({ actor, results }), jobId);
       }
       recordAudit(this.config.dbPath, "approval_accepted", sanitizeValue({ approvalId: approval.id, kind: "resolution", actor }), jobId);
+      if (source === "slack") {
+        this.scheduleSlackPoll(closeIssue ? "approved_close" : "resolution_update", issueId);
+      }
       const improvementAnalysis = closeIssue
         ? await this.captureResolvedWorkflowImprovements(jobId, actor, "approved_resolution")
         : null;
@@ -3684,6 +4257,12 @@ export class MediaIssueAgent {
         completedActionCount: results.length
       });
       recordAudit(this.config.dbPath, "issue_close_failed", sanitizeValue({ actor, error: error.message, results }), jobId);
+      this.queueSlackJobUpdate(
+        jobId,
+        "closure_failed",
+        `approved-closure-failed:${jobId}:${approval.id}:${Date.now()}`,
+        "The approved resolution could not be delivered or closed. The issue remains open for operator review."
+      );
       throw error;
     }
   }
@@ -3724,10 +4303,15 @@ export class MediaIssueAgent {
 
   async serve(log = console.error) {
     await this.init();
+    await this.startSlack();
     if (this.config.webEnabled) {
       const { startWebServer } = await import("./web.js");
       await startWebServer(this, this.config, log);
     }
-    await this.pollLoop(log);
+    try {
+      await this.pollLoop(log);
+    } finally {
+      await this.stopSlack();
+    }
   }
 }

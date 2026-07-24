@@ -302,7 +302,8 @@ async function testIssueStateActionMatrix(browser) {
       { source: "seerr", issueId: "204", date: "2026-01-04T00:00:00Z", reporter: "Fixture", mediaTitle: "Resolution", status: "open", description: "Resolution issue" },
       { source: "seerr", issueId: "205", date: "2026-01-05T00:00:00Z", reporter: "Fixture", mediaTitle: "Closed", status: "open", description: "Closed issue" },
       { source: "seerr", issueId: "206", date: "2026-01-06T00:00:00Z", reporter: "Fixture", mediaTitle: "Terminal", status: "open", description: "Terminal repair issue" },
-      { source: "seerr", issueId: "207", date: "2026-01-07T00:00:00Z", reporter: "Fixture", mediaTitle: "Source closed, job stale", status: "resolved", description: "Resolved source row with a stale detected job.", lifecycle: "closed" }
+      { source: "seerr", issueId: "207", date: "2026-01-07T00:00:00Z", reporter: "Fixture", mediaTitle: "Source closed, job stale", status: "resolved", description: "Resolved source row with a stale detected job.", lifecycle: "closed" },
+      { source: "slack", issueId: "208", date: "2026-01-08T00:00:00Z", reporter: "Fixture", mediaTitle: "Slack report", status: "open", description: "Archived Slack issue fixture." }
     ];
     insertSnapshot(dbPath, issueTableMarkdown(entries), entries);
 
@@ -489,6 +490,9 @@ async function testIssueStateActionMatrix(browser) {
     await expect(row(page, 7)).toHaveClass(/issue-closed/);
     await expect(row(page, 7).getByRole("button", { name: "View summary" })).toBeVisible();
     await expect(row(page, 7).getByRole("button", { name: "Close" })).toHaveCount(0);
+    await expect(row(page, 8).locator(".source-pill")).toHaveText("slack");
+    await expect(row(page, 8).getByRole("button", { name: "Investigate" })).toBeVisible();
+    await expect(row(page, 8).getByRole("button", { name: "Close" })).toBeVisible();
     await expect(row(page, 5).getByRole("button", { name: "Learn" })).toBeVisible();
     await row(page, 5).getByRole("button", { name: "Learn" }).click();
     const learningActivity = page.locator(".activity-popup", { hasText: "Learning from resolved issue" });

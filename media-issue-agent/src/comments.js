@@ -12,7 +12,7 @@ export function validateDraftComment(source, message) {
   if (!text.trim()) {
     errors.push("Comment must not be empty.");
   }
-  if (!text.endsWith(AUTOMATED_SUFFIX)) {
+  if (source !== "slack" && !text.endsWith(AUTOMATED_SUFFIX)) {
     errors.push(`Comment must end with: ${AUTOMATED_SUFFIX}`);
   }
   const characterCount = countCharacters(text);

@@ -90,6 +90,7 @@ async function run() {
     }]],
     ["report-2", []]
   ]);
+  let plexAvailable = true;
 
   const mock = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
@@ -175,6 +176,9 @@ async function run() {
       });
     }
     if (req.method === "GET" && url.pathname === "/plex/status/sessions") {
+      if (!plexAvailable) {
+        return sendJson(res, 503, { error: "fixture Plex unavailable" });
+      }
       return sendJson(res, 200, {
         MediaContainer: {
           Metadata: [{
@@ -185,6 +189,24 @@ async function run() {
             User: { id: 10, username: "viewer", title: "Viewer One" },
             Player: { title: "Apple TV", product: "Plex for Apple TV", platform: "tvOS", state: "playing", local: false },
             TranscodeSession: { key: "transcode-1", videoDecision: "copy", audioDecision: "transcode" }
+          }]
+        }
+      });
+    }
+    if (req.method === "GET" && url.pathname === "/plex/hubs/search") {
+      assert.equal(url.searchParams.get("query"), "Example Movie");
+      return sendJson(res, 200, {
+        MediaContainer: {
+          Hub: [{
+            type: "movie",
+            Metadata: [{
+              ratingKey: "123",
+              type: "movie",
+              title: "Example Movie",
+              year: 2026,
+              librarySectionID: "1",
+              librarySectionTitle: "Movies"
+            }]
           }]
         }
       });
@@ -273,7 +295,15 @@ async function run() {
     const tools = await rpc("tools/list");
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("plex_add_reported_issue_comment"));
+    assert.ok(toolNames.has("plex_availability"));
     assert.equal(toolNames.has("plex_update_reported_issue_state"), false);
+
+    const availability = await tool("plex_availability");
+    assert.deepEqual(availability, {
+      configured: true,
+      online: true,
+      activeStreamCount: 1
+    });
 
     const listed = await tool("plex_reported_issues", { source: "plex", status: "open", take: 10 });
     assert.deepEqual(listed.sources, ["plex"]);
@@ -307,6 +337,15 @@ async function run() {
     assert.equal(diagnosis.suggestedActions[0].type, "plex_add_reported_issue_comment");
     assert.match(diagnosis.limitations[0], /do not expose/i);
 
+    const externalDiagnosis = await tool("media_diagnose_report", {
+      mediaTitle: "Example Movie",
+      description: "Playback stops after ten minutes."
+    });
+    assert.equal(externalDiagnosis.issue.source, "external_report");
+    assert.equal(externalDiagnosis.plexSearch.matches[0].ratingKey, "123");
+    assert.equal(externalDiagnosis.plex.metadata.title, "Example Movie");
+    assert.equal(externalDiagnosis.plex.activeSessions.length, 1);
+
     const beforeCommentMutations = graphqlCalls.filter(call => call.operationName === "createReportComment").length;
     const dryComment = await tool("plex_add_reported_issue_comment", {
       issueId: "report-1",
@@ -328,6 +367,13 @@ async function run() {
 
     assert.equal(graphqlCalls.some(call => /state|resolve|close|archive|delete|ignore/i.test(call.operationName)), false);
     assert.deepEqual(await stateDirEntries(), []);
+
+    plexAvailable = false;
+    assert.deepEqual(await tool("plex_availability"), {
+      configured: true,
+      online: false,
+      activeStreamCount: 0
+    });
   } finally {
     child.kill("SIGTERM");
     mock.close();
