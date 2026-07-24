@@ -208,6 +208,94 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS slack_threads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  root_ts TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'pending',
+  state TEXT NOT NULL DEFAULT 'active',
+  reporter_user_id TEXT,
+  reporter_name TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE(team_id, channel_id, root_ts)
+);
+
+CREATE TABLE IF NOT EXISTS slack_issues (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id INTEGER NOT NULL UNIQUE REFERENCES slack_threads(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'open',
+  media_title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  intent_confidence REAL NOT NULL DEFAULT 0,
+  evidence_version INTEGER NOT NULL DEFAULT 1,
+  investigated_evidence_version INTEGER NOT NULL DEFAULT 0,
+  delivery_status TEXT NOT NULL DEFAULT 'available',
+  delivery_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS slack_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id INTEGER REFERENCES slack_threads(id) ON DELETE SET NULL,
+  slack_issue_id INTEGER REFERENCES slack_issues(id) ON DELETE SET NULL,
+  direction TEXT NOT NULL,
+  event_id TEXT,
+  team_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  root_ts TEXT NOT NULL,
+  message_ts TEXT NOT NULL,
+  user_id TEXT,
+  user_name TEXT,
+  text TEXT NOT NULL,
+  delivery_status TEXT NOT NULL DEFAULT 'received',
+  evidence_applied_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE(team_id, channel_id, message_ts, direction)
+);
+
+CREATE TABLE IF NOT EXISTS slack_event_receipts (
+  event_id TEXT PRIMARY KEY,
+  message_key TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  message_id INTEGER NOT NULL REFERENCES slack_messages(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  error TEXT,
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  processed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS slack_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slack_issue_id INTEGER REFERENCES slack_issues(id) ON DELETE SET NULL,
+  thread_id INTEGER REFERENCES slack_threads(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT,
+  message TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  sent_ts TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS slack_rate_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_issue_log_events_issue
 ON issue_log_events(source, issue_id, timestamp, id);
 
@@ -240,11 +328,27 @@ ON agent_run_events(job_id, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_missing_mcp_items_job
 ON missing_mcp_items(job_id, dismissed_at, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_slack_event_receipts_queue
+ON slack_event_receipts(status, available_at, received_at);
+
+CREATE INDEX IF NOT EXISTS idx_slack_outbox_queue
+ON slack_outbox(status, available_at, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_slack_messages_thread
+ON slack_messages(thread_id, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_slack_rate_events_window
+ON slack_rate_events(team_id, user_id, kind, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_slack_rate_events_created
+ON slack_rate_events(created_at);
 `);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
   ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
   ensureColumn(dbPath, "agent_runs", "owner_started_at", "TEXT");
   ensureColumn(dbPath, "missing_mcp_items", "item_type", "TEXT NOT NULL DEFAULT 'mcp_capability'");
+  ensureColumn(dbPath, "slack_messages", "evidence_applied_at", "TEXT");
   sqliteExec(dbPath, `
 UPDATE agent_runs
 SET heartbeat_at = COALESCE(heartbeat_at, started_at)
@@ -261,6 +365,7 @@ UPDATE jobs SET state = 'executing' WHERE state = 'waiting_for_plex_verification
 UPDATE jobs SET state = 'awaiting_resolution_approval' WHERE state = 'awaiting_comment_approval';
 UPDATE jobs SET state = 'closing_issue' WHERE state = 'posting_comment';
 UPDATE jobs SET state = 'blocked_needs_human' WHERE state = 'dry_run_complete';
+
 `);
 }
 
@@ -1379,6 +1484,749 @@ export function issueLogRecords(dbPath, source, issueId) {
     }
   }
   return records;
+}
+
+function slackIssueFromRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: Number(row.id),
+    threadId: Number(row.threadId),
+    teamId: row.teamId,
+    channelId: row.channelId,
+    rootTs: row.rootTs,
+    reporterUserId: row.reporterUserId || "",
+    reporterName: row.reporterName || "",
+    status: row.status,
+    mediaTitle: row.mediaTitle,
+    description: row.description,
+    intentConfidence: Number(row.intentConfidence || 0),
+    evidenceVersion: Number(row.evidenceVersion || 1),
+    investigatedEvidenceVersion: Number(row.investigatedEvidenceVersion || 0),
+    deliveryStatus: row.deliveryStatus,
+    deliveryError: row.deliveryError || "",
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    closedAt: row.closedAt || null
+  };
+}
+
+const SLACK_ISSUE_SELECT = `
+SELECT
+  slack_issues.id,
+  slack_issues.thread_id AS threadId,
+  slack_threads.team_id AS teamId,
+  slack_threads.channel_id AS channelId,
+  slack_threads.root_ts AS rootTs,
+  slack_threads.reporter_user_id AS reporterUserId,
+  slack_threads.reporter_name AS reporterName,
+  slack_issues.status,
+  slack_issues.media_title AS mediaTitle,
+  slack_issues.description,
+  slack_issues.intent_confidence AS intentConfidence,
+  slack_issues.evidence_version AS evidenceVersion,
+  slack_issues.investigated_evidence_version AS investigatedEvidenceVersion,
+  slack_issues.delivery_status AS deliveryStatus,
+  slack_issues.delivery_error AS deliveryError,
+  slack_issues.created_at AS createdAt,
+  slack_issues.updated_at AS updatedAt,
+  slack_issues.closed_at AS closedAt
+FROM slack_issues
+JOIN slack_threads ON slack_threads.id = slack_issues.thread_id
+`;
+
+export function archiveSlackInbound(dbPath, event) {
+  return sqliteTransaction(dbPath, database => {
+    database.prepare(sql`
+INSERT INTO slack_threads (
+  team_id, channel_id, root_ts, reporter_user_id, reporter_name
+) VALUES (
+  ${event.teamId},
+  ${event.channelId},
+  ${event.rootTs},
+  ${event.userId || ""},
+  ${event.userName || ""}
+)
+ON CONFLICT(team_id, channel_id, root_ts) DO UPDATE SET
+  reporter_name = CASE
+    WHEN excluded.reporter_name <> '' THEN excluded.reporter_name
+    ELSE slack_threads.reporter_name
+  END,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`).run();
+    const thread = database.prepare(sql`
+SELECT id FROM slack_threads
+WHERE team_id = ${event.teamId}
+  AND channel_id = ${event.channelId}
+  AND root_ts = ${event.rootTs}
+LIMIT 1;
+`).get();
+    const existingIssue = database.prepare(sql`
+SELECT id FROM slack_issues WHERE thread_id = ${thread.id} LIMIT 1;
+`).get();
+    database.prepare(sql`
+INSERT OR IGNORE INTO slack_messages (
+  thread_id, slack_issue_id, direction, event_id, team_id, channel_id, root_ts, message_ts,
+  user_id, user_name, text, delivery_status
+) VALUES (
+  ${thread.id},
+  ${existingIssue?.id || null},
+  'inbound',
+  ${event.eventId},
+  ${event.teamId},
+  ${event.channelId},
+  ${event.rootTs},
+  ${event.messageTs},
+  ${event.userId || ""},
+  ${event.userName || ""},
+  ${event.text},
+  'received'
+);
+`).run();
+    const message = database.prepare(sql`
+SELECT id FROM slack_messages
+WHERE team_id = ${event.teamId}
+  AND channel_id = ${event.channelId}
+  AND message_ts = ${event.messageTs}
+  AND direction = 'inbound'
+LIMIT 1;
+`).get();
+    const inserted = database.prepare(sql`
+INSERT OR IGNORE INTO slack_event_receipts (
+  event_id, message_key, event_type, message_id
+) VALUES (
+  ${event.eventId},
+  ${event.messageKey},
+  ${event.eventType},
+  ${message.id}
+);
+`).run();
+    database.prepare(`
+DELETE FROM slack_event_receipts
+WHERE processed_at IS NOT NULL
+  AND processed_at < datetime('now', '-30 days');
+`).run();
+    database.prepare(`
+DELETE FROM slack_outbox
+WHERE status IN ('sent', 'failed')
+  AND updated_at < datetime('now', '-30 days');
+`).run();
+    return {
+      queued: inserted.changes > 0,
+      duplicate: inserted.changes === 0,
+      threadId: Number(thread.id),
+      messageId: Number(message.id)
+    };
+  });
+}
+
+export function recoverSlackQueues(dbPath) {
+  sqliteExec(dbPath, `
+UPDATE slack_event_receipts
+SET status = 'pending',
+    available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    error = CASE
+      WHEN error IS NULL OR error = '' THEN 'Recovered after media issue agent restart.'
+      ELSE error
+    END
+WHERE status = 'processing';
+
+UPDATE slack_outbox
+SET status = 'pending',
+    available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    error = CASE
+      WHEN error IS NULL OR error = '' THEN 'Recovered after media issue agent restart.'
+      ELSE error
+    END
+WHERE status = 'sending';
+`);
+}
+
+export function claimSlackInbound(dbPath) {
+  return sqliteTransaction(dbPath, database => {
+    const receipt = database.prepare(`
+SELECT event_id AS eventId
+FROM slack_event_receipts
+WHERE status = 'pending'
+  AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+ORDER BY received_at, event_id
+LIMIT 1;
+`).get();
+    if (!receipt) {
+      return null;
+    }
+    database.prepare(sql`
+UPDATE slack_event_receipts
+SET status = 'processing',
+    attempts = attempts + 1,
+    error = NULL
+WHERE event_id = ${receipt.eventId}
+  AND status = 'pending';
+`).run();
+    return database.prepare(sql`
+SELECT
+  slack_event_receipts.event_id AS eventId,
+  slack_event_receipts.event_type AS eventType,
+  slack_event_receipts.attempts,
+  slack_messages.id AS messageId,
+  slack_messages.thread_id AS threadId,
+  slack_messages.team_id AS teamId,
+  slack_messages.channel_id AS channelId,
+  slack_messages.root_ts AS rootTs,
+  slack_messages.message_ts AS messageTs,
+  slack_messages.user_id AS userId,
+  slack_messages.user_name AS userName,
+  slack_messages.text,
+  slack_threads.kind AS threadKind,
+  slack_threads.state AS threadState,
+  slack_issues.id AS slackIssueId,
+  slack_issues.status AS issueStatus,
+  slack_issues.evidence_version AS evidenceVersion
+FROM slack_event_receipts
+JOIN slack_messages ON slack_messages.id = slack_event_receipts.message_id
+JOIN slack_threads ON slack_threads.id = slack_messages.thread_id
+LEFT JOIN slack_issues ON slack_issues.thread_id = slack_threads.id
+WHERE slack_event_receipts.event_id = ${receipt.eventId}
+LIMIT 1;
+`).get();
+  });
+}
+
+export function completeSlackInbound(dbPath, eventId, status = "completed", error = null) {
+  sqliteExec(dbPath, sql`
+UPDATE slack_event_receipts
+SET status = ${status},
+    error = ${error},
+    processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE event_id = ${eventId};
+`);
+}
+
+export function retrySlackInbound(dbPath, eventId, error, delaySeconds = 5) {
+  const availableAt = new Date(Date.now() + Math.max(1, Number(delaySeconds || 1)) * 1000).toISOString();
+  sqliteExec(dbPath, sql`
+UPDATE slack_event_receipts
+SET status = 'pending',
+    error = ${error},
+    available_at = ${availableAt}
+WHERE event_id = ${eventId};
+`);
+}
+
+export function slackThreadForMessage(dbPath, teamId, channelId, rootTs) {
+  return sqliteExec(dbPath, sql`
+SELECT
+  slack_threads.id,
+  slack_threads.team_id AS teamId,
+  slack_threads.channel_id AS channelId,
+  slack_threads.root_ts AS rootTs,
+  slack_threads.kind,
+  slack_threads.state,
+  slack_threads.reporter_user_id AS reporterUserId,
+  slack_threads.reporter_name AS reporterName,
+  slack_issues.id AS slackIssueId
+FROM slack_threads
+LEFT JOIN slack_issues ON slack_issues.thread_id = slack_threads.id
+WHERE slack_threads.team_id = ${teamId}
+  AND slack_threads.channel_id = ${channelId}
+  AND slack_threads.root_ts = ${rootTs}
+LIMIT 1;
+`, { json: true })[0] || null;
+}
+
+export function createSlackIssue(dbPath, threadId, values) {
+  const issueId = sqliteTransaction(dbPath, database => {
+    database.prepare(sql`
+INSERT INTO slack_issues (
+  thread_id, media_title, description, intent_confidence
+) VALUES (
+  ${threadId},
+  ${values.mediaTitle},
+  ${values.description},
+  ${Number(values.confidence || 0)}
+)
+ON CONFLICT(thread_id) DO UPDATE SET
+  media_title = excluded.media_title,
+  description = excluded.description,
+  intent_confidence = excluded.intent_confidence,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`).run();
+    const issue = database.prepare(sql`
+SELECT id FROM slack_issues WHERE thread_id = ${threadId} LIMIT 1;
+`).get();
+    database.prepare(sql`
+UPDATE slack_threads
+SET kind = 'issue',
+    state = 'active',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${threadId};
+`).run();
+    database.prepare(sql`
+UPDATE slack_messages
+SET slack_issue_id = ${issue.id}
+WHERE thread_id = ${threadId};
+`).run();
+    return Number(issue.id);
+  });
+  return slackIssueForId(dbPath, issueId);
+}
+
+export function setSlackThreadKind(dbPath, threadId, kind, state = "active") {
+  sqliteExec(dbPath, sql`
+UPDATE slack_threads
+SET kind = ${kind},
+    state = ${state},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${threadId};
+`);
+}
+
+export function updateSlackReporterIdentity(dbPath, threadId, userId, userName) {
+  const name = String(userName || "").trim();
+  if (!name) {
+    return;
+  }
+  sqliteExec(dbPath, sql`
+UPDATE slack_threads
+SET reporter_name = ${name},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${threadId}
+  AND reporter_user_id = ${userId};
+UPDATE slack_messages
+SET user_name = ${name}
+WHERE thread_id = ${threadId}
+  AND user_id = ${userId}
+  AND (user_name IS NULL OR user_name = '');
+`);
+}
+
+export function slackIssueForId(dbPath, issueId) {
+  const row = sqliteExec(dbPath, `${SLACK_ISSUE_SELECT}
+WHERE slack_issues.id = ${Number(issueId)}
+LIMIT 1;`, { json: true })[0];
+  return slackIssueFromRow(row);
+}
+
+export function slackMessagesForThread(dbPath, threadId, limit = 200) {
+  const capped = Math.max(1, Math.min(Number(limit || 200), 1000));
+  return sqliteExec(dbPath, sql`
+SELECT
+  id,
+  direction,
+  event_id AS eventId,
+  team_id AS teamId,
+  channel_id AS channelId,
+  root_ts AS rootTs,
+  message_ts AS messageTs,
+  user_id AS userId,
+  user_name AS userName,
+  text,
+  delivery_status AS deliveryStatus,
+  created_at AS createdAt
+FROM slack_messages
+WHERE thread_id = ${threadId}
+ORDER BY created_at DESC, id DESC
+LIMIT ${capped};
+`, { json: true }).reverse();
+}
+
+export function slackIssueDetails(dbPath, issueId) {
+  const issue = slackIssueForId(dbPath, issueId);
+  if (!issue) {
+    return null;
+  }
+  const messages = slackMessagesForThread(dbPath, issue.threadId);
+  return {
+    issue: {
+      source: "slack",
+      id: String(issue.id),
+      status: issue.status,
+      lifecycle: issue.status,
+      isClosed: issue.status === "closed",
+      mediaTitle: issue.mediaTitle,
+      description: issue.description,
+      reporter: issue.reporterName || issue.reporterUserId,
+      reporterUserId: issue.reporterUserId,
+      createdAt: issue.createdAt,
+      updatedAt: issue.updatedAt,
+      evidenceVersion: issue.evidenceVersion,
+      investigatedEvidenceVersion: issue.investigatedEvidenceVersion,
+      deliveryStatus: issue.deliveryStatus,
+      deliveryError: issue.deliveryError,
+      comments: messages.map(message => ({
+        id: message.id,
+        direction: message.direction,
+        message: message.text,
+        userId: message.userId,
+        userName: message.userName,
+        createdAt: message.createdAt,
+        messageTs: message.messageTs
+      }))
+    },
+    conversation: messages
+  };
+}
+
+export function listSlackIssueRecords(dbPath) {
+  const rows = sqliteExec(dbPath, `${SLACK_ISSUE_SELECT}
+ORDER BY slack_issues.updated_at DESC, slack_issues.id DESC;`, { json: true });
+  return rows.map(row => {
+    const issue = slackIssueFromRow(row);
+    return {
+      source: "slack",
+      id: String(issue.id),
+      issueId: String(issue.id),
+      status: issue.status,
+      lifecycle: issue.status,
+      isClosed: issue.status === "closed",
+      mediaTitle: issue.mediaTitle,
+      description: issue.description,
+      reporter: issue.reporterName || issue.reporterUserId,
+      createdAt: issue.createdAt,
+      updatedAt: issue.updatedAt,
+      evidenceVersion: issue.evidenceVersion,
+      investigatedEvidenceVersion: issue.investigatedEvidenceVersion,
+      deliveryStatus: issue.deliveryStatus,
+      deliveryError: issue.deliveryError
+    };
+  });
+}
+
+export function applySlackIssueEvidenceMessage(dbPath, issueId, messageId) {
+  const applied = sqliteTransaction(dbPath, database => {
+    const message = database.prepare(sql`
+SELECT evidence_applied_at AS evidenceAppliedAt
+FROM slack_messages
+WHERE id = ${messageId}
+  AND slack_issue_id = ${issueId}
+  AND direction = 'inbound'
+LIMIT 1;
+`).get();
+    if (!message) {
+      throw new Error(`Slack message ${messageId} is not attached to issue ${issueId}`);
+    }
+    if (message.evidenceAppliedAt) {
+      return false;
+    }
+    database.prepare(sql`
+UPDATE slack_messages
+SET evidence_applied_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${messageId}
+  AND evidence_applied_at IS NULL;
+`).run();
+    database.prepare(sql`
+UPDATE slack_issues
+SET evidence_version = evidence_version + 1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${issueId};
+`).run();
+    return true;
+  });
+  return {
+    applied,
+    issue: slackIssueForId(dbPath, issueId)
+  };
+}
+
+export function markSlackIssueInvestigated(dbPath, issueId, evidenceVersion) {
+  sqliteExec(dbPath, sql`
+UPDATE slack_issues
+SET investigated_evidence_version = MAX(investigated_evidence_version, ${Number(evidenceVersion || 0)}),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${issueId};
+`);
+  return slackIssueForId(dbPath, issueId);
+}
+
+export function setSlackIssueStatus(dbPath, issueId, status) {
+  if (!["open", "closed"].includes(status)) {
+    throw new Error(`Unsupported Slack issue status ${status}`);
+  }
+  sqliteExec(dbPath, sql`
+UPDATE slack_issues
+SET status = ${status},
+    closed_at = CASE WHEN ${status} = 'closed' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${issueId};
+`);
+  return slackIssueForId(dbPath, issueId);
+}
+
+export function setSlackIssueDelivery(dbPath, issueId, status, error = null) {
+  sqliteExec(dbPath, sql`
+UPDATE slack_issues
+SET delivery_status = ${status},
+    delivery_error = ${error},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${issueId};
+`);
+  return slackIssueForId(dbPath, issueId);
+}
+
+export function enqueueSlackOutbox(dbPath, values) {
+  sqliteExec(dbPath, sql`
+INSERT INTO slack_outbox (
+  slack_issue_id, thread_id, kind, dedupe_key, channel_id, thread_ts, message
+) VALUES (
+  ${values.slackIssueId || null},
+  ${values.threadId || null},
+  ${values.kind},
+  ${values.dedupeKey},
+  ${values.channelId},
+  ${values.threadTs || null},
+  ${values.message}
+)
+ON CONFLICT(dedupe_key) DO NOTHING;
+`);
+  return sqliteExec(dbPath, sql`
+SELECT
+  id,
+  slack_issue_id AS slackIssueId,
+  thread_id AS threadId,
+  kind,
+  dedupe_key AS dedupeKey,
+  channel_id AS channelId,
+  thread_ts AS threadTs,
+  message,
+  status,
+  attempts,
+  available_at AS availableAt,
+  sent_ts AS sentTs,
+  error,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+FROM slack_outbox
+WHERE dedupe_key = ${values.dedupeKey}
+LIMIT 1;
+`, { json: true })[0];
+}
+
+export function claimSlackOutbox(dbPath) {
+  return sqliteTransaction(dbPath, database => {
+    const item = database.prepare(`
+SELECT id
+FROM slack_outbox
+WHERE status = 'pending'
+  AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+ORDER BY created_at, id
+LIMIT 1;
+`).get();
+    if (!item) {
+      return null;
+    }
+    database.prepare(sql`
+UPDATE slack_outbox
+SET status = 'sending',
+    attempts = attempts + 1,
+    error = NULL,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${item.id}
+  AND status = 'pending';
+`).run();
+    return database.prepare(sql`
+SELECT
+  slack_outbox.id,
+  slack_outbox.slack_issue_id AS slackIssueId,
+  slack_outbox.thread_id AS threadId,
+  slack_outbox.kind,
+  slack_outbox.dedupe_key AS dedupeKey,
+  slack_outbox.channel_id AS channelId,
+  slack_outbox.thread_ts AS threadTs,
+  slack_outbox.message,
+  slack_outbox.status,
+  slack_outbox.attempts,
+  slack_threads.team_id AS teamId,
+  slack_threads.root_ts AS rootTs
+FROM slack_outbox
+LEFT JOIN slack_threads ON slack_threads.id = slack_outbox.thread_id
+WHERE slack_outbox.id = ${item.id}
+LIMIT 1;
+`).get();
+  });
+}
+
+export function completeSlackOutbox(dbPath, outboxId, result) {
+  return sqliteTransaction(dbPath, database => {
+    const item = database.prepare(sql`
+SELECT
+  slack_outbox.*,
+  slack_threads.team_id AS team_id,
+  slack_threads.root_ts AS root_ts
+FROM slack_outbox
+LEFT JOIN slack_threads ON slack_threads.id = slack_outbox.thread_id
+WHERE slack_outbox.id = ${outboxId}
+LIMIT 1;
+`).get();
+    if (!item) {
+      return null;
+    }
+    const sentTs = String(result?.ts || "");
+    database.prepare(sql`
+UPDATE slack_outbox
+SET status = 'sent',
+    sent_ts = ${sentTs},
+    error = NULL,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${outboxId};
+`).run();
+    if (sentTs) {
+      database.prepare(sql`
+INSERT OR IGNORE INTO slack_messages (
+  thread_id, slack_issue_id, direction, team_id, channel_id, root_ts,
+  message_ts, user_id, user_name, text, delivery_status
+) VALUES (
+  ${item.thread_id},
+  ${item.slack_issue_id},
+  'outbound',
+  ${item.team_id || ""},
+  ${item.channel_id},
+  ${item.thread_ts || sentTs},
+  ${sentTs},
+  '',
+  'media-issue-agent',
+  ${item.message},
+  'sent'
+);
+`).run();
+    }
+    return { id: Number(item.id), sentTs };
+  });
+}
+
+export function retrySlackOutbox(dbPath, outboxId, error, delaySeconds) {
+  const availableAt = new Date(Date.now() + Math.max(1, Number(delaySeconds || 1)) * 1000).toISOString();
+  sqliteExec(dbPath, sql`
+UPDATE slack_outbox
+SET status = 'pending',
+    error = ${error},
+    available_at = ${availableAt},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${outboxId};
+`);
+}
+
+export function failSlackOutbox(dbPath, outboxId, error) {
+  sqliteExec(dbPath, sql`
+UPDATE slack_outbox
+SET status = 'failed',
+    error = ${error},
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE id = ${outboxId};
+`);
+}
+
+export function slackRateCounts(dbPath, teamId, userId, now = Date.now()) {
+  const tenMinutesAgo = new Date(now - 10 * 60 * 1000).toISOString();
+  const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+  const rows = sqliteExec(dbPath, sql`
+SELECT
+  SUM(CASE WHEN kind = 'interaction' AND user_id = ${userId} AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS userInteractions,
+  SUM(CASE WHEN kind = 'interaction' AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS workspaceInteractions,
+  SUM(CASE WHEN kind = 'classifier' AND user_id = ${userId} AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS userClassifiers,
+  SUM(CASE WHEN kind = 'classifier' AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS workspaceClassifiers,
+  MAX(CASE WHEN kind = 'rate_notice' AND user_id = ${userId} THEN created_at ELSE NULL END) AS lastRateNoticeAt
+FROM slack_rate_events
+WHERE team_id = ${teamId}
+  AND created_at >= ${oneHourAgo};
+`, { json: true })[0] || {};
+  return {
+    userInteractions: Number(rows.userInteractions || 0),
+    workspaceInteractions: Number(rows.workspaceInteractions || 0),
+    userClassifiers: Number(rows.userClassifiers || 0),
+    workspaceClassifiers: Number(rows.workspaceClassifiers || 0),
+    lastRateNoticeAt: rows.lastRateNoticeAt || null
+  };
+}
+
+export function consumeSlackRateLimit(dbPath, teamId, userId, limits, now = Date.now(), options = {}) {
+  const tenMinutesAgo = new Date(now - 10 * 60 * 1000).toISOString();
+  const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+  return sqliteTransaction(dbPath, database => {
+    database.prepare(`
+DELETE FROM slack_rate_events
+WHERE created_at < datetime('now', '-2 days');
+`).run();
+    const rows = database.prepare(sql`
+SELECT
+  SUM(CASE WHEN kind = 'interaction' AND user_id = ${userId} AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS userInteractions,
+  SUM(CASE WHEN kind = 'interaction' AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS workspaceInteractions,
+  SUM(CASE WHEN kind = 'classifier' AND user_id = ${userId} AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS userClassifiers,
+  SUM(CASE WHEN kind = 'classifier' AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS workspaceClassifiers,
+  MAX(CASE WHEN kind = 'rate_notice' AND user_id = ${userId} THEN created_at ELSE NULL END) AS lastRateNoticeAt
+FROM slack_rate_events
+WHERE team_id = ${teamId}
+  AND created_at >= ${oneHourAgo};
+`).get() || {};
+    const counts = {
+      userInteractions: Number(rows.userInteractions || 0),
+      workspaceInteractions: Number(rows.workspaceInteractions || 0),
+      userClassifiers: Number(rows.userClassifiers || 0),
+      workspaceClassifiers: Number(rows.workspaceClassifiers || 0),
+      lastRateNoticeAt: rows.lastRateNoticeAt || null
+    };
+    if (options.countInteraction !== false) {
+      if (counts.userInteractions >= Number(limits.userInteractionsPerTenMinutes)) {
+        return { allowed: false, reason: "user_interaction_limit", counts };
+      }
+      if (counts.workspaceInteractions >= Number(limits.workspaceInteractionsPerTenMinutes)) {
+        return { allowed: false, reason: "workspace_interaction_limit", counts };
+      }
+      database.prepare(sql`
+INSERT INTO slack_rate_events (team_id, user_id, kind)
+VALUES (${teamId}, ${userId}, 'interaction');
+`).run();
+    }
+    if (counts.userClassifiers >= Number(limits.userClassifiersPerHour)) {
+      return { allowed: false, reason: "user_classifier_limit", counts };
+    }
+    if (counts.workspaceClassifiers >= Number(limits.workspaceClassifiersPerHour)) {
+      return { allowed: false, reason: "workspace_classifier_limit", counts };
+    }
+    database.prepare(sql`
+INSERT INTO slack_rate_events (team_id, user_id, kind)
+VALUES (${teamId}, ${userId}, 'classifier');
+`).run();
+    return { allowed: true, reason: null, counts };
+  });
+}
+
+export function recordSlackRateEvent(dbPath, teamId, userId, kind) {
+  sqliteExec(dbPath, sql`
+INSERT INTO slack_rate_events (team_id, user_id, kind)
+VALUES (${teamId}, ${userId}, ${kind});
+DELETE FROM slack_rate_events
+WHERE created_at < datetime('now', '-2 days');
+`);
+}
+
+export function slackQueueStatus(dbPath) {
+  const inbound = sqliteExec(dbPath, `
+SELECT
+  SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+  SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+FROM slack_event_receipts;
+`, { json: true })[0] || {};
+  const outbound = sqliteExec(dbPath, `
+SELECT
+  SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+  SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) AS sending,
+  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+FROM slack_outbox;
+`, { json: true })[0] || {};
+  return {
+    inbound: {
+      pending: Number(inbound.pending || 0),
+      processing: Number(inbound.processing || 0),
+      failed: Number(inbound.failed || 0)
+    },
+    outbound: {
+      pending: Number(outbound.pending || 0),
+      sending: Number(outbound.sending || 0),
+      failed: Number(outbound.failed || 0)
+    }
+  };
 }
 
 export function statusSummary(dbPath) {

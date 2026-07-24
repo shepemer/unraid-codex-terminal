@@ -35,14 +35,25 @@ export function newOpenIssuePushoverPayload(config, issue) {
   return payload;
 }
 
-export async function sendPushoverMessage(config, issue, fetchImpl = globalThis.fetch) {
+export function slackMessagePushoverPayload(config, message = {}) {
+  const direction = message.direction === "outbound" ? "Sent" : "Received";
+  const context = message.channelKind === "dm" ? "Slack DM" : "Slack channel";
+  const issue = message.issueId ? ` - Issue ${message.issueId}` : "";
+  return {
+    token: config.pushoverAppToken,
+    user: config.pushoverUserKey,
+    title: compactText(`${direction} ${context}${issue}`, 250),
+    message: compactText(redactText(message.preview || "Message content unavailable."), 420)
+  };
+}
+
+export async function sendPushoverPayload(config, payload, fetchImpl = globalThis.fetch) {
   if (!pushoverConfigured(config)) {
     return { skipped: true, reason: "not_configured" };
   }
   if (typeof fetchImpl !== "function") {
     throw new Error("Pushover notifications require fetch support.");
   }
-  const payload = newOpenIssuePushoverPayload(config, issue);
   const response = await fetchImpl(PUSHOVER_MESSAGES_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -54,4 +65,12 @@ export async function sendPushoverMessage(config, issue, fetchImpl = globalThis.
     throw new Error(`Pushover notification failed with HTTP ${response.status}: ${redactText(text)}`);
   }
   return { skipped: false, status: response.status };
+}
+
+export async function sendPushoverMessage(config, issue, fetchImpl = globalThis.fetch) {
+  return sendPushoverPayload(config, newOpenIssuePushoverPayload(config, issue), fetchImpl);
+}
+
+export async function sendSlackPushoverMessage(config, message, fetchImpl = globalThis.fetch) {
+  return sendPushoverPayload(config, slackMessagePushoverPayload(config, message), fetchImpl);
 }

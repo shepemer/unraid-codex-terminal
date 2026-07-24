@@ -145,6 +145,10 @@ export async function loadConfig(env = process.env, options = {}) {
     issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, 200, 1),
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",
     pushoverUserKey: env.ISSUE_AGENT_PUSHOVER_USER_KEY || "",
+    slackEnabled: truthy(env.ISSUE_AGENT_SLACK_ENABLED, false),
+    slackAppToken: env.ISSUE_AGENT_SLACK_APP_TOKEN || "",
+    slackBotToken: env.ISSUE_AGENT_SLACK_BOT_TOKEN || "",
+    slackChannelId: String(env.ISSUE_AGENT_SLACK_CHANNEL_ID || "").trim(),
     codexHome: env.CODEX_HOME || "",
     codexBin: env.ISSUE_AGENT_CODEX_BIN || "codex",
     codexWorkspace: env.ISSUE_AGENT_CODEX_WORKSPACE || "/tmp/media-issue-agent-workspace",
@@ -166,6 +170,22 @@ export async function loadConfig(env = process.env, options = {}) {
 
   if (!config.mediaMcpBearerToken) {
     throw new Error("ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN is required.");
+  }
+  if (config.slackEnabled) {
+    const missing = [
+      ["ISSUE_AGENT_SLACK_APP_TOKEN", config.slackAppToken],
+      ["ISSUE_AGENT_SLACK_BOT_TOKEN", config.slackBotToken],
+      ["ISSUE_AGENT_SLACK_CHANNEL_ID", config.slackChannelId]
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length) {
+      throw new Error(`Slack is enabled but required configuration is missing: ${missing.join(", ")}.`);
+    }
+    if (!config.slackAppToken.startsWith("xapp-")) {
+      throw new Error("ISSUE_AGENT_SLACK_APP_TOKEN must be a Slack app-level token beginning with xapp-.");
+    }
+    if (!config.slackBotToken.startsWith("xoxb-")) {
+      throw new Error("ISSUE_AGENT_SLACK_BOT_TOKEN must be a Slack bot OAuth token beginning with xoxb-.");
+    }
   }
 
   if (options.requireCodexAuth !== false) {

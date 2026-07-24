@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import { jobDetails } from "../src/db.js";
+import { SlackService } from "../src/slack.js";
 import { startWebServer } from "../src/web.js";
 import { closeServer, createCodexHome, jsonRpcError, jsonRpcResult, readBody } from "./helpers.js";
 
@@ -166,6 +167,27 @@ async function startFakeMediaMcp() {
           ],
           suggestedActions: []
         };
+      } else if (toolName === "media_diagnose_report") {
+        result = {
+          issue: {
+            source: "external_report",
+            mediaTitle: args.mediaTitle,
+            description: args.description
+          },
+          plexSearch: {
+            configured: true,
+            matches: [{ ratingKey: "990001", type: "movie", title: args.mediaTitle }]
+          },
+          plex: { configured: true, activeSessions: [], activeSessionCount: 0 },
+          tautulli: { configured: false },
+          tracearr: { configured: false }
+        };
+      } else if (toolName === "plex_availability") {
+        result = {
+          configured: true,
+          online: true,
+          activeStreamCount: 2
+        };
       } else if (toolName === "seerr_add_issue_comment") {
         if (failCloseIssueIds.has(Number(args.issueId))) {
           const secretLike = ["Bearer", "sil-secret-token"].join(" ");
@@ -310,12 +332,18 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Autonomous approved media repair execution')) kind = 'repair-execution';",
     "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
     "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
+    "if (prompt.includes('Slack message intent classification.')) kind = 'slack-intent';",
     "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
     "  process.exit(42);",
     "}",
-    "if (kind === 'workflow-improvement') {",
+    "if (kind === 'slack-intent') {",
+    "  const result = prompt.includes('Is Plex online')",
+    "    ? { intent: 'plex_status', confidence: 0.99, mediaTitle: '', description: '', clarification: '' }",
+    "    : { intent: 'issue_report', confidence: 0.97, mediaTitle: 'SIL Slack Movie', description: 'Playback stops after ten minutes.', clarification: '' };",
+    "  process.stdout.write(`${JSON.stringify(result)}\\n`);",
+    "} else if (kind === 'workflow-improvement') {",
     "  const result = { summary: 'Learned one reusable SIL workflow improvement.', improvements: [{ dedupeKey: 'sil_verify_before_client_classification', title: 'Verify evidence before client-side classification', target: 'suggested_repair_steps', description: 'Require an evidence check before handing a client-side conclusion to the repair runner.', recommendedChange: 'Verify the reported condition before concluding that no server-side action is required.', rationale: 'Trusted operator steering corrected the initial repair direction.', issuePattern: 'Playback reports where the first investigation lacks decisive evidence.', implementationSignals: ['verify the reported condition before classification'], steeringEvidence: [{ sequence: 1, guidance: 'Treat this as a client-side app issue with no server-side action.', effect: 'Changed the approved repair direction.' }] }] };",
     "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
     "  if (outputPathIndex >= 0) await import('node:fs').then(fs => fs.writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result)));",
@@ -750,6 +778,151 @@ async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
   assert.equal(reopenedEntry.jobState, "detected");
 }
 
+async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
+  const posts = [];
+  const transport = {
+    status: () => ({ connected: true }),
+    async userName() {
+      return "SIL Slack Reporter";
+    },
+    async postMessage(item) {
+      posts.push({ ...item });
+      return { ts: `sil-slack-sent-${posts.length}` };
+    },
+    async stop() {}
+  };
+  const slackConfig = {
+    ...agent.config,
+    slackEnabled: true,
+    slackAppToken: "xapp-sil-fixture",
+    slackBotToken: "xoxb-sil-fixture",
+    slackChannelId: "C-SIL-ISSUES"
+  };
+  const service = new SlackService(agent, slackConfig, { transport });
+  service.botUserId = "B-SIL-BOT";
+  service.teamId = "T-SIL";
+  const issueEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-ISSUE",
+      team_id: "T-SIL",
+      event: {
+        type: "app_mention",
+        channel: "C-SIL-ISSUES",
+        ts: "100.000",
+        user: "U-SIL-REPORTER",
+        text: "<@B-SIL-BOT> SIL exact report text should remain archived."
+      }
+    },
+    event: {
+      type: "app_mention",
+      channel: "C-SIL-ISSUES",
+      ts: "100.000",
+      user: "U-SIL-REPORTER",
+      text: "<@B-SIL-BOT> SIL exact report text should remain archived."
+    }
+  };
+  const before = await codexInvocations(codexLogPath);
+  assert.deepEqual(await service.ingestEnvelope(issueEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
+  await agent.pollOnce();
+  assert.equal((await codexInvocations(codexLogPath)).length, before.length + 1);
+
+  let latest = await api(baseUrl, "/api/snapshot/latest");
+  const slackEntry = latest.snapshot.entries.find(entry => entry.source === "slack");
+  assert.ok(slackEntry);
+  assert.equal(slackEntry.mediaTitle, "SIL Slack Movie");
+  assert.doesNotMatch(JSON.stringify(slackEntry.raw), /SIL exact report text/);
+  const summary = await api(baseUrl, `/api/issues/${latest.snapshot.id}/${slackEntry.idx}/summary`);
+  assert.match(summary.summary, /SIL exact report text should remain archived/);
+
+  const investigated = await api(baseUrl, "/api/investigate", {
+    method: "POST",
+    body: JSON.stringify({ snapshotId: latest.snapshot.id, index: slackEntry.idx })
+  });
+  assert.equal(investigated.result.cached, false);
+  assert.ok(investigated.result.approvalId);
+  assert.equal(investigated.result.evidence.trustedReporterGuidance, null);
+  const followupEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-FOLLOWUP",
+      team_id: "T-SIL",
+      event: {
+        type: "message",
+        channel: "C-SIL-ISSUES",
+        thread_ts: "100.000",
+        ts: "100.100",
+        user: "U-SIL-REPORTER",
+        text: "The same failure also happens on a second player."
+      }
+    },
+    event: {
+      type: "message",
+      channel: "C-SIL-ISSUES",
+      thread_ts: "100.000",
+      ts: "100.100",
+      user: "U-SIL-REPORTER",
+      text: "The same failure also happens on a second player."
+    }
+  };
+  assert.deepEqual(await service.ingestEnvelope(followupEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
+  const afterFollowup = await api(baseUrl, `/api/jobs/${investigated.result.jobId}`);
+  assert.equal(afterFollowup.detail.job.state, "detected");
+  const refreshed = await api(baseUrl, "/api/investigate", {
+    method: "POST",
+    body: JSON.stringify({ snapshotId: latest.snapshot.id, index: slackEntry.idx })
+  });
+  assert.equal(refreshed.result.cached, false);
+  assert.notEqual(refreshed.result.approvalId, investigated.result.approvalId);
+
+  const resolution = await api(baseUrl, `/api/jobs/${refreshed.result.jobId}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ actor: "sil-operator" })
+  });
+  assert.equal(resolution.result.status, "awaiting_resolution_approval");
+  assert.doesNotMatch(resolution.result.message, /Automated response from Codex/);
+  const closed = await api(baseUrl, `/api/jobs/${refreshed.result.jobId}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ actor: "sil-operator" })
+  });
+  assert.equal(closed.result.status, "closed");
+
+  const statusEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-STATUS",
+      team_id: "T-SIL",
+      event: {
+        type: "app_mention",
+        channel: "C-SIL-ISSUES",
+        ts: "101.000",
+        user: "U-SIL-REPORTER",
+        text: "<@B-SIL-BOT> Is Plex online?"
+      }
+    },
+    event: {
+      type: "app_mention",
+      channel: "C-SIL-ISSUES",
+      ts: "101.000",
+      user: "U-SIL-REPORTER",
+      text: "<@B-SIL-BOT> Is Plex online?"
+    }
+  };
+  assert.deepEqual(await service.ingestEnvelope(statusEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
+  await service.sendPendingForTest();
+  const received = posts.find(post => post.kind === "issue_received");
+  const status = posts.find(post => post.kind === "plex_status");
+  assert.equal(received.threadTs, "100.000");
+  assert.equal(status.threadTs, null);
+  assert.equal(status.message, "<@U-SIL-REPORTER> Plex is online. 2 active streams.");
+  const resolutionPost = posts.find(post => post.kind === "slack_post_issue_message");
+  assert.ok(resolutionPost);
+  assert.doesNotMatch(resolutionPost.message, /Automated response from Codex/);
+  assert.ok(posts.some(post => post.kind === "slack_close_issue" && post.message === "Closed."));
+  latest = await api(baseUrl, "/api/snapshot/latest");
+  assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
+}
+
 async function run() {
   const root = await tempDir();
   const oldCodexLog = process.env.SIL_CODEX_LOG;
@@ -772,6 +945,7 @@ async function run() {
       ISSUE_AGENT_CODEX_ENV_ALLOWLIST: "SIL_CODEX_LOG",
       ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS: "10000",
       ISSUE_AGENT_POLL_INTERVAL_SECONDS: "30",
+      ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: "SIL Slack Reporter",
       ISSUE_AGENT_WEB_HOST: "127.0.0.1",
       ISSUE_AGENT_WEB_PORT: "6983",
       ISSUE_AGENT_WEB_USERNAME: WEB_USERNAME,
@@ -794,6 +968,7 @@ async function run() {
     await assertClosureFailurePath(baseUrl, fakeMcp, snapshotId);
     await assertCodexFailurePath(baseUrl, snapshotId);
     await assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId);
+    await assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath);
   } finally {
     if (oldCodexLog === undefined) {
       delete process.env.SIL_CODEX_LOG;

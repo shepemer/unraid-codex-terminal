@@ -63,6 +63,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return 0;
   }
   if (command === "web") {
+    await agent.startSlack();
     const { startWebServer } = await import("./web.js");
     await startWebServer(agent, config);
     await new Promise(() => {});

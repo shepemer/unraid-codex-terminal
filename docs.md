@@ -264,7 +264,7 @@ archive-tools-check --downloads-dir /mnt/unraid/downloads
 
 ## Optional Media Issue Agent
 
-`media-issue-agent` is a separate worker for user-reported media issues. It periodically reconciles both Plex-native reports and Seerr-family issues through `media-mcp`, writes a GitHub-flavored Markdown table with stable numeric indexes, serves a password-protected Web UI, and stores only automation bookkeeping in SQLite.
+`media-issue-agent` is a separate worker for user-reported media issues. It periodically reconciles Plex-native reports, Seerr-family issues, and locally archived Slack reports, writes a GitHub-flavored Markdown table with stable numeric indexes, serves a password-protected Web UI, and stores automation bookkeeping in SQLite.
 
 Important behavior:
 
@@ -285,6 +285,26 @@ Important behavior:
 - Final resolution approval posts the drafted comment, posts the exact `Closed.` marker, and resolves Seerr-family issues when applicable. These final closure actions run live after approval.
 - Mutating media repairs are performed by the approved autonomous Codex runner through `media-mcp`; final reporter comments and issue closure still require explicit approval in the issue agent.
 - Plex-native final comments must be 300 characters or fewer and automated comments must end with `Automated response from Codex.`
+- Slack responses do not use the `Automated response from Codex.` suffix because the bot identity already makes automation explicit.
+
+### Optional Slack bot
+
+The Slack integration uses Socket Mode, so it does not expose a public HTTP webhook. Create a Slack app from `media-issue-agent/slack-app-manifest.yml`, install it to the workspace, and create an app-level token with the `connections:write` scope. Configure:
+
+- `ISSUE_AGENT_SLACK_ENABLED=true`
+- `ISSUE_AGENT_SLACK_APP_TOKEN` with the secret `xapp-` app-level token
+- `ISSUE_AGENT_SLACK_BOT_TOKEN` with the secret `xoxb-` bot OAuth token
+- `ISSUE_AGENT_SLACK_CHANNEL_ID` with the ID of one public issue-report channel
+
+The manifest requests `app_mention`, `message.channels`, and `message.im` events. The configured channel must be public and must not be a Slack Connect or organization-shared channel. The process ignores ordinary channel traffic: in that channel it accepts direct app mentions and human replies inside bot-owned issue threads; in direct messages it accepts human messages from the authenticated workspace. It ignores bot messages, message subtypes, external-workspace users, other channels, and untracked channel threads. The bot joins the configured public channel at startup when needed.
+
+Every accepted message is classified by local Codex using ChatGPT auth. The classifier is tool-free and treats all Slack text as untrusted data. Slack messages never inherit `ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME` trust, even when a Slack display name matches that configured reporter. A confident, concrete report creates a normal `slack` issue in the triage queue; an ambiguous report receives a clarification request. Plex availability requests return only online/offline state and active stream count. Channel status responses are top-level and mention the requester, and DM status responses are top-level. All other bot responses and lifecycle updates stay in the originating thread.
+
+Exact inbound and outbound Slack text is archived in SQLite so old issue history survives Slack retention or deletion. General issue-list and snapshot APIs do not include the verbatim archive; authenticated issue detail and investigation evidence can use it. If Slack reports that an old thread is missing, archived history remains available and delivery is marked unavailable without creating a replacement thread or DM.
+
+Hardcoded abuse guards limit each user to 12 accepted interactions per 10 minutes and 5 Codex classifications per hour. Workspace limits are 60 interactions per 10 minutes and 30 classifications per hour, with at most two concurrent classifiers and 20 queued messages. Repeated rate-limit notices are suppressed for five minutes. These limits intentionally cannot be relaxed through untrusted chat input.
+
+When Pushover is configured, each accepted inbound Slack message and each successfully sent bot message generates a redacted, truncated Pushover preview. New Slack issues do not generate a second generic new-issue notification. Slack app and bot tokens are secrets: never commit, log, paste, or place them in issue reports.
 
 The Web UI is the primary approval surface. The CLI remains available for the same operations:
 
