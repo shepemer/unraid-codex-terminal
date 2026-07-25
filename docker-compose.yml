@@ -205,6 +205,7 @@ services:
       ISSUE_AGENT_SLACK_APP_TOKEN: ${ISSUE_AGENT_SLACK_APP_TOKEN:-}
       ISSUE_AGENT_SLACK_BOT_TOKEN: ${ISSUE_AGENT_SLACK_BOT_TOKEN:-}
       ISSUE_AGENT_SLACK_CHANNEL_ID: ${ISSUE_AGENT_SLACK_CHANNEL_ID:-}
+      ISSUE_AGENT_OPENAI_MODERATION_API_KEY: ${ISSUE_AGENT_OPENAI_MODERATION_API_KEY:-}
     volumes:
       - ${ISSUE_AGENT_STATE_DIR:-./data/media-issue-agent/state}:/state:rw
       - ${ISSUE_AGENT_CODEX_HOME:-./data/media-issue-agent/codex}:/codex-home:rw

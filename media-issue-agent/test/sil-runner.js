@@ -847,9 +847,22 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
     slackEnabled: true,
     slackAppToken: "xapp-sil-fixture",
     slackBotToken: "xoxb-sil-fixture",
-    slackChannelId: "C-SIL-ISSUES"
+    slackChannelId: "C-SIL-ISSUES",
+    slackModerationApiKey: "sk-sil-moderation-fixture"
   };
-  const service = new SlackService(agent, slackConfig, { transport });
+  const moderationClient = {
+    async moderate() {
+      return {
+        id: "modr-sil-fixture",
+        model: "omni-moderation-latest",
+        flagged: false,
+        categories: {},
+        categoryScores: {},
+        latencyMs: 1
+      };
+    }
+  };
+  const service = new SlackService(agent, slackConfig, { transport, moderationClient });
   service.botUserId = "B-SIL-BOT";
   service.teamId = "T-SIL";
   const tokensBefore = agent.status().tokenUsage.totalTokens;

@@ -2384,14 +2384,20 @@ function testRepairCodexArgs() {
 function testCodexEnvAndPromptHardening() {
   const previousSecret = process.env.MEDIA_ISSUE_AGENT_SHOULD_NOT_LEAK;
   const previousAllowed = process.env.MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE;
+  const previousModerationKey = process.env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY;
   process.env.MEDIA_ISSUE_AGENT_SHOULD_NOT_LEAK = "fixture-secret";
   process.env.MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE = "fixture-allowed";
+  process.env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY = "sk-fixture-moderation";
   try {
     const env = buildCodexSubprocessEnv({
       codexHome: "/codex-home",
-      codexEnvAllowlist: ["MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE"]
+      codexEnvAllowlist: [
+        "MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE",
+        "ISSUE_AGENT_OPENAI_MODERATION_API_KEY"
+      ]
     }, {
-      ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token"
+      ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
+      ISSUE_AGENT_OPENAI_MODERATION_API_KEY: "sk-extra-fixture-moderation"
     });
     assert.equal(env.CODEX_HOME, "/codex-home");
     assert.equal(env.MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE, "fixture-allowed");
@@ -2399,6 +2405,7 @@ function testCodexEnvAndPromptHardening() {
     assert.equal(env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN, "fixture-token");
     assert.equal(env.OPENAI_API_KEY, undefined);
     assert.equal(env.CODEX_API_KEY, undefined);
+    assert.equal(env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY, undefined);
   } finally {
     if (previousSecret === undefined) {
       delete process.env.MEDIA_ISSUE_AGENT_SHOULD_NOT_LEAK;
@@ -2409,6 +2416,11 @@ function testCodexEnvAndPromptHardening() {
       delete process.env.MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE;
     } else {
       process.env.MEDIA_ISSUE_AGENT_ALLOWED_FIXTURE = previousAllowed;
+    }
+    if (previousModerationKey === undefined) {
+      delete process.env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY;
+    } else {
+      process.env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY = previousModerationKey;
     }
   }
 
@@ -2813,7 +2825,7 @@ async function testAuthConfig() {
       CODEX_HOME: codexHome,
       OPENAI_API_KEY: "sk-fixture"
     }),
-    /refuses OpenAI API key/
+    /refuses generic OpenAI API key/
   );
   await assert.rejects(
     () => loadConfig({

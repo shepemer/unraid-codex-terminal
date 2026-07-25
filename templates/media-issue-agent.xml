@@ -45,4 +45,5 @@
   <Config Name="Slack App Token" Target="ISSUE_AGENT_SLACK_APP_TOKEN" Default="" Mode="" Description="Secret Slack app-level Socket Mode token beginning with xapp-. Create it with connections:write." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Slack Bot Token" Target="ISSUE_AGENT_SLACK_BOT_TOKEN" Default="" Mode="" Description="Secret Slack bot OAuth token beginning with xoxb-." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Slack Channel ID" Target="ISSUE_AGENT_SLACK_CHANNEL_ID" Default="" Mode="" Description="ID of the one public Slack channel where app mentions and tracked issue-thread replies are accepted." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Slack Moderation API Key" Target="ISSUE_AGENT_OPENAI_MODERATION_API_KEY" Default="" Mode="" Description="Restricted OpenAI Platform API key used only with the free omni-moderation endpoint. Required when Slack is enabled and never passed to Codex or media-mcp." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 </Container>
