@@ -131,6 +131,7 @@ async function startFakeMediaMcp() {
               { name: "bazarr_download_movie_subtitles_for_plex", description: "Download movie subtitles for one Plex rating key." },
               { name: "plex_refresh_metadata", description: "Refresh one Plex rating key." },
               { name: "plex_verify_subtitle_track", description: "Verify a subtitle track by language." },
+              { name: "media_public_library_summary", description: "Return privacy-safe aggregate media library counts." },
               { name: "seerr_search_media", description: "Search for movies and television shows." },
               { name: "seerr_request_media", description: "Submit an exact media request." },
               { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." }
@@ -189,6 +190,27 @@ async function startFakeMediaMcp() {
           configured: true,
           online: true,
           activeStreamCount: 2
+        };
+      } else if (toolName === "media_public_library_summary") {
+        result = {
+          tv: {
+            configured: true,
+            available: true,
+            seriesCount: 42,
+            seasonCount: 90,
+            episodeFileCount: 800,
+            missingEpisodeCount: 4,
+            sizeOnDiskBytes: 2_000_000_000
+          },
+          movies: {
+            configured: true,
+            available: true,
+            movieCount: 100,
+            movieFileCount: 98,
+            missingMovieCount: 2,
+            sizeOnDiskBytes: 4_000_000_000
+          },
+          totalSizeOnDiskBytes: 6_000_000_000
         };
       } else if (toolName === "seerr_search_media") {
         result = {
@@ -361,7 +383,9 @@ async function createFakeCodexBin(root, logPath) {
     "  process.exit(42);",
     "}",
     "if (kind === 'slack-intent') {",
-    "  const result = prompt.includes('Is Plex online')",
+    "  const result = prompt.includes('How many shows are managed')",
+    "    ? { intent: 'media_info', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, queryType: 'library_summary', service: '', socialTone: 'neutral', responseTopic: 'other', response: '' }",
+    "    : prompt.includes('Is Plex online')",
     "    ? { intent: 'plex_status', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
     "    : prompt.includes('request SIL Request Movie')",
     "      ? { intent: 'media_request', confidence: 0.99, mediaTitle: 'SIL Request Movie', description: '', clarification: '', mediaType: 'movie', year: 2025, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
@@ -971,6 +995,29 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   assert.deepEqual(await service.ingestEnvelope(statusEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
 
+  const mediaInfoEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-MEDIA-INFO",
+      team_id: "T-SIL",
+      event: {
+        type: "app_mention",
+        channel: "C-SIL-ISSUES",
+        ts: "101.500",
+        user: "U-SIL-REPORTER",
+        text: "<@B-SIL-BOT> How many shows are managed?"
+      }
+    },
+    event: {
+      type: "app_mention",
+      channel: "C-SIL-ISSUES",
+      ts: "101.500",
+      user: "U-SIL-REPORTER",
+      text: "<@B-SIL-BOT> How many shows are managed?"
+    }
+  };
+  assert.deepEqual(await service.ingestEnvelope(mediaInfoEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
+
   const requestEnvelope = {
     body: {
       event_id: "EV-SIL-SLACK-REQUEST",
@@ -997,16 +1044,20 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   const received = posts.find(post => post.kind === "issue_received");
   const status = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS");
   const threadedStatus = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS-THREAD");
+  const mediaInfoPost = posts.find(post => post.dedupeKey === "media-info:EV-SIL-SLACK-MEDIA-INFO");
   const requestPost = posts.find(post => post.dedupeKey === "media-request:EV-SIL-SLACK-REQUEST");
   assert.equal(received.threadTs, "100.000");
   assert.equal(status.threadTs, null);
   assert.equal(threadedStatus.threadTs, "100.000");
   assert.equal(status.message, "<@U-SIL-REPORTER> Plex is online. 2 active streams.");
+  assert.equal(mediaInfoPost.threadTs, "101.500");
+  assert.match(mediaInfoPost.message, /42 TV shows/);
   assert.equal(requestPost.threadTs, "102.000");
   assert.match(requestPost.message, /submitted a Seerr request for SIL Request Movie/);
   assert.ok(fakeMcp.calls.some(call => call.name === "seerr_request_media"
     && call.args.mediaId === 8123
     && call.args.mediaType === "movie"));
+  assert.ok(fakeMcp.calls.some(call => call.name === "media_public_library_summary"));
   const resolutionPost = posts.find(post => post.kind === "slack_post_issue_message");
   assert.ok(resolutionPost);
   assert.doesNotMatch(resolutionPost.message, /Automated response from Codex/);
@@ -1014,7 +1065,7 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   latest = await api(baseUrl, "/api/snapshot/latest");
   assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
   const tokensAfter = agent.status().tokenUsage.totalTokens;
-  assert.equal(tokensAfter - tokensBefore, 250);
+  assert.equal(tokensAfter - tokensBefore, 300);
 }
 
 async function run() {
