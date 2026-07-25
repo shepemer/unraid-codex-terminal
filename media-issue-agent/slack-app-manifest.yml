@@ -1,6 +1,6 @@
 display_information:
   name: Media Issue Agent
-  description: Receives media issue reports and reports Plex availability.
+  description: Receives media issue reports and requests, and reports Plex availability.
   background_color: "#14201d"
 features:
   app_home:

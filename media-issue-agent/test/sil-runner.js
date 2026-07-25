@@ -131,6 +131,8 @@ async function startFakeMediaMcp() {
               { name: "bazarr_download_movie_subtitles_for_plex", description: "Download movie subtitles for one Plex rating key." },
               { name: "plex_refresh_metadata", description: "Refresh one Plex rating key." },
               { name: "plex_verify_subtitle_track", description: "Verify a subtitle track by language." },
+              { name: "seerr_search_media", description: "Search for movies and television shows." },
+              { name: "seerr_request_media", description: "Submit an exact media request." },
               { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." }
             ]
           }
@@ -187,6 +189,26 @@ async function startFakeMediaMcp() {
           configured: true,
           online: true,
           activeStreamCount: 2
+        };
+      } else if (toolName === "seerr_search_media") {
+        result = {
+          page: 1,
+          totalPages: 1,
+          totalResults: 1,
+          results: [{
+            id: 8123,
+            mediaType: "movie",
+            title: "SIL Request Movie",
+            releaseDate: "2025-01-02",
+            mediaInfo: { status: 2 }
+          }]
+        };
+      } else if (toolName === "seerr_request_media") {
+        result = {
+          id: 8124,
+          status: 1,
+          mediaId: args.mediaId,
+          mediaType: args.mediaType
         };
       } else if (toolName === "seerr_add_issue_comment") {
         if (failCloseIssueIds.has(Number(args.issueId))) {
@@ -297,7 +319,7 @@ async function createFakeCodexBin(root, logPath) {
   const bin = path.join(root, "codex-fixture.mjs");
   await writeFile(bin, [
     "#!/usr/bin/env node",
-    "import { appendFileSync, readFileSync } from 'node:fs';",
+    "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';",
     "const prompt = readFileSync(0, 'utf8');",
     "function configValue(name) {",
     "  for (let index = 0; index < process.argv.length - 1; index += 1) {",
@@ -340,9 +362,14 @@ async function createFakeCodexBin(root, logPath) {
     "}",
     "if (kind === 'slack-intent') {",
     "  const result = prompt.includes('Is Plex online')",
-    "    ? { intent: 'plex_status', confidence: 0.99, mediaTitle: '', description: '', clarification: '' }",
-    "    : { intent: 'issue_report', confidence: 0.97, mediaTitle: 'SIL Slack Movie', description: 'Playback stops after ten minutes.', clarification: '' };",
-    "  process.stdout.write(`${JSON.stringify(result)}\\n`);",
+    "    ? { intent: 'plex_status', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
+    "    : prompt.includes('request SIL Request Movie')",
+    "      ? { intent: 'media_request', confidence: 0.99, mediaTitle: 'SIL Request Movie', description: '', clarification: '', mediaType: 'movie', year: 2025, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
+    "      : { intent: 'issue_report', confidence: 0.97, mediaTitle: 'SIL Slack Movie', description: 'Playback stops after ten minutes.', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' };",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 } })}\\n`);",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
     "} else if (kind === 'workflow-improvement') {",
     "  const result = { summary: 'Learned one reusable SIL workflow improvement.', improvements: [{ dedupeKey: 'sil_verify_before_client_classification', title: 'Verify evidence before client-side classification', target: 'suggested_repair_steps', description: 'Require an evidence check before handing a client-side conclusion to the repair runner.', recommendedChange: 'Verify the reported condition before concluding that no server-side action is required.', rationale: 'Trusted operator steering corrected the initial repair direction.', issuePattern: 'Playback reports where the first investigation lacks decisive evidence.', implementationSignals: ['verify the reported condition before classification'], steeringEvidence: [{ sequence: 1, guidance: 'Treat this as a client-side app issue with no server-side action.', effect: 'Changed the approved repair direction.' }] }] };",
     "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
@@ -778,7 +805,7 @@ async function assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId) {
   assert.equal(reopenedEntry.jobState, "detected");
 }
 
-async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
+async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeMcp) {
   const posts = [];
   const transport = {
     status: () => ({ connected: true }),
@@ -801,6 +828,7 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
   const service = new SlackService(agent, slackConfig, { transport });
   service.botUserId = "B-SIL-BOT";
   service.teamId = "T-SIL";
+  const tokensBefore = agent.status().tokenUsage.totalTokens;
   const issueEnvelope = {
     body: {
       event_id: "EV-SIL-SLACK-ISSUE",
@@ -852,7 +880,7 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
         thread_ts: "100.000",
         ts: "100.100",
         user: "U-SIL-REPORTER",
-        text: "The same failure also happens on a second player."
+        text: "<@B-SIL-BOT> The same failure also happens on a second player."
       }
     },
     event: {
@@ -861,9 +889,16 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
       thread_ts: "100.000",
       ts: "100.100",
       user: "U-SIL-REPORTER",
-      text: "The same failure also happens on a second player."
+      text: "<@B-SIL-BOT> The same failure also happens on a second player."
     }
   };
+  const ignoredFollowup = structuredClone(followupEnvelope);
+  ignoredFollowup.body.event_id = "EV-SIL-SLACK-FOLLOWUP-IGNORED";
+  ignoredFollowup.body.event.ts = "100.050";
+  ignoredFollowup.body.event.text = "This unmentioned thread reply must not invoke the bot.";
+  ignoredFollowup.event.ts = "100.050";
+  ignoredFollowup.event.text = "This unmentioned thread reply must not invoke the bot.";
+  assert.deepEqual(await service.ingestEnvelope(ignoredFollowup), { accepted: false });
   assert.deepEqual(await service.ingestEnvelope(followupEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
   const afterFollowup = await api(baseUrl, `/api/jobs/${investigated.result.jobId}`);
@@ -874,6 +909,32 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
   });
   assert.equal(refreshed.result.cached, false);
   assert.notEqual(refreshed.result.approvalId, investigated.result.approvalId);
+  assert.match(JSON.stringify(refreshed.result.evidence), /same failure also happens on a second player/i);
+
+  const threadedStatusEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-STATUS-THREAD",
+      team_id: "T-SIL",
+      event: {
+        type: "app_mention",
+        channel: "C-SIL-ISSUES",
+        thread_ts: "100.000",
+        ts: "100.200",
+        user: "U-SIL-REPORTER",
+        text: "<@B-SIL-BOT> Is Plex online?"
+      }
+    },
+    event: {
+      type: "app_mention",
+      channel: "C-SIL-ISSUES",
+      thread_ts: "100.000",
+      ts: "100.200",
+      user: "U-SIL-REPORTER",
+      text: "<@B-SIL-BOT> Is Plex online?"
+    }
+  };
+  assert.deepEqual(await service.ingestEnvelope(threadedStatusEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
 
   const resolution = await api(baseUrl, `/api/jobs/${refreshed.result.jobId}/approve`, {
     method: "POST",
@@ -909,18 +970,51 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath) {
   };
   assert.deepEqual(await service.ingestEnvelope(statusEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
+
+  const requestEnvelope = {
+    body: {
+      event_id: "EV-SIL-SLACK-REQUEST",
+      team_id: "T-SIL",
+      event: {
+        type: "app_mention",
+        channel: "C-SIL-ISSUES",
+        ts: "102.000",
+        user: "U-SIL-REPORTER",
+        text: "<@B-SIL-BOT> Please request SIL Request Movie (2025)."
+      }
+    },
+    event: {
+      type: "app_mention",
+      channel: "C-SIL-ISSUES",
+      ts: "102.000",
+      user: "U-SIL-REPORTER",
+      text: "<@B-SIL-BOT> Please request SIL Request Movie (2025)."
+    }
+  };
+  assert.deepEqual(await service.ingestEnvelope(requestEnvelope), { accepted: true, duplicate: false });
+  assert.equal(await service.processPendingForTest(), 1);
   await service.sendPendingForTest();
   const received = posts.find(post => post.kind === "issue_received");
-  const status = posts.find(post => post.kind === "plex_status");
+  const status = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS");
+  const threadedStatus = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS-THREAD");
+  const requestPost = posts.find(post => post.dedupeKey === "media-request:EV-SIL-SLACK-REQUEST");
   assert.equal(received.threadTs, "100.000");
   assert.equal(status.threadTs, null);
+  assert.equal(threadedStatus.threadTs, "100.000");
   assert.equal(status.message, "<@U-SIL-REPORTER> Plex is online. 2 active streams.");
+  assert.equal(requestPost.threadTs, "102.000");
+  assert.match(requestPost.message, /submitted a Seerr request for SIL Request Movie/);
+  assert.ok(fakeMcp.calls.some(call => call.name === "seerr_request_media"
+    && call.args.mediaId === 8123
+    && call.args.mediaType === "movie"));
   const resolutionPost = posts.find(post => post.kind === "slack_post_issue_message");
   assert.ok(resolutionPost);
   assert.doesNotMatch(resolutionPost.message, /Automated response from Codex/);
   assert.ok(posts.some(post => post.kind === "slack_close_issue" && post.message === "Closed."));
   latest = await api(baseUrl, "/api/snapshot/latest");
   assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
+  const tokensAfter = agent.status().tokenUsage.totalTokens;
+  assert.equal(tokensAfter - tokensBefore, 250);
 }
 
 async function run() {
@@ -968,7 +1062,7 @@ async function run() {
     await assertClosureFailurePath(baseUrl, fakeMcp, snapshotId);
     await assertCodexFailurePath(baseUrl, snapshotId);
     await assertDirectCloseReopenPath(baseUrl, fakeMcp, snapshotId);
-    await assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath);
+    await assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeMcp);
   } finally {
     if (oldCodexLog === undefined) {
       delete process.env.SIL_CODEX_LOG;

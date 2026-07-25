@@ -144,10 +144,14 @@ const HTML = `<!doctype html>
           </div>
           <div class="toolbar">
             <span id="detail-processing" class="processing-pill hidden">Processing</span>
+            <button id="investigation-report-button" type="button" class="secondary hidden">Full report</button>
             <button id="detail-close-button" type="button" class="secondary">Close</button>
             <button id="reopen-button" type="button" class="secondary hidden">Re-open</button>
             <button id="continue-button" type="button" class="secondary hidden">Continue</button>
             <button id="abort-repair-button" type="button" class="danger hidden">Abort repair</button>
+            <button id="reinvestigate-job-button" type="button" class="secondary hidden">Re-investigate</button>
+            <button id="retry-same-repair-button" type="button" class="secondary hidden">Retry same repair</button>
+            <button id="close-failed-repair-button" type="button" class="danger hidden">Close anyway</button>
             <div id="approval-actions" class="toolbar hidden">
               <button id="approve-button" type="button">Approve</button>
               <button id="reject-button" type="button" class="danger">Reject</button>
@@ -165,16 +169,48 @@ const HTML = `<!doctype html>
             <ol id="investigation-next-steps-list"></ol>
             <p id="investigation-next-steps-empty" class="investigation-next-steps-empty hidden">No explicit steps were extracted. Expand the full report to review the complete recommendation.</p>
           </div>
-          <details id="investigation-full-details" class="investigation-full-details">
-            <summary>Read full investigation report</summary>
-            <pre id="investigation-full-report" class="investigation-full-report"></pre>
-          </details>
+        </section>
+        <section id="repair-live-view" class="repair-live-view hidden" aria-labelledby="repair-live-title">
+          <div class="repair-live-heading">
+            <span class="activity-spinner" aria-hidden="true"></span>
+            <div>
+              <span class="eyebrow">Autonomous repair</span>
+              <h3 id="repair-live-title">Codex is working</h3>
+              <p>Tool calls and verification updates appear here as they complete.</p>
+            </div>
+          </div>
+          <div id="repair-live-log" class="repair-live-log" role="log" aria-live="polite"></div>
+        </section>
+        <section id="repair-result-view" class="repair-result-view hidden" aria-labelledby="repair-result-title">
+          <div class="repair-result-heading">
+            <span id="repair-result-status" class="badge">Result</span>
+            <div>
+              <span class="eyebrow">Repair outcome</span>
+              <h3 id="repair-result-title">Repair result</h3>
+              <p id="repair-result-summary"></p>
+            </div>
+          </div>
+          <div class="repair-result-grid">
+            <section>
+              <h4>What was done</h4>
+              <ul id="repair-result-actions"></ul>
+              <p id="repair-result-actions-empty" class="muted-copy hidden">No media changes were completed.</p>
+            </section>
+            <section>
+              <h4>Verification</h4>
+              <p id="repair-result-verification"></p>
+            </section>
+          </div>
+          <section id="repair-result-comment-section" class="repair-result-comment hidden">
+            <h4>Proposed closing comment</h4>
+            <p id="repair-result-comment"></p>
+          </section>
+          <p id="repair-result-guidance" class="repair-result-guidance hidden"></p>
         </section>
         <pre id="investigation-output">Select an issue to investigate.</pre>
         <div id="steer-panel" class="steer-panel hidden">
           <textarea id="steer-input" rows="1" placeholder="Steer the investigation or repair plan"></textarea>
           <button id="steer-button" type="button" class="secondary">Update investigation</button>
-          <button id="retry-same-repair-button" type="button" class="secondary hidden">Retry same repair</button>
         </div>
         <div id="repair-retry-panel" class="steer-panel hidden">
           <textarea id="repair-retry-input" rows="3" placeholder="Retry repair with trusted guidance"></textarea>
@@ -183,11 +219,25 @@ const HTML = `<!doctype html>
       </section>
     </div>
   </div>
+  <div id="investigation-report-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="investigation-report-dialog-title">
+    <div class="modal-panel investigation-report-panel">
+      <div class="section-header">
+        <div>
+          <span class="eyebrow">Complete evidence review</span>
+          <h2 id="investigation-report-dialog-title">Full Investigation Report</h2>
+        </div>
+        <button id="investigation-report-close-button" type="button" class="secondary">Close</button>
+      </div>
+      <div class="modal-body investigation-report-body">
+        <pre id="investigation-full-report" class="investigation-full-report"></pre>
+      </div>
+    </div>
+  </div>
   <div id="close-dialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title">
     <div class="modal-panel">
       <div class="section-header">
         <div>
-          <span class="eyebrow">Manual Closure</span>
+          <span id="close-dialog-eyebrow" class="eyebrow">Manual Closure</span>
           <h2 id="close-dialog-title">Close Issue</h2>
         </div>
       </div>
@@ -1141,58 +1191,173 @@ pre {
   line-height: 1.45;
 }
 
-.investigation-full-details {
-  border-top: 1px solid var(--line);
-}
-
-.investigation-full-details summary {
-  display: flex;
-  min-height: 44px;
-  align-items: center;
-  padding: 0 16px;
-  color: var(--accent-strong);
-  font-weight: 720;
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.investigation-full-details summary::-webkit-details-marker {
-  display: none;
-}
-
-.investigation-full-details summary::before {
-  content: "›";
-  width: 18px;
-  margin-right: 6px;
-  font-size: 20px;
-  line-height: 1;
-  transform-origin: center;
-  transition: transform 140ms ease;
-}
-
-.investigation-full-details[open] summary::before {
-  transform: rotate(90deg);
-}
-
-.investigation-full-details summary:hover,
-.investigation-full-details summary:focus-visible {
-  background: color-mix(in srgb, var(--accent-soft) 32%, transparent);
-}
-
-.investigation-full-details summary:focus-visible {
-  outline: none;
-  box-shadow: inset var(--focus);
-}
-
 .investigation-full-report {
   flex: none;
   min-height: 0;
   padding: 14px 16px;
-  border-top: 1px solid var(--line);
   background: var(--panel);
   font-size: 13px;
   line-height: 1.6;
+}
+
+.modal-panel.investigation-report-panel {
+  width: min(920px, 100%);
+  height: min(820px, calc(100dvh - 36px));
+  display: flex;
+  flex-direction: column;
+}
+
+.investigation-report-body {
+  min-height: 0;
+  flex: 1;
+  padding: 0;
+}
+
+.investigation-report-body .investigation-full-report {
+  width: 100%;
+  min-height: 100%;
+  max-height: none;
+  border: 0;
+  overflow: auto;
+}
+
+.repair-live-view,
+.repair-result-view {
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.repair-live-heading,
+.repair-result-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent-soft) 42%, transparent), transparent 40rem);
+}
+
+.repair-live-heading h3,
+.repair-result-heading h3 {
+  margin: 3px 0 4px;
+  font-size: 17px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+
+.repair-live-heading p,
+.repair-result-heading p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.repair-live-log {
+  height: calc(100% - 94px);
+  min-height: 220px;
+  overflow: auto;
+  padding: 12px 16px 24px;
+  overscroll-behavior: contain;
+}
+
+.repair-live-entry {
+  position: relative;
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 12px 10px 28px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.repair-live-entry time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.repair-live-entry span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.repair-live-entry::before {
+  content: "";
+  position: absolute;
+  top: 16px;
+  left: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+
+.repair-live-empty {
+  padding: 28px 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.repair-result-view {
+  overflow: auto;
+}
+
+.repair-result-heading .badge {
+  margin-top: 2px;
+}
+
+.repair-result-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.repair-result-grid > section,
+.repair-result-comment,
+.repair-result-guidance {
+  padding: 16px;
+}
+
+.repair-result-grid > section + section {
+  border-left: 1px solid var(--line);
+}
+
+.repair-result-view h4 {
+  margin: 0 0 9px;
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+.repair-result-view ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.repair-result-view p {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.muted-copy {
+  color: var(--muted);
+}
+
+.repair-result-comment {
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 72%, var(--panel));
+}
+
+.repair-result-guidance {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--warning) 8%, var(--panel));
 }
 
 .steer-panel {
@@ -2324,6 +2489,38 @@ pre {
     font-size: 12px;
   }
 
+  .repair-result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .repair-result-grid > section + section {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .repair-live-heading,
+  .repair-result-heading,
+  .repair-result-grid > section,
+  .repair-result-comment,
+  .repair-result-guidance {
+    padding: 13px;
+  }
+
+  .repair-live-log {
+    height: calc(100% - 104px);
+    padding: 8px 10px 20px;
+  }
+
+  .repair-live-entry {
+    grid-template-columns: 68px minmax(0, 1fr);
+    gap: 8px;
+    padding-left: 24px;
+  }
+
+  .modal-panel.investigation-report-panel {
+    height: calc(100dvh - 20px);
+  }
+
   .steer-panel {
     grid-template-columns: 1fr;
     gap: 8px;
@@ -2433,8 +2630,10 @@ const JS = `const state = {
   jobs: [],
   activeJobId: null,
   activeJobState: null,
+  activeJobDetail: null,
   activeEntryIndex: null,
   closeEntryIndex: null,
+  closeDialogMode: "manual",
   busy: false,
   authOk: false,
   loginRunning: false,
@@ -2526,13 +2725,29 @@ const el = {
   investigationNextSteps: document.getElementById("investigation-next-steps"),
   investigationNextStepsList: document.getElementById("investigation-next-steps-list"),
   investigationNextStepsEmpty: document.getElementById("investigation-next-steps-empty"),
-  investigationFullDetails: document.getElementById("investigation-full-details"),
+  investigationReportButton: document.getElementById("investigation-report-button"),
+  investigationReportDialog: document.getElementById("investigation-report-dialog"),
+  investigationReportCloseButton: document.getElementById("investigation-report-close-button"),
   investigationFullReport: document.getElementById("investigation-full-report"),
+  repairLiveView: document.getElementById("repair-live-view"),
+  repairLiveLog: document.getElementById("repair-live-log"),
+  repairResultView: document.getElementById("repair-result-view"),
+  repairResultStatus: document.getElementById("repair-result-status"),
+  repairResultTitle: document.getElementById("repair-result-title"),
+  repairResultSummary: document.getElementById("repair-result-summary"),
+  repairResultActions: document.getElementById("repair-result-actions"),
+  repairResultActionsEmpty: document.getElementById("repair-result-actions-empty"),
+  repairResultVerification: document.getElementById("repair-result-verification"),
+  repairResultCommentSection: document.getElementById("repair-result-comment-section"),
+  repairResultComment: document.getElementById("repair-result-comment"),
+  repairResultGuidance: document.getElementById("repair-result-guidance"),
   detailCloseButton: document.getElementById("detail-close-button"),
   detailProcessing: document.getElementById("detail-processing"),
   reopenButton: document.getElementById("reopen-button"),
   continueButton: document.getElementById("continue-button"),
   abortRepairButton: document.getElementById("abort-repair-button"),
+  reinvestigateJobButton: document.getElementById("reinvestigate-job-button"),
+  closeFailedRepairButton: document.getElementById("close-failed-repair-button"),
   approvalActions: document.getElementById("approval-actions"),
   approveButton: document.getElementById("approve-button"),
   rejectButton: document.getElementById("reject-button"),
@@ -2544,6 +2759,8 @@ const el = {
   repairRetryInput: document.getElementById("repair-retry-input"),
   repairRetryButton: document.getElementById("repair-retry-button"),
   closeDialog: document.getElementById("close-dialog"),
+  closeDialogEyebrow: document.getElementById("close-dialog-eyebrow"),
+  closeDialogTitle: document.getElementById("close-dialog-title"),
   closeComment: document.getElementById("close-comment"),
   closeCancelButton: document.getElementById("close-cancel-button"),
   closeConfirmButton: document.getElementById("close-confirm-button"),
@@ -2893,15 +3110,23 @@ function closeDetail() {
   clearJobPolling();
   state.activeJobId = null;
   state.activeJobState = null;
+  state.activeJobDetail = null;
   state.activeEntryIndex = null;
   setDetailProcessing(false);
   setDetailOpen(false);
   hideInvestigationReview();
+  closeInvestigationReportDialog();
+  el.investigationReportButton.classList.add("hidden");
+  el.repairLiveView.classList.add("hidden");
+  el.repairResultView.classList.add("hidden");
+  el.output.classList.remove("hidden");
   el.detailHeading.textContent = "Investigation";
   el.output.textContent = "Select an issue to investigate.";
   el.reopenButton.classList.add("hidden");
   el.continueButton.classList.add("hidden");
   el.abortRepairButton.classList.add("hidden");
+  el.reinvestigateJobButton.classList.add("hidden");
+  el.closeFailedRepairButton.classList.add("hidden");
   el.approvalActions.classList.add("hidden");
   setSteerVisible(false);
   setRetrySameRepairVisible(false);
@@ -2985,7 +3210,13 @@ function stateLabel(stateName) {
     closed: "Closed",
     blocked_needs_human: "Needs human",
     failed_retryable: "Retry needed",
-    failed_terminal: "Failed"
+    failed_terminal: "Failed",
+    fixed: "Fixed",
+    not_reproducible: "Not reproducible",
+    client_side: "Client-side",
+    partially_fixed: "Partially fixed",
+    needs_operator_decision: "Decision needed",
+    passed: "Passed"
   };
   return labels[stateName] || String(stateName || "").replaceAll("_", " ");
 }
@@ -4275,8 +4506,10 @@ function showEntry(index) {
   const entry = state.entries.find(row => Number(row.idx) === Number(index));
   if (!entry) return;
   state.activeEntryIndex = Number(index);
+  state.activeJobDetail = null;
   setDetailOpen(true);
   setDetailProcessing(false);
+  showPlainOutputSurface();
   updateIssueRowHighlights();
   if (isClosedEntry(entry)) {
     showIssueSummary(index);
@@ -4307,6 +4540,7 @@ function showEntry(index) {
     el.approvalActions.classList.toggle("hidden", entry.jobState !== "awaiting_action_approval");
   } else {
     hideInvestigationReview();
+    el.investigationReportButton.classList.add("hidden");
     el.output.textContent = [formatEntryMetadata(entry), "", "No cached investigation. Select Investigate to run Codex."].filter(Boolean).join("\\n");
     el.approvalActions.classList.add("hidden");
     setSteerVisible(false);
@@ -4395,84 +4629,81 @@ function readableEventType(value) {
   return String(value || "event").replaceAll("_", " ");
 }
 
-function formatRepairActivityEvent(event) {
+function repairActivityDescription(event) {
   const payload = event.payload || {};
   const eventType = event.eventType || payload.type || "event";
-  const prefix = event.createdAt + " · run " + event.runId + " · ";
   if (eventType === "repair_mcp_tool_call") {
-    return prefix + "Calling " + activityToolName(payload.toolName) + summarizeActivityArguments(payload.arguments) + ".";
+    return "Calling " + activityToolName(payload.toolName) + summarizeActivityArguments(payload.arguments) + ".";
   }
   if (eventType === "repair_mcp_tool_result") {
     const tools = (payload.calls || []).map(call => activityToolName(call.toolName)).join(", ") || "media tool";
     const status = payload.status ? "HTTP " + payload.status : "completed";
-    return prefix + "Result from " + tools + ": " + status + summarizeActivityResult(payload.result) + ".";
+    return "Received " + status + " from " + tools + summarizeActivityResult(payload.result) + ".";
   }
   if (eventType === "repair_mcp_proxy_blocked") {
-    return prefix + "Blocked issue-lifecycle tool " + activityToolName(payload.toolName) + ": " + compactActivityText(payload.message, 180) + ".";
+    return "Held issue-lifecycle action " + activityToolName(payload.toolName) + " for final approval: " + compactActivityText(payload.message, 180) + ".";
   }
   if (eventType === "repair_mcp_proxy_error") {
-    return prefix + "Media MCP proxy error: " + compactActivityText(payload.error, 180) + ".";
+    return "Media tool connection error: " + compactActivityText(payload.error, 180) + ".";
   }
   if (eventType === "codex_exit") {
-    return prefix + "Codex process exited" + (payload.stderr ? " with stderr output recorded in logs." : ".");
+    return "Codex finished the repair session" + (payload.stderr ? "; diagnostic output was saved to logs." : ".");
   }
   if (eventType === "stderr") {
-    return prefix + "Codex stderr: " + compactActivityText(payload.text, 180);
+    return "Codex reported a diagnostic message; full details were saved to logs.";
   }
   if (eventType === "stdout") {
-    return prefix + "Codex output: " + compactActivityText(payload.text, 180);
+    return "Codex produced repair output; full details were saved to logs.";
   }
-  if (eventType === "item.completed") {
-    const item = payload.item || {};
+  if (eventType === "item.started" || eventType === "item.completed") {
+    const item = payload.item || payload;
     if (item.type === "mcp_tool_call") {
       const status = item.status ? " (" + String(item.status).replaceAll("_", " ") + ")" : "";
       const error = item.error ? ": " + compactActivityText(item.error, 160) : ".";
-      return prefix + "Codex completed " + activityToolName(item.name || item.tool) + status + error;
+      return eventType === "item.started"
+        ? "Codex started " + activityToolName(item.name || item.tool) + "."
+        : "Codex completed " + activityToolName(item.name || item.tool) + status + error;
     }
     if (item.type === "agent_message" || item.type === "message") {
-      return prefix + "Codex reported " + summarizeAgentMessage(item.text || item.message || item.content) + ".";
+      return "Codex reported " + summarizeAgentMessage(item.text || item.message || item.content) + ".";
+    }
+    if (item.type === "command_execution") {
+      const command = compactActivityText(item.command || item.text || "workspace command", 120);
+      return eventType === "item.started"
+        ? "Running " + command + "."
+        : "Finished " + command + (item.status ? " (" + String(item.status).replaceAll("_", " ") + ")." : ".");
+    }
+    if (item.type === "reasoning") {
+      return eventType === "item.started"
+        ? "Codex is reasoning over the latest evidence."
+        : "Codex finished reviewing the latest evidence.";
     }
   }
+  if (eventType === "thread.started") {
+    return "Repair session started.";
+  }
+  if (eventType === "turn.started") {
+    return "Codex started the next repair step.";
+  }
+  if (eventType === "turn.completed") {
+    return "Codex completed a repair step.";
+  }
+  if (eventType === "repair_agent_started") {
+    return "Autonomous repair runner started.";
+  }
+  if (eventType === "repair_failed") {
+    return "Repair stopped: " + compactActivityText(payload.error || payload.message, 180);
+  }
+  if (eventType === "repair_abort_requested") {
+    return "Operator requested that the repair stop.";
+  }
   if (payload.text) {
-    return prefix + readableEventType(eventType) + ": " + compactActivityText(payload.text, 180);
+    return readableEventType(eventType) + ": " + compactActivityText(payload.text, 180);
   }
   if (payload.error) {
-    return prefix + readableEventType(eventType) + ": " + compactActivityText(payload.error, 180);
+    return readableEventType(eventType) + ": " + compactActivityText(payload.error, 180);
   }
-  return prefix + readableEventType(eventType) + ".";
-}
-
-function formatAgentRunSummary(run) {
-  const parts = [
-    "Run " + run.id,
-    run.kind || "agent",
-    String(run.status || "unknown").replaceAll("_", " ")
-  ];
-  if (run.config?.model) {
-    parts.push("model " + run.config.model);
-  }
-  if (run.config?.reasoningEffort) {
-    parts.push("reasoning " + run.config.reasoningEffort);
-  }
-  if (run.config?.fastMode !== undefined) {
-    parts.push(run.config.fastMode ? "fast mode" : "standard mode");
-  }
-  const lines = ["- " + parts.join(" · ")];
-  if (run.startedAt) {
-    lines.push("  Started: " + run.startedAt);
-  }
-  if (run.completedAt) {
-    lines.push("  Completed: " + run.completedAt);
-  }
-  if (run.error) {
-    lines.push("  Error: " + compactActivityText(run.error, 220));
-  }
-  if (run.finalResult?.summary || run.finalResult?.status) {
-    const status = run.finalResult.status ? String(run.finalResult.status).replaceAll("_", " ") : "result";
-    const summary = run.finalResult.summary ? " - " + compactActivityText(run.finalResult.summary, 220) : "";
-    lines.push("  Result: " + status + summary);
-  }
-  return lines.join("\\n");
+  return readableEventType(eventType) + ".";
 }
 
 function pendingApproval(detail) {
@@ -4531,107 +4762,6 @@ function formatActionSummary(summary) {
     }
   }
   return lines.join("\\n");
-}
-
-function formatPlanDetails(plan) {
-  if (!plan) {
-    return "";
-  }
-  const lines = [];
-  if (plan.classification) {
-    lines.push("Classification: " + String(plan.classification).replaceAll("_", " "));
-  }
-  if (plan.executionMode) {
-    lines.push("Execution: " + String(plan.executionMode).replaceAll("_", " "));
-  }
-  if (plan.requiresServerAction !== undefined) {
-    lines.push("Server action: " + (plan.requiresServerAction ? "yes" : "no"));
-  }
-  if (plan.note) {
-    lines.push("Note: " + compactActivityText(plan.note, 260));
-  }
-  if (plan.repairPrompt) {
-    lines.push("", "Repair prompt preview:", compactActivityText(plan.repairPrompt, 700));
-  }
-  return lines.join("\\n");
-}
-
-function formatExecutionResult(result) {
-  if (!result) {
-    return "";
-  }
-  const lines = [];
-  const outcome = result.outcome || result.status;
-  if (outcome) {
-    lines.push("Outcome: " + String(outcome).replaceAll("_", " "));
-  }
-  if (result.summary) {
-    lines.push("Summary: " + result.summary);
-  }
-  if (result.verification) {
-    const verificationStatus = result.verification.status ? String(result.verification.status).replaceAll("_", " ") : "unknown";
-    lines.push("Verification: " + verificationStatus + (result.verification.details ? " - " + result.verification.details : ""));
-  }
-  const actions = result.actionsTaken || result.actions || [];
-  if (actions.length) {
-    lines.push("Actions:");
-    for (const action of actions) {
-      if (typeof action === "string") {
-        lines.push("- " + action);
-      } else {
-        const tool = action.toolName || action.tool || "media action";
-        const status = action.status || action.result?.status || "";
-        lines.push("- " + tool + (status ? " · " + status : ""));
-      }
-    }
-  }
-  if (result.missingMcpItems?.length) {
-    lines.push("MCP gaps reported: " + result.missingMcpItems.length);
-  }
-  return lines.join("\\n");
-}
-
-function formatPlannedAction(action) {
-  const lines = [
-    "- " + (action.toolName || "media action") + (action.riskLevel ? " · risk " + action.riskLevel : "")
-  ];
-  if (action.result?.summary || action.dryRunResult?.summary) {
-    lines.push("  " + (action.result?.summary || action.dryRunResult?.summary));
-  } else if (action.result?.status || action.dryRunResult?.status) {
-    lines.push("  Status: " + (action.result?.status || action.dryRunResult?.status));
-  }
-  return lines.join("\\n");
-}
-
-function formatVerificationCheck(check) {
-  const lines = [
-    "- " + (check.checkType || "verification") + " · " + (check.status || "unknown")
-  ];
-  if (check.criteria?.summary || check.criteria?.description) {
-    lines.push("  " + (check.criteria.summary || check.criteria.description));
-  }
-  if (check.completedAt) {
-    lines.push("  Completed: " + check.completedAt);
-  }
-  return lines.join("\\n");
-}
-
-function formatMissingMcpItem(item) {
-  const parts = [];
-  if (item.suggestedToolName) {
-    parts.push("tool " + item.suggestedToolName);
-  }
-  if (item.category) {
-    parts.push("category " + item.category);
-  }
-  if (item.updatedAt) {
-    parts.push("updated " + item.updatedAt);
-  }
-  return [
-    "- " + item.title,
-    item.description ? "  " + item.description : "",
-    parts.length ? "  " + parts.join(" · ") : ""
-  ].filter(Boolean).join("\\n");
 }
 
 function steeringHistoryFromInvestigation(investigation) {
@@ -4828,19 +4958,23 @@ function hideInvestigationReview() {
   el.investigationReviewSummary.textContent = "";
   el.investigationNextStepsList.replaceChildren();
   el.investigationNextStepsEmpty.classList.add("hidden");
-  el.investigationFullDetails.open = false;
-  el.investigationFullReport.textContent = "";
+}
+
+function showPlainOutputSurface() {
+  el.repairLiveView.classList.add("hidden");
+  el.repairResultView.classList.add("hidden");
+  el.output.classList.remove("hidden");
 }
 
 function renderInvestigationReview(detail) {
   const summary = String(detail?.investigation?.summary || "").trim();
   if (!summary) {
     hideInvestigationReview();
+    el.investigationReportButton.classList.add("hidden");
+    el.investigationFullReport.textContent = "";
     return;
   }
-  const sameReport = !el.investigationReview.classList.contains("hidden")
-    && el.investigationFullReport.textContent === summary;
-  const preserveOpen = sameReport && el.investigationFullDetails.open;
+  const sameReport = el.investigationFullReport.textContent === summary;
   const preserveScrollTop = sameReport ? el.investigationReview.scrollTop : 0;
   const plan = latestInvestigationPlan(detail);
   const parsedSteps = extractInvestigationNextSteps(summary);
@@ -4859,9 +4993,215 @@ function renderInvestigationReview(detail) {
   el.investigationNextStepsList.classList.toggle("hidden", !steps.length);
   el.investigationNextStepsEmpty.classList.toggle("hidden", Boolean(steps.length));
   el.investigationFullReport.textContent = summary;
-  el.investigationFullDetails.open = preserveOpen;
+  el.investigationReportButton.classList.remove("hidden");
   el.investigationReview.classList.remove("hidden");
   el.investigationReview.scrollTop = preserveScrollTop;
+}
+
+function openInvestigationReportDialog() {
+  if (!el.investigationFullReport.textContent.trim()) {
+    return;
+  }
+  el.investigationReportDialog.classList.remove("hidden");
+  el.investigationReportCloseButton.focus();
+}
+
+function closeInvestigationReportDialog() {
+  el.investigationReportDialog.classList.add("hidden");
+}
+
+function latestRepairRun(detail) {
+  return [...(detail?.agentRuns || [])]
+    .filter(run => run.kind === "repair")
+    .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+}
+
+function repairResultForDetail(detail) {
+  const pending = pendingApproval(detail);
+  const executionResult = pending?.kind === "resolution" ? pending.payload?.executionResult : null;
+  if (executionResult) {
+    return {
+      ...executionResult,
+      status: executionResult.outcome || executionResult.status || "completed",
+      draftComment: pending.payload?.message || executionResult.draftComment || ""
+    };
+  }
+  const run = latestRepairRun(detail);
+  if (run?.finalResult) {
+    return {
+      ...run.finalResult,
+      status: run.finalResult.status || run.status || detail?.job?.state || "completed",
+      error: run.error || ""
+    };
+  }
+  if (run || String(detail?.job?.state || "").startsWith("failed") || detail?.job?.state === "blocked_needs_human") {
+    return {
+      status: run?.status || detail?.job?.state || "failed_retryable",
+      summary: run?.error || detail?.job?.lastError || "The repair did not complete.",
+      actionsTaken: [],
+      verification: {
+        status: "failed",
+        details: detail?.job?.lastError || run?.error || "The repair ended before verification completed."
+      },
+      draftComment: ""
+    };
+  }
+  return null;
+}
+
+function repairResultActions(result) {
+  const raw = result?.actionsTaken || result?.actions || [];
+  return raw.map(action => {
+    if (typeof action === "string") {
+      return action.trim();
+    }
+    return String(action?.summary || action?.message || action?.toolName || action?.tool || "").trim();
+  }).filter(Boolean);
+}
+
+function repairVerificationText(result) {
+  const verification = result?.verification;
+  if (!verification) {
+    return "No verification result was recorded.";
+  }
+  if (typeof verification === "string") {
+    return verification;
+  }
+  const status = verification.status
+    ? String(verification.status).replaceAll("_", " ")
+    : "";
+  const details = String(verification.details || verification.summary || "").trim();
+  if (status && details) {
+    return status.charAt(0).toUpperCase() + status.slice(1) + ": " + details;
+  }
+  return details || (status ? status.charAt(0).toUpperCase() + status.slice(1) : "No verification result was recorded.");
+}
+
+function renderRepairLive(detail) {
+  const wasVisible = !el.repairLiveView.classList.contains("hidden");
+  const bottomGap = el.repairLiveLog.scrollHeight - el.repairLiveLog.scrollTop - el.repairLiveLog.clientHeight;
+  const followTail = !wasVisible || bottomGap < 56;
+  const events = [...(detail?.agentRunEvents || [])].reverse().slice(-200);
+  const entries = [];
+  let previous = "";
+  for (const event of events) {
+    const description = repairActivityDescription(event);
+    if (!description || description === previous) {
+      continue;
+    }
+    previous = description;
+    entries.push({ event, description });
+  }
+  el.repairLiveLog.replaceChildren();
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "repair-live-empty";
+    empty.textContent = detail?.job?.state === "approved_for_execution"
+      ? "Repair approved. Waiting for the Codex runner to start..."
+      : "Codex is starting the repair session...";
+    el.repairLiveLog.appendChild(empty);
+  } else {
+    for (const { event, description } of entries) {
+      const row = document.createElement("div");
+      row.className = "repair-live-entry";
+      const time = document.createElement("time");
+      time.dateTime = event.createdAt || "";
+      time.textContent = event.createdAt
+        ? new Date(event.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        : "";
+      const message = document.createElement("span");
+      message.textContent = description;
+      row.append(time, message);
+      el.repairLiveLog.appendChild(row);
+    }
+  }
+  el.repairLiveView.classList.remove("hidden");
+  if (followTail) {
+    requestAnimationFrame(() => {
+      el.repairLiveLog.scrollTop = el.repairLiveLog.scrollHeight;
+    });
+  }
+}
+
+function renderRepairResult(detail) {
+  const result = repairResultForDetail(detail);
+  if (!result) {
+    el.repairResultView.classList.add("hidden");
+    return false;
+  }
+  const status = String(result.status || detail?.job?.state || "result");
+  const failed = status.startsWith("failed")
+    || ["blocked_needs_human", "needs_operator_decision"].includes(status)
+    || ["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(detail?.job?.state);
+  const partial = status === "partially_fixed";
+  el.repairResultStatus.className = failed ? "badge danger" : partial ? "badge warning" : "badge success";
+  el.repairResultStatus.textContent = stateLabel(status);
+  el.repairResultTitle.textContent = failed
+    ? status === "needs_operator_decision" || detail?.job?.state === "blocked_needs_human"
+      ? "Repair needs a decision"
+      : "Repair did not complete"
+    : partial ? "Repair partially completed" : "Repair completed";
+  el.repairResultSummary.textContent = result.summary || detail?.job?.lastError || "No summary was returned.";
+  const actions = repairResultActions(result);
+  el.repairResultActions.replaceChildren();
+  for (const action of actions) {
+    const item = document.createElement("li");
+    item.textContent = action;
+    el.repairResultActions.appendChild(item);
+  }
+  el.repairResultActions.classList.toggle("hidden", !actions.length);
+  el.repairResultActionsEmpty.classList.toggle("hidden", Boolean(actions.length));
+  el.repairResultVerification.textContent = repairVerificationText(result);
+  const draftComment = String(result.draftComment || "").trim();
+  el.repairResultComment.textContent = draftComment;
+  el.repairResultCommentSection.classList.toggle("hidden", !draftComment);
+  const choices = Array.isArray(result.proposedChoices) ? result.proposedChoices.filter(Boolean) : [];
+  el.repairResultGuidance.textContent = failed
+    ? choices.length
+      ? "Operator decision requested: " + choices.join(" or ") + ". Re-investigate with your choice, retry the approved repair, or close the issue with the recorded outcome."
+      : "The issue remains open. Re-investigate with new guidance, retry the approved repair, or close it with the recorded outcome."
+    : detail?.job?.state === "awaiting_resolution_approval"
+      ? "Review the completed work and proposed comment, then approve closure or reject it."
+      : "";
+  el.repairResultGuidance.classList.toggle("hidden", !el.repairResultGuidance.textContent);
+  el.repairResultView.classList.remove("hidden");
+  return true;
+}
+
+function renderJobSurface(detail) {
+  state.activeJobDetail = detail;
+  const stateName = detail?.job?.state || "";
+  const repairRunning = ["approved_for_execution", "executing"].includes(stateName);
+  const repairResultState = [
+    "drafting_comment",
+    "awaiting_resolution_approval",
+    "failed_retryable",
+    "failed_terminal",
+    "blocked_needs_human",
+    "closed"
+  ].includes(stateName) && (Boolean(latestRepairRun(detail)) || pendingApproval(detail)?.kind === "resolution");
+
+  el.repairLiveView.classList.add("hidden");
+  el.repairResultView.classList.add("hidden");
+  el.output.classList.add("hidden");
+  hideInvestigationReview();
+
+  if (repairRunning) {
+    el.investigationReportButton.classList.add("hidden");
+    renderRepairLive(detail);
+    return;
+  }
+
+  if (repairResultState && renderRepairResult(detail)) {
+    const summary = String(detail?.investigation?.summary || "").trim();
+    el.investigationFullReport.textContent = summary;
+    el.investigationReportButton.classList.toggle("hidden", !summary);
+    return;
+  }
+
+  renderInvestigationReview(detail);
+  el.output.textContent = formatJobDetail(detail);
+  el.output.classList.remove("hidden");
 }
 
 function formatPromptImprovementItem(item) {
@@ -4885,22 +5225,14 @@ function formatJobDetail(detail) {
     lines.push(\`Last note: \${job.lastError}\`);
   }
   if (pending) {
-    lines.push("", \`Pending \${pending.kind} approval #\${pending.id}\`);
+    lines.push("", pending.kind === "resolution"
+      ? "Decision needed: review the completed repair and proposed closing comment."
+      : "Decision needed: approve or reject the suggested repair.");
     if (pending.payload?.plan) {
       const actionSummary = formatActionSummary(pending.payload.plan.actionSummary);
       if (actionSummary) {
-        lines.push("", "Action summary:", actionSummary);
+        lines.push("", "Suggested action:", actionSummary);
       }
-      const planDetails = formatPlanDetails(pending.payload.plan);
-      if (planDetails) {
-        lines.push("", "Plan details:", planDetails);
-      }
-    }
-    if (pending.payload?.executionResult) {
-      lines.push("", "Fix result:", formatExecutionResult(pending.payload.executionResult));
-    }
-    if (pending.payload?.message) {
-      lines.push("", "Draft resolution comment:", pending.payload.message);
     }
   }
   if (detail.investigation?.summary) {
@@ -4913,47 +5245,11 @@ function formatJobDetail(detail) {
       lines.push("", steeringHistory);
     }
   }
-  if (detail.plannedActions?.length) {
-    lines.push("", "Planned/executed actions:");
-    for (const action of detail.plannedActions) {
-      lines.push(formatPlannedAction(action));
-    }
-  }
-  if (detail.verificationChecks?.length) {
-    lines.push("", "Verification checks:");
-    for (const check of detail.verificationChecks) {
-      lines.push(formatVerificationCheck(check));
-    }
-  }
-  if (detail.agentRuns?.length) {
-    lines.push("", "Autonomous Codex repair runs:");
-    for (const run of detail.agentRuns) {
-      lines.push(formatAgentRunSummary(run));
-    }
-  }
-  if (detail.missingMcpItems?.length) {
-    lines.push("", "Missing MCP items reported by repair runs:");
-    for (const item of detail.missingMcpItems) {
-      lines.push(formatMissingMcpItem(item));
-    }
-  }
   const promptImprovements = (detail.improvementItems || []).filter(item => item.itemType === "investigation_prompt");
   if (promptImprovements.length) {
     lines.push("", "Investigation improvements learned from this workflow:");
     for (const item of promptImprovements) {
       lines.push(formatPromptImprovementItem(item));
-    }
-  }
-  if (detail.agentRunEvents?.length) {
-    lines.push("", "Live repair activity:");
-    for (const event of detail.agentRunEvents.slice(0, 12).reverse()) {
-      lines.push("- " + formatRepairActivityEvent(event));
-    }
-  }
-  if (detail.auditEvents?.length) {
-    lines.push("", "Recent activity:");
-    for (const event of detail.auditEvents.slice(0, 8)) {
-      lines.push(\`- \${event.createdAt} \${event.eventType}\`);
     }
   }
   return lines.join("\\n");
@@ -4968,16 +5264,21 @@ function updateJobControls(detail) {
   );
   const hasPendingResolution = pending?.kind === "resolution";
   const retryResolutionDraft = canRetryResolutionDraft(detail);
+  const hasRepairRun = Boolean(latestRepairRun(detail));
+  const failedRepair = hasRepairRun && ["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(stateName);
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution" && !retryResolutionDraft);
   el.continueButton.textContent = retryResolutionDraft ? "Retry draft" : "Continue";
   const canAbortRepair = stateName === "executing";
   el.abortRepairButton.classList.toggle("hidden", !canAbortRepair);
   el.abortRepairButton.disabled = !canAbortRepair || !state.authOk;
+  el.reinvestigateJobButton.classList.toggle("hidden", !failedRepair);
+  el.reinvestigateJobButton.disabled = !failedRepair || !state.authOk;
+  el.closeFailedRepairButton.classList.toggle("hidden", !failedRepair);
+  el.closeFailedRepairButton.disabled = !failedRepair;
   setRepairRetryVisible(false);
-  setSteerVisible(stateName === "awaiting_action_approval"
-    || (["failed_retryable", "failed_terminal"].includes(stateName) && Boolean(detail.investigation) && !hasPendingResolution && !retryResolutionDraft));
-  setRetrySameRepairVisible(canRetrySameRepair(detail));
+  setSteerVisible(stateName === "awaiting_action_approval" && Boolean(detail.investigation) && !hasPendingResolution);
+  setRetrySameRepairVisible(failedRepair && canRetrySameRepair(detail));
 }
 
 function shouldPollJob(detail) {
@@ -5030,7 +5331,10 @@ async function showJob(jobId, options = {}) {
   if (!options.quiet) {
     if (switchingJobs) {
       hideInvestigationReview();
+      el.repairLiveView.classList.add("hidden");
+      el.repairResultView.classList.add("hidden");
     }
+    el.output.classList.remove("hidden");
     el.output.textContent = "Loading job detail...";
     setDetailProcessing(true, "Loading");
   }
@@ -5042,8 +5346,7 @@ async function showJob(jobId, options = {}) {
     const outputScroll = options.quiet ? captureOutputScroll() : null;
     const result = await api(\`/api/jobs/\${state.activeJobId}\`);
     mergeJobDetailState(result.detail);
-    renderInvestigationReview(result.detail);
-    el.output.textContent = formatJobDetail(result.detail);
+    renderJobSurface(result.detail);
     restoreOutputScroll(outputScroll);
     updateJobControls(result.detail);
     const processing = shouldPollJob(result.detail);
@@ -5058,6 +5361,7 @@ async function showJob(jobId, options = {}) {
     }
   } catch (error) {
     setDetailProcessing(false);
+    showPlainOutputSurface();
     el.output.textContent = error.message;
     toast(error.message);
   }
@@ -5131,7 +5435,10 @@ async function showIssueSummary(index) {
   state.activeJobId = entry?.jobId || null;
   setDetailOpen(true);
   setDetailProcessing(false);
+  state.activeJobDetail = null;
   hideInvestigationReview();
+  showPlainOutputSurface();
+  el.investigationReportButton.classList.add("hidden");
   el.detailHeading.textContent = "Issue Summary";
   el.approvalActions.classList.add("hidden");
   el.continueButton.classList.add("hidden");
@@ -5200,17 +5507,64 @@ async function poll() {
   }
 }
 
-function openCloseDialog(index) {
+function openCloseDialog(index, options = {}) {
   state.closeEntryIndex = Number(index);
-  el.closeComment.value = "";
+  state.closeDialogMode = options.mode || "manual";
+  const failedRepair = state.closeDialogMode === "failed_repair";
+  el.closeDialogEyebrow.textContent = failedRepair ? "Repair Review" : "Manual Closure";
+  el.closeDialogTitle.textContent = failedRepair ? "Close After Failed Repair" : "Close Issue";
+  el.closeConfirmButton.textContent = failedRepair ? "Close anyway" : "Close Issue";
+  el.closeComment.value = String(options.comment || "");
   el.closeDialog.classList.remove("hidden");
   el.closeComment.focus();
 }
 
 function closeCloseDialog() {
   state.closeEntryIndex = null;
+  state.closeDialogMode = "manual";
   el.closeDialog.classList.add("hidden");
   el.closeComment.value = "";
+  el.closeDialogEyebrow.textContent = "Manual Closure";
+  el.closeDialogTitle.textContent = "Close Issue";
+  el.closeConfirmButton.textContent = "Close Issue";
+}
+
+function failedRepairCloseComment(detail, entry) {
+  const result = repairResultForDetail(detail) || {};
+  const actions = repairResultActions(result);
+  const verification = repairVerificationText(result);
+  const parts = [
+    actions.length ? "Repair attempt: " + actions.slice(0, 3).join("; ") + "." : "No media change was completed.",
+    result.summary ? "Result: " + result.summary : "",
+    verification ? "Verification: " + verification : ""
+  ].filter(Boolean);
+  let comment = parts.join(" ").replace(/\\s+/g, " ").trim();
+  if (entry?.source === "plex" && [...comment].length > 300) {
+    comment = [...comment].slice(0, 297).join("").trimEnd() + "...";
+  }
+  return comment;
+}
+
+function reinvestigateFailedJob() {
+  const index = state.activeEntryIndex || entryIndexForJob(state.activeJobId);
+  if (!index) {
+    toast("This job is not linked to the current issue snapshot");
+    return;
+  }
+  investigate(index, true);
+}
+
+function closeFailedRepair() {
+  const index = state.activeEntryIndex || entryIndexForJob(state.activeJobId);
+  const entry = state.entries.find(row => Number(row.idx) === Number(index));
+  if (!index || !entry) {
+    toast("This job is not linked to the current issue snapshot");
+    return;
+  }
+  openCloseDialog(index, {
+    mode: "failed_repair",
+    comment: failedRepairCloseComment(state.activeJobDetail, entry)
+  });
 }
 
 async function closeIssueFromDialog() {
@@ -5280,7 +5634,10 @@ async function investigate(index, force = false) {
   state.activeEntryIndex = Number(index);
   setDetailOpen(true);
   setDetailProcessing(true, "Investigating");
+  state.activeJobDetail = null;
   hideInvestigationReview();
+  showPlainOutputSurface();
+  el.investigationReportButton.classList.add("hidden");
   updateIssueRowHighlights();
   el.output.textContent = "Investigation running...";
   el.approvalActions.classList.add("hidden");
@@ -5638,9 +5995,18 @@ el.issueCards.addEventListener("click", handleIssueListClick);
 el.approveButton.addEventListener("click", () => approval("approve"));
 el.rejectButton.addEventListener("click", () => approval("reject"));
 el.detailCloseButton.addEventListener("click", closeDetail);
+el.investigationReportButton.addEventListener("click", openInvestigationReportDialog);
+el.investigationReportCloseButton.addEventListener("click", closeInvestigationReportDialog);
+el.investigationReportDialog.addEventListener("click", event => {
+  if (event.target === el.investigationReportDialog) {
+    closeInvestigationReportDialog();
+  }
+});
 el.reopenButton.addEventListener("click", reopenIssue);
 el.continueButton.addEventListener("click", continueJob);
 el.abortRepairButton.addEventListener("click", abortRepair);
+el.reinvestigateJobButton.addEventListener("click", reinvestigateFailedJob);
+el.closeFailedRepairButton.addEventListener("click", closeFailedRepair);
 el.repairRetryButton.addEventListener("click", retryRepair);
 el.retrySameRepairButton.addEventListener("click", retrySameRepair);
 el.steerButton.addEventListener("click", steerInvestigation);

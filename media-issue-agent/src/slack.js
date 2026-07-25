@@ -18,31 +18,39 @@ import {
   retrySlackOutbox,
   setSlackIssueDelivery,
   setSlackThreadKind,
+  slackInboundQueueCountForUser,
   slackIssueForId,
   slackMessagesForThread,
   slackQueueStatus,
-  slackThreadForMessage,
   updateSlackReporterIdentity
 } from "./db.js";
 import { redactText } from "./redact.js";
 import { pushoverConfigured, sendSlackPushoverMessage } from "./pushover.js";
 
 export const SLACK_LIMITS = Object.freeze({
-  userInteractionsPerTenMinutes: 12,
-  userClassifiersPerHour: 5,
-  workspaceInteractionsPerTenMinutes: 60,
-  workspaceClassifiersPerHour: 30,
-  classifierConcurrency: 2,
-  queueSize: 20,
+  userInteractionsPerTenMinutes: 36,
+  userClassifiersPerHour: 15,
+  classifierConcurrency: 6,
+  queueSize: 60,
   rateNoticeSeconds: 300
 });
 
 const CLASSIFIER_INTENTS = new Set([
   "issue_report",
   "issue_followup",
+  "media_request",
   "plex_status",
   "needs_clarification",
   "unsupported"
+]);
+
+const RESPONSE_TOPICS = new Set([
+  "account_help",
+  "capabilities",
+  "conversation",
+  "media_discovery",
+  "server_admin",
+  "other"
 ]);
 
 const TERMINAL_DELIVERY_ERRORS = new Set([
@@ -71,6 +79,7 @@ function compact(value, maxLength) {
 function stripSlackMentions(value) {
   return String(value || "")
     .replace(/<@[A-Z0-9]+>/gi, " ")
+    .replace(/<#[A-Z0-9]+(?:\|[^>]*)?>/gi, " ")
     .replace(/<![^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -101,6 +110,46 @@ function parseJsonObject(output) {
   throw new Error(`Slack intent classifier did not return valid JSON: ${lastError?.message || "unknown parse error"}`);
 }
 
+function safeClassifierReply(value) {
+  const text = compact(redactText(stripSlackMentions(value)), 320);
+  if (!text || /\[REDACTED(?:_[A-Z]+)?\]/.test(text)) {
+    return "";
+  }
+  if (
+    /<[^>]+>/.test(text)
+    || /(?:^|\s)@[A-Za-z0-9._-]+/.test(text)
+    || /\bhttps?:\/\/|www\./i.test(text)
+    || /\b[A-Z][A-Z0-9]{7,}\b/.test(text)
+    || /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(text)
+    || /\b(?:\+?\d[\d ().-]{7,}\d)\b/.test(text)
+  ) {
+    return "";
+  }
+  return text;
+}
+
+function normalizedMediaType(value) {
+  const type = String(value || "").trim().toLowerCase();
+  return type === "movie" || type === "tv" ? type : "";
+}
+
+function normalizedYear(value) {
+  const year = Number(value);
+  const maximum = new Date().getUTCFullYear() + 10;
+  return Number.isInteger(year) && year >= 1870 && year <= maximum ? year : null;
+}
+
+function normalizedSeasons(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value
+    .map(Number)
+    .filter(season => Number.isInteger(season) && season >= 0 && season <= 100))]
+    .sort((left, right) => left - right)
+    .slice(0, 50);
+}
+
 export function parseSlackIntentResult(output) {
   const parsed = typeof output === "string" ? parseJsonObject(output) : output;
   const intent = String(parsed?.intent || "").trim();
@@ -116,8 +165,87 @@ export function parseSlackIntentResult(output) {
     confidence,
     mediaTitle: compact(redactText(stripSlackMentions(parsed.mediaTitle)), 160),
     description: compact(redactText(stripSlackMentions(parsed.description)), 1200),
-    clarification: compact(redactText(stripSlackMentions(parsed.clarification)), 120)
+    clarification: compact(redactText(stripSlackMentions(parsed.clarification)), 120),
+    mediaType: normalizedMediaType(parsed.mediaType),
+    year: normalizedYear(parsed.year),
+    seasons: normalizedSeasons(parsed.seasons),
+    allSeasons: parsed.allSeasons === true,
+    responseTopic: RESPONSE_TOPICS.has(String(parsed.responseTopic || "")) ? String(parsed.responseTopic) : "other",
+    response: safeClassifierReply(parsed.response)
   };
+}
+
+function normalizeMediaTitle(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s*\((?:18|19|20)\d{2}\)\s*$/, "")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function seerrResultTitle(result) {
+  return compact(redactText(stripSlackMentions(
+    result?.title || result?.name || result?.originalTitle || result?.originalName
+  ).replace(/[<>&]/g, " ")), 160);
+}
+
+function seerrResultYear(result) {
+  const date = String(result?.releaseDate || result?.firstAirDate || "");
+  const year = Number(date.slice(0, 4));
+  return normalizedYear(year);
+}
+
+function seerrResultCandidate(result) {
+  const mediaType = normalizedMediaType(result?.mediaType);
+  const mediaId = Number(result?.id);
+  const title = seerrResultTitle(result);
+  if (!mediaType || !Number.isInteger(mediaId) || mediaId <= 0 || !title) {
+    return null;
+  }
+  return {
+    mediaId,
+    mediaType,
+    title,
+    year: seerrResultYear(result),
+    available: Number(result?.mediaInfo?.status) === 5
+  };
+}
+
+export function selectSeerrMediaMatch(searchPayload, request) {
+  const requestedTitle = normalizeMediaTitle(request?.mediaTitle);
+  const requestedType = normalizedMediaType(request?.mediaType);
+  const requestedYear = normalizedYear(request?.year);
+  const candidates = (Array.isArray(searchPayload?.results) ? searchPayload.results : [])
+    .map(seerrResultCandidate)
+    .filter(Boolean)
+    .filter(candidate => !requestedType || candidate.mediaType === requestedType);
+  const exactTitle = candidates.filter(candidate => normalizeMediaTitle(candidate.title) === requestedTitle);
+  const exactYear = requestedYear
+    ? exactTitle.filter(candidate => candidate.year === requestedYear)
+    : exactTitle;
+  if (exactYear.length === 1) {
+    return { status: "matched", match: exactYear[0], candidates: exactYear };
+  }
+  const relevant = (exactYear.length ? exactYear : exactTitle.length ? exactTitle : candidates).slice(0, 3);
+  return {
+    status: relevant.length ? "ambiguous" : "not_found",
+    match: null,
+    candidates: relevant
+  };
+}
+
+function fallbackUnsupportedResponse(topic) {
+  const responses = {
+    account_help: "I cannot change accounts or permissions from Slack, but I can check Plex status, file a media issue, or submit a specific movie or show request.",
+    capabilities: "I can check Plex status, file a media issue with follow-up details, and submit a specific movie or show request.",
+    conversation: "I am focused on media operations here. Ask me to check Plex status, report a media problem, or request a specific movie or show.",
+    media_discovery: "I do not provide general recommendations yet, but I can submit a request when you give me a specific movie or show title.",
+    server_admin: "I cannot change server or account settings through Slack, but I can check Plex availability and handle media reports or requests.",
+    other: "I cannot complete that action through Slack yet. I can check Plex status, file a media issue, or request a specific movie or show."
+  };
+  return responses[topic] || responses.other;
 }
 
 function messageIdentity(teamId, channelId, messageTs) {
@@ -216,7 +344,19 @@ export class SlackSocketTransport {
     if (!this.botUserId || !this.teamId) {
       throw new Error("Slack auth.test did not return a bot user and workspace.");
     }
-    const info = await this.web.conversations.info({ channel: this.config.slackChannelId });
+    let info;
+    try {
+      info = await this.web.conversations.info({ channel: this.config.slackChannelId });
+    } catch (error) {
+      if (slackErrorCode(error) === "missing_scope") {
+        const needed = String(error?.data?.needed || "");
+        if (needed.split(",").map(scope => scope.trim()).includes("groups:read")) {
+          throw new Error("The configured Slack channel appears to be private. Use a public channel for the media issue agent.");
+        }
+        throw new Error(`The Slack app is missing a required OAuth scope${needed ? ` (${needed})` : ""}. Reinstall the app from the checked-in manifest after updating its scopes.`);
+      }
+      throw error;
+    }
     const channel = info.channel || {};
     if (channel.is_private || channel.is_channel === false || channel.is_ext_shared || channel.is_org_shared) {
       throw new Error("ISSUE_AGENT_SLACK_CHANNEL_ID must identify a public Slack channel that is not shared outside this workspace.");
@@ -361,7 +501,7 @@ export class SlackService {
       teamRef: opaqueSlackRef(this.teamId),
       channelRef: opaqueSlackRef(this.config.slackChannelId),
       classifierConcurrency: SLACK_LIMITS.classifierConcurrency,
-      queueSize: SLACK_LIMITS.queueSize
+      perUserQueueSize: SLACK_LIMITS.queueSize
     });
     return this.publicStatus();
   }
@@ -396,10 +536,9 @@ export class SlackService {
       return null;
     }
     const rootTs = String(event.thread_ts || event.ts);
-    const existingThread = slackThreadForMessage(this.dbPath, teamId, String(event.channel), rootTs);
     const mentioned = Boolean(this.botUserId && String(event.text).includes(`<@${this.botUserId}>`));
     const appMention = event.type === "app_mention";
-    if (!dm && !appMention && !mentioned && !existingThread) {
+    if (!dm && !appMention && !mentioned) {
       return null;
     }
     const messageTs = String(event.ts);
@@ -428,8 +567,8 @@ export class SlackService {
     if (!archived.queued) {
       return { accepted: true, duplicate: true };
     }
-    const queue = slackQueueStatus(this.dbPath).inbound;
-    if (queue.pending + queue.processing > SLACK_LIMITS.queueSize) {
+    const userQueueSize = slackInboundQueueCountForUser(this.dbPath, event.teamId, event.userId);
+    if (userQueueSize > SLACK_LIMITS.queueSize) {
       completeSlackInbound(this.dbPath, event.eventId, "ignored", "Slack classifier queue is full.");
       enqueueSlackOutbox(this.dbPath, {
         threadId: archived.threadId,
@@ -437,8 +576,9 @@ export class SlackService {
         dedupeKey: `queue-full:${event.teamId}:${event.userId}:${Math.floor(Date.now() / (SLACK_LIMITS.rateNoticeSeconds * 1000))}`,
         channelId: event.channelId,
         threadTs: event.rootTs,
-        message: "I am at processing capacity right now. Please try again shortly."
+        message: "You already have several messages waiting to be processed. Please let those finish before sending more."
       });
+      return { accepted: true, duplicate: false, rateLimited: true };
     }
     this.agent.diagnostic("info", "slack_message_received", {
       eventRef: opaqueSlackRef(event.eventId),
@@ -616,7 +756,41 @@ export class SlackService {
       if (item.channelId === this.config.slackChannelId) {
         message = `<@${item.userId}> ${message}`;
       }
-      this.enqueueThreadReply(item, "plex_status", `plex-status:${item.eventId}`, message, { threaded: false });
+      this.enqueueThreadReply(item, "plex_status", `plex-status:${item.eventId}`, message, {
+        threaded: item.messageTs !== item.rootTs
+      });
+      return;
+    }
+
+    if (result.intent === "media_request") {
+      if (result.confidence < 0.9 || !result.mediaTitle) {
+        if (!item.slackIssueId) {
+          setSlackThreadKind(this.dbPath, item.threadId, "request", "active");
+        }
+        this.enqueueThreadReply(
+          item,
+          "request_clarification",
+          `request-clarification:${item.eventId}`,
+          result.response || "Tell me the exact movie or show title, and include the year if the title is ambiguous."
+        );
+        return;
+      }
+      if (!item.slackIssueId) {
+        setSlackThreadKind(this.dbPath, item.threadId, "request", "active");
+      }
+      const request = await this.agent.slackRequestMedia(result, {
+        eventId: item.eventId,
+        threadId: item.threadId
+      });
+      if (!item.slackIssueId) {
+        setSlackThreadKind(this.dbPath, item.threadId, "request", request.completed ? "closed" : "active");
+      }
+      this.enqueueThreadReply(
+        item,
+        request.kind || "media_request",
+        `media-request:${item.eventId}`,
+        request.message
+      );
       return;
     }
 
@@ -667,7 +841,7 @@ export class SlackService {
         item,
         "clarification",
         `clarification:${item.eventId}`,
-        "I may be able to file this as a media issue, but I need the media title and a short description of what is wrong."
+        result.response || "I may be able to file this as a media issue, but I need the media title and a short description of what is wrong."
       );
       return;
     }
@@ -679,7 +853,7 @@ export class SlackService {
       item,
       "unsupported",
       `unsupported:${item.eventId}`,
-      "I can currently accept media issue reports and check whether Plex is online."
+      result.response || fallbackUnsupportedResponse(result.responseTopic)
     );
   }
 

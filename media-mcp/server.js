@@ -12325,7 +12325,10 @@ function createServer() {
     inputSchema: {
       mediaId: z.number().int().positive(),
       mediaType: z.enum(["movie", "tv"]),
-      seasons: z.array(z.number().int().min(0)).optional(),
+      seasons: z.union([
+        z.literal("all"),
+        z.array(z.number().int().min(0)).min(1)
+      ]).optional(),
       is4k: z.boolean().optional(),
       serverId: z.number().int().positive().optional(),
       profileId: z.number().int().positive().optional(),
