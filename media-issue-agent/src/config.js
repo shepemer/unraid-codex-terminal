@@ -61,7 +61,7 @@ function hasChatGptTokenShape(authJson) {
 
 export function assertNoOpenAiApiKeys(env = process.env) {
   if (env.OPENAI_API_KEY || env.CODEX_API_KEY) {
-    throw new Error("media-issue-agent refuses OpenAI API key auth; use Codex ChatGPT auth in CODEX_HOME instead.");
+    throw new Error("media-issue-agent refuses generic OpenAI API key auth; use Codex ChatGPT auth in CODEX_HOME. Slack moderation uses only ISSUE_AGENT_OPENAI_MODERATION_API_KEY.");
   }
 }
 
@@ -149,6 +149,7 @@ export async function loadConfig(env = process.env, options = {}) {
     slackAppToken: env.ISSUE_AGENT_SLACK_APP_TOKEN || "",
     slackBotToken: env.ISSUE_AGENT_SLACK_BOT_TOKEN || "",
     slackChannelId: String(env.ISSUE_AGENT_SLACK_CHANNEL_ID || "").trim(),
+    slackModerationApiKey: env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY || "",
     codexHome: env.CODEX_HOME || "",
     codexBin: env.ISSUE_AGENT_CODEX_BIN || "codex",
     codexWorkspace: env.ISSUE_AGENT_CODEX_WORKSPACE || "/tmp/media-issue-agent-workspace",
@@ -175,7 +176,8 @@ export async function loadConfig(env = process.env, options = {}) {
     const missing = [
       ["ISSUE_AGENT_SLACK_APP_TOKEN", config.slackAppToken],
       ["ISSUE_AGENT_SLACK_BOT_TOKEN", config.slackBotToken],
-      ["ISSUE_AGENT_SLACK_CHANNEL_ID", config.slackChannelId]
+      ["ISSUE_AGENT_SLACK_CHANNEL_ID", config.slackChannelId],
+      ["ISSUE_AGENT_OPENAI_MODERATION_API_KEY", config.slackModerationApiKey]
     ].filter(([, value]) => !value).map(([name]) => name);
     if (missing.length) {
       throw new Error(`Slack is enabled but required configuration is missing: ${missing.join(", ")}.`);

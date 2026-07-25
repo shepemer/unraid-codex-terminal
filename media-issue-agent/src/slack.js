@@ -2,8 +2,8 @@ import crypto from "node:crypto";
 import { LogLevel, SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import {
+  allowSlackInboundModeration,
   applySlackIssueEvidenceMessage,
-  archiveSlackInbound,
   claimSlackInbound,
   claimSlackOutbox,
   completeSlackInbound,
@@ -12,8 +12,12 @@ import {
   createSlackIssue,
   enqueueSlackOutbox,
   failSlackOutbox,
+  queueSlackInboundForModeration,
   recordSlackRateEvent,
+  recordSlackOutboundModeration,
+  recoverSlackModerationPending,
   recoverSlackQueues,
+  rejectSlackInboundModeration,
   retrySlackInbound,
   retrySlackOutbox,
   setSlackIssueDelivery,
@@ -21,9 +25,26 @@ import {
   slackInboundQueueCountForUser,
   slackIssueForId,
   slackMessagesForThread,
+  slackModerationStatus,
   slackQueueStatus,
   updateSlackReporterIdentity
 } from "./db.js";
+import {
+  blockedSlackResponse,
+  createSlackPendingEncryptionKey,
+  decideSlackModeration,
+  decryptSlackPendingText,
+  encryptSlackPendingText,
+  highConfidenceSlackSafetyCategory,
+  keyedSlackContentDigest,
+  moderationErrorSlackResponse,
+  normalizeSlackModerationText,
+  OpenAiModerationClient,
+  outboundModerationFallback,
+  SLACK_MODERATION_MAX_CHARACTERS,
+  SLACK_MODERATION_MODEL,
+  SLACK_MODERATION_POLICY_VERSION
+} from "./moderation.js";
 import { redactText } from "./redact.js";
 import { pushoverConfigured, sendSlackPushoverMessage } from "./pushover.js";
 
@@ -34,6 +55,8 @@ export const SLACK_LIMITS = Object.freeze({
   queueSize: 60,
   rateNoticeSeconds: 300
 });
+
+export const SLACK_RESPONSE_MAX_CHARACTERS = 2000;
 
 const CLASSIFIER_INTENTS = new Set([
   "conversation",
@@ -154,7 +177,7 @@ function parseJsonObject(output) {
 }
 
 function safeClassifierReply(value) {
-  const text = compact(redactText(stripSlackMentions(value)), 320);
+  const text = compact(redactText(stripSlackMentions(value)), SLACK_RESPONSE_MAX_CHARACTERS);
   if (!text || /\[REDACTED(?:_[A-Z]+)?\]/.test(text)) {
     return "";
   }
@@ -162,7 +185,7 @@ function safeClassifierReply(value) {
     /<[^>]+>/.test(text)
     || /(?:^|\s)@[A-Za-z0-9._-]+/.test(text)
     || /\bhttps?:\/\/|www\./i.test(text)
-    || /\b[A-Z][A-Z0-9]{7,}\b/.test(text)
+    || /\b(?=[A-Z0-9]{8,}\b)(?=[A-Z0-9]*\d)[A-Z][A-Z0-9]{7,}\b/.test(text)
     || /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(text)
     || /\b(?:\+?\d[\d ().-]{7,}\d)\b/.test(text)
   ) {
@@ -529,6 +552,10 @@ export class SlackService {
     this.transport = options.transport || new SlackSocketTransport(config, {
       onError: error => this.recordTransportError(error)
     });
+    this.pendingEncryptionKey = options.pendingEncryptionKey || createSlackPendingEncryptionKey();
+    this.moderationClient = options.moderationClient || new OpenAiModerationClient(config, {
+      fetch: options.fetch || agent.fetch || globalThis.fetch
+    });
     this.running = false;
     this.workerPromises = [];
     this.botUserId = "";
@@ -539,11 +566,22 @@ export class SlackService {
   }
 
   publicStatus() {
+    const moderation = slackModerationStatus(this.dbPath);
+    const lastSuccess = Date.parse(moderation.lastSuccessAt || "");
+    const lastError = Date.parse(moderation.lastError?.createdAt || "");
     return {
       enabled: true,
       connected: Boolean(this.transport.status?.().connected),
       channelId: this.config.slackChannelId,
       queue: slackQueueStatus(this.dbPath),
+      moderation: {
+        configured: Boolean(this.config.slackModerationApiKey),
+        healthy: Boolean(this.config.slackModerationApiKey)
+          && (!Number.isFinite(lastError) || (Number.isFinite(lastSuccess) && lastSuccess >= lastError)),
+        model: SLACK_MODERATION_MODEL,
+        policyVersion: SLACK_MODERATION_POLICY_VERSION,
+        ...moderation
+      },
       lastError: this.lastError
     };
   }
@@ -559,13 +597,28 @@ export class SlackService {
     if (this.running) {
       return this.publicStatus();
     }
+    const interrupted = recoverSlackModerationPending(
+      this.dbPath,
+      SLACK_MODERATION_POLICY_VERSION
+    );
+    recoverSlackQueues(this.dbPath);
+    for (const item of interrupted) {
+      enqueueSlackOutbox(this.dbPath, {
+        slackIssueId: item.slackIssueId,
+        threadId: item.threadId,
+        kind: "moderation_restart",
+        dedupeKey: `moderation-restart:${item.eventId}`,
+        channelId: item.channelId,
+        threadTs: item.rootTs,
+        message: moderationErrorSlackResponse()
+      });
+    }
     let transportStarted = false;
     try {
       const identity = await this.transport.start(envelope => this.ingestEnvelope(envelope));
       transportStarted = true;
       this.botUserId = identity.botUserId;
       this.teamId = identity.teamId;
-      recoverSlackQueues(this.dbPath);
       this.running = true;
       this.workerPromises = [
         ...Array.from({ length: SLACK_LIMITS.classifierConcurrency }, () => this.inboundWorker()),
@@ -581,7 +634,10 @@ export class SlackService {
       teamRef: opaqueSlackRef(this.teamId),
       channelRef: opaqueSlackRef(this.config.slackChannelId),
       classifierConcurrency: SLACK_LIMITS.classifierConcurrency,
-      perUserQueueSize: SLACK_LIMITS.queueSize
+      perUserQueueSize: SLACK_LIMITS.queueSize,
+      moderationModel: SLACK_MODERATION_MODEL,
+      moderationPolicyVersion: SLACK_MODERATION_POLICY_VERSION,
+      recoveredModerationMessages: interrupted.length
     });
     return this.publicStatus();
   }
@@ -643,12 +699,23 @@ export class SlackService {
     if (!event || !event.text) {
       return { accepted: false };
     }
-    const archived = archiveSlackInbound(this.dbPath, event);
+    const encrypted = encryptSlackPendingText(
+      event.text,
+      this.pendingEncryptionKey,
+      event.eventId
+    );
+    const archived = queueSlackInboundForModeration(this.dbPath, event, encrypted);
     if (!archived.queued) {
       return { accepted: true, duplicate: true };
     }
     const userQueueSize = slackInboundQueueCountForUser(this.dbPath, event.teamId, event.userId);
     if (userQueueSize > SLACK_LIMITS.queueSize) {
+      rejectSlackInboundModeration(this.dbPath, event.eventId, {
+        verdict: "block",
+        category: "rate_limit",
+        policyVersion: SLACK_MODERATION_POLICY_VERSION,
+        model: "local"
+      });
       completeSlackInbound(this.dbPath, event.eventId, "ignored", "Slack classifier queue is full.");
       enqueueSlackOutbox(this.dbPath, {
         threadId: archived.threadId,
@@ -656,7 +723,12 @@ export class SlackService {
         dedupeKey: `queue-full:${event.teamId}:${event.userId}:${Math.floor(Date.now() / (SLACK_LIMITS.rateNoticeSeconds * 1000))}`,
         channelId: event.channelId,
         threadTs: event.rootTs,
-        message: "You already have several messages waiting to be processed. Please let those finish before sending more."
+        message: blockedSlackResponse("rate_limit")
+      });
+      void this.notifyPushover({
+        direction: "inbound",
+        channelKind: event.channelKind,
+        preview: "Blocked Slack message (rate_limit)."
       });
       return { accepted: true, duplicate: false, rateLimited: true };
     }
@@ -669,11 +741,6 @@ export class SlackService {
       threadId: archived.threadId,
       userRef: opaqueSlackRef(event.userId),
       messageLength: event.text.length
-    });
-    void this.notifyPushover({
-      direction: "inbound",
-      channelKind: event.channelKind,
-      preview: event.text
     });
     return { accepted: true, duplicate: false };
   }
@@ -694,8 +761,9 @@ export class SlackService {
           retrySlackInbound(this.dbPath, item.eventId, message, 2 ** Number(item.attempts || 1));
         } else {
           completeSlackInbound(this.dbPath, item.eventId, "failed", message);
-          this.enqueueThreadReply(item, "processing_failed", `processing-failed:${item.eventId}`,
-            "I could not process that message safely. Please try again in a new message.");
+          await this.enqueueThreadReply(item, "processing_failed", `processing-failed:${item.eventId}`,
+            "I could not process that message safely. Please try again in a new message.",
+            { trustedTemplate: true });
         }
         this.agent.diagnostic("error", "slack_message_processing_failed", {
           eventRef: opaqueSlackRef(item.eventId),
@@ -738,17 +806,18 @@ export class SlackService {
     return result.allowed ? null : result;
   }
 
-  maybeEnqueueRateNotice(item, limit) {
+  async maybeEnqueueRateNotice(item, limit) {
     const previous = Date.parse(limit.counts.lastRateNoticeAt || "");
     if (Number.isFinite(previous) && Date.now() - previous < SLACK_LIMITS.rateNoticeSeconds * 1000) {
       return;
     }
     recordSlackRateEvent(this.dbPath, item.teamId, item.userId, "rate_notice");
-    this.enqueueThreadReply(
+    await this.enqueueThreadReply(
       item,
       "rate_limited",
       `rate-limit:${item.teamId}:${item.userId}:${Math.floor(Date.now() / (SLACK_LIMITS.rateNoticeSeconds * 1000))}`,
-      "I am receiving too many requests right now. Please wait a few minutes and try again."
+      "I am receiving too many requests right now. Please wait a few minutes and try again.",
+      { trustedTemplate: true }
     );
     this.agent.diagnostic("warn", "slack_message_rate_limited", {
       eventRef: opaqueSlackRef(item.eventId),
@@ -758,7 +827,206 @@ export class SlackService {
     });
   }
 
-  enqueueThreadReply(item, kind, dedupeKey, message, options = {}) {
+  async rejectInbound(item, category, options = {}) {
+    const verdict = options.verdict === "error" ? "error" : "block";
+    rejectSlackInboundModeration(this.dbPath, item.eventId, {
+      verdict,
+      category,
+      categories: options.categories || {},
+      categoryScores: options.categoryScores || {},
+      model: options.model || "local",
+      policyVersion: SLACK_MODERATION_POLICY_VERSION,
+      latencyMs: options.latencyMs,
+      errorCode: options.errorCode || "",
+      contentDigest: options.contentDigest || keyedSlackContentDigest(
+        options.normalizedText || item.text || "",
+        this.pendingEncryptionKey
+      )
+    });
+    const response = options.response || (
+      verdict === "error" ? moderationErrorSlackResponse() : blockedSlackResponse(category)
+    );
+    if (options.reply !== false) {
+      await this.enqueueThreadReply(
+        item,
+        verdict === "error" ? "moderation_error" : "moderation_blocked",
+        `moderation:${verdict}:${item.eventId}`,
+        response,
+        { trustedTemplate: true }
+      );
+    }
+    void this.notifyPushover({
+      direction: "inbound",
+      channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm",
+      issueId: item.slackIssueId || null,
+      preview: verdict === "error"
+        ? `Slack moderation error (${category || "unknown"}).`
+        : `Blocked Slack message (${category || "policy_violation"}).`
+    });
+    this.agent.diagnostic(verdict === "error" ? "error" : "warn", `slack_moderation_${verdict}`, {
+      eventRef: opaqueSlackRef(item.eventId),
+      threadId: item.threadId,
+      slackIssueId: item.slackIssueId || null,
+      category,
+      model: options.model || "local",
+      policyVersion: SLACK_MODERATION_POLICY_VERSION,
+      latencyMs: options.latencyMs || null,
+      errorCode: options.errorCode || null
+    });
+    return false;
+  }
+
+  async ensureInboundModerated(item) {
+    if (item.moderationVerdict === "allow") {
+      return true;
+    }
+    if (item.moderationVerdict === "block" || item.moderationVerdict === "error") {
+      return false;
+    }
+    let rawText = item.text;
+    if (item.pendingCiphertext) {
+      try {
+        rawText = decryptSlackPendingText({
+          nonce: item.pendingNonce,
+          ciphertext: item.pendingCiphertext,
+          authTag: item.pendingAuthTag
+        }, this.pendingEncryptionKey, item.eventId);
+      } catch (error) {
+        return this.rejectInbound(item, "decryption_failed", {
+          verdict: "error",
+          errorCode: "decryption_failed",
+          contentDigest: item.contentDigest || null
+        });
+      }
+    }
+    const normalizedText = normalizeSlackModerationText(rawText);
+    const contentDigest = item.contentDigest || keyedSlackContentDigest(
+      normalizedText,
+      this.pendingEncryptionKey
+    );
+    if (!normalizedText) {
+      return this.rejectInbound(item, "empty_message", {
+        normalizedText,
+        contentDigest
+      });
+    }
+    if (normalizedText.length > SLACK_MODERATION_MAX_CHARACTERS) {
+      return this.rejectInbound(item, "message_too_long", {
+        normalizedText,
+        contentDigest
+      });
+    }
+    if (obviousSlackPromptInjection(normalizedText)) {
+      return this.rejectInbound(item, "prompt_injection", {
+        normalizedText,
+        contentDigest,
+        response: blockedSlackResponse("prompt_injection")
+      });
+    }
+    const localCategory = highConfidenceSlackSafetyCategory(normalizedText);
+    if (localCategory) {
+      return this.rejectInbound(item, localCategory, {
+        normalizedText,
+        contentDigest
+      });
+    }
+    let parsed;
+    try {
+      parsed = await this.moderationClient.moderate(normalizedText);
+    } catch (error) {
+      return this.rejectInbound(item, "moderation_unavailable", {
+        verdict: "error",
+        normalizedText,
+        contentDigest,
+        model: SLACK_MODERATION_MODEL,
+        errorCode: String(error?.code || "request_failed")
+      });
+    }
+    const decision = decideSlackModeration(parsed);
+    if (decision.verdict === "block") {
+      return this.rejectInbound(item, decision.category, {
+        normalizedText,
+        contentDigest,
+        categories: parsed.categories,
+        categoryScores: parsed.categoryScores,
+        model: parsed.model,
+        latencyMs: parsed.latencyMs
+      });
+    }
+    allowSlackInboundModeration(this.dbPath, item.eventId, normalizedText, {
+      category: decision.category,
+      categories: parsed.categories,
+      categoryScores: parsed.categoryScores,
+      model: parsed.model,
+      policyVersion: SLACK_MODERATION_POLICY_VERSION,
+      latencyMs: parsed.latencyMs,
+      contentDigest
+    });
+    item.text = normalizedText;
+    item.messageStatus = "received";
+    item.moderationVerdict = "allow";
+    void this.notifyPushover({
+      direction: "inbound",
+      channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm",
+      issueId: item.slackIssueId || null,
+      preview: normalizedText
+    });
+    this.agent.diagnostic("info", "slack_moderation_allow", {
+      eventRef: opaqueSlackRef(item.eventId),
+      threadId: item.threadId,
+      slackIssueId: item.slackIssueId || null,
+      category: decision.category || null,
+      model: parsed.model,
+      policyVersion: SLACK_MODERATION_POLICY_VERSION,
+      latencyMs: parsed.latencyMs
+    });
+    return true;
+  }
+
+  async enqueueThreadReply(item, kind, dedupeKey, message, options = {}) {
+    let safeMessage = compact(message, 3500);
+    if (!options.trustedTemplate) {
+      const contentDigest = keyedSlackContentDigest(safeMessage, this.pendingEncryptionKey);
+      const localCategory = highConfidenceSlackSafetyCategory(safeMessage);
+      if (localCategory) {
+        recordSlackOutboundModeration(this.dbPath, dedupeKey, {
+          verdict: "block",
+          category: localCategory,
+          model: "local",
+          policyVersion: SLACK_MODERATION_POLICY_VERSION,
+          contentDigest
+        });
+        safeMessage = outboundModerationFallback(localCategory);
+      } else {
+        try {
+          const parsed = await this.moderationClient.moderate(safeMessage);
+          const decision = decideSlackModeration(parsed, { direction: "outbound" });
+          recordSlackOutboundModeration(this.dbPath, dedupeKey, {
+            verdict: decision.verdict,
+            category: decision.category,
+            categories: parsed.categories,
+            categoryScores: parsed.categoryScores,
+            model: parsed.model,
+            policyVersion: SLACK_MODERATION_POLICY_VERSION,
+            contentDigest,
+            latencyMs: parsed.latencyMs
+          });
+          if (decision.verdict === "block") {
+            safeMessage = outboundModerationFallback(decision.category);
+          }
+        } catch (error) {
+          recordSlackOutboundModeration(this.dbPath, dedupeKey, {
+            verdict: "error",
+            category: "moderation_unavailable",
+            model: SLACK_MODERATION_MODEL,
+            policyVersion: SLACK_MODERATION_POLICY_VERSION,
+            contentDigest,
+            errorCode: String(error?.code || "request_failed")
+          });
+          safeMessage = outboundModerationFallback();
+        }
+      }
+    }
     return enqueueSlackOutbox(this.dbPath, {
       slackIssueId: item.slackIssueId || null,
       threadId: item.threadId,
@@ -766,23 +1034,23 @@ export class SlackService {
       dedupeKey,
       channelId: item.channelId,
       threadTs: options.threaded === false ? null : item.rootTs,
-      message
+      message: safeMessage
     });
   }
 
   async processInbound(item) {
-    await this.resolveUserName(item);
     if (
       item.slackIssueId
       && item.threadKind === "issue"
       && item.messageTs === item.rootTs
       && Number(item.attempts || 0) > 1
+      && item.moderationVerdict === "allow"
     ) {
       const issue = slackIssueForId(this.dbPath, item.slackIssueId);
       if (!issue) {
         throw new Error(`Slack issue ${item.slackIssueId} disappeared while recovering its initial report`);
       }
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "issue_received",
         `issue-received:${issue.id}`,
@@ -795,9 +1063,19 @@ export class SlackService {
       countInteraction: Number(item.attempts || 0) <= 1
     });
     if (limit) {
-      this.maybeEnqueueRateNotice(item, limit);
+      if (!item.moderationVerdict) {
+        await this.rejectInbound(item, "rate_limit", {
+          reply: false,
+          contentDigest: item.contentDigest || null
+        });
+      }
+      await this.maybeEnqueueRateNotice(item, limit);
       return;
     }
+    if (!await this.ensureInboundModerated(item)) {
+      return;
+    }
+    await this.resolveUserName(item);
     const recentMessages = slackMessagesForThread(this.dbPath, item.threadId, 11)
       .filter(message => Number(message.id) !== Number(item.messageId))
       .slice(-10)
@@ -806,16 +1084,6 @@ export class SlackService {
         user: message.direction === "inbound" ? "human" : "bot",
         text: compact(stripSlackMentions(message.text), 4000)
       }));
-    if (obviousSlackPromptInjection(item.text)) {
-      await this.applyIntent(item, {
-        intent: "unsupported",
-        confidence: 1,
-        socialTone: "exploit_attempt",
-        responseTopic: "other",
-        response: ""
-      });
-      return;
-    }
     const result = await this.agent.classifySlackIntent({
       trackedIssue: Boolean(item.slackIssueId),
       threadKind: item.threadKind,
@@ -835,7 +1103,7 @@ export class SlackService {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");
       }
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "conversation",
         `exploit-attempt:${item.eventId}`,
@@ -860,7 +1128,7 @@ export class SlackService {
       if (item.channelId === this.config.slackChannelId) {
         message = `<@${item.userId}> ${message}`;
       }
-      this.enqueueThreadReply(item, "plex_status", `plex-status:${item.eventId}`, message, {
+      await this.enqueueThreadReply(item, "plex_status", `plex-status:${item.eventId}`, message, {
         threaded: item.messageTs !== item.rootTs
       });
       return;
@@ -874,7 +1142,7 @@ export class SlackService {
         eventId: item.eventId,
         threadId: item.threadId
       });
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         answer.kind || "media_info",
         `media-info:${item.eventId}`,
@@ -888,7 +1156,7 @@ export class SlackService {
         if (!item.slackIssueId) {
           setSlackThreadKind(this.dbPath, item.threadId, "request", "active");
         }
-        this.enqueueThreadReply(
+        await this.enqueueThreadReply(
           item,
           "request_clarification",
           `request-clarification:${item.eventId}`,
@@ -909,7 +1177,7 @@ export class SlackService {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "request", request.completed ? "closed" : "active");
       }
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         request.kind || "media_request",
         `media-request:${item.eventId}`,
@@ -932,7 +1200,7 @@ export class SlackService {
         confidence: result.confidence
       });
       item.slackIssueId = issue.id;
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "issue_received",
         `issue-received:${issue.id}`,
@@ -949,7 +1217,7 @@ export class SlackService {
       const applied = applySlackIssueEvidenceMessage(this.dbPath, item.slackIssueId, item.messageId);
       const issue = applied.issue;
       await this.agent.onSlackIssueEvidenceUpdated(issue, { evidenceApplied: applied.applied });
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "issue_followup",
         `issue-followup:${item.eventId}`,
@@ -967,7 +1235,7 @@ export class SlackService {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "clarification", "active");
       }
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "clarification",
         `clarification:${item.eventId}`,
@@ -987,7 +1255,7 @@ export class SlackService {
       const classifierResponse = result.responseTopic === "capabilities" && !capabilitiesRequested
         ? ""
         : result.response;
-      this.enqueueThreadReply(
+      await this.enqueueThreadReply(
         item,
         "conversation",
         `conversation:${item.eventId}`,
@@ -1011,7 +1279,7 @@ export class SlackService {
       : result.responseTopic === "capabilities"
         ? "other"
         : result.responseTopic;
-    this.enqueueThreadReply(
+    await this.enqueueThreadReply(
       item,
       "unsupported",
       `unsupported:${item.eventId}`,

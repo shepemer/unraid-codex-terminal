@@ -142,7 +142,7 @@ async function testCodexAuthInspectionEdges() {
         CODEX_HOME: chatGptAuth,
         CODEX_API_KEY: ["sk", "fixture"].join("-")
       }),
-      /refuses OpenAI API key/
+      /refuses generic OpenAI API key/
     );
   } finally {
     await rm(root, { recursive: true, force: true });

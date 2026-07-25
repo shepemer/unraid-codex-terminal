@@ -2642,6 +2642,11 @@ export class MediaIssueAgent {
         connected: false,
         channelId: this.config.slackEnabled ? this.config.slackChannelId : "",
         queue: this.config.slackEnabled ? slackQueueStatus(this.config.dbPath) : null,
+        moderation: this.config.slackEnabled ? {
+          configured: Boolean(this.config.slackModerationApiKey),
+          healthy: false,
+          model: "omni-moderation-latest"
+        } : null,
         lastError: ""
       }
     };

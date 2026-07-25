@@ -296,6 +296,34 @@ CREATE TABLE IF NOT EXISTS slack_rate_events (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS slack_moderation_pending (
+  event_id TEXT PRIMARY KEY REFERENCES slack_event_receipts(event_id) ON DELETE CASCADE,
+  message_id INTEGER NOT NULL UNIQUE REFERENCES slack_messages(id) ON DELETE CASCADE,
+  nonce TEXT NOT NULL,
+  ciphertext TEXT NOT NULL,
+  auth_tag TEXT NOT NULL,
+  content_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS slack_moderation_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reference_key TEXT NOT NULL,
+  message_id INTEGER REFERENCES slack_messages(id) ON DELETE SET NULL,
+  direction TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  category TEXT,
+  categories_json TEXT NOT NULL DEFAULT '{}',
+  scores_json TEXT NOT NULL DEFAULT '{}',
+  model TEXT,
+  policy_version TEXT NOT NULL,
+  content_digest TEXT,
+  latency_ms INTEGER,
+  error_code TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE(direction, reference_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_issue_log_events_issue
 ON issue_log_events(source, issue_id, timestamp, id);
 
@@ -343,6 +371,9 @@ ON slack_rate_events(team_id, user_id, kind, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_slack_rate_events_created
 ON slack_rate_events(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_slack_moderation_decisions_created
+ON slack_moderation_decisions(created_at, verdict, direction);
 `);
   ensureColumn(dbPath, "agent_runs", "heartbeat_at", "TEXT");
   ensureColumn(dbPath, "agent_runs", "owner_pid", "INTEGER");
@@ -1536,7 +1567,7 @@ FROM slack_issues
 JOIN slack_threads ON slack_threads.id = slack_issues.thread_id
 `;
 
-export function archiveSlackInbound(dbPath, event) {
+function insertSlackInbound(dbPath, event, pending = null) {
   return sqliteTransaction(dbPath, database => {
     database.prepare(sql`
 INSERT INTO slack_threads (
@@ -1580,8 +1611,8 @@ INSERT OR IGNORE INTO slack_messages (
   ${event.messageTs},
   ${event.userId || ""},
   ${event.userName || ""},
-  ${event.text},
-  'received'
+  ${pending ? "[PENDING_MODERATION]" : event.text},
+  ${pending ? "pending_moderation" : "received"}
 );
 `).run();
     const message = database.prepare(sql`
@@ -1602,6 +1633,20 @@ INSERT OR IGNORE INTO slack_event_receipts (
   ${message.id}
 );
 `).run();
+    if (pending && inserted.changes > 0) {
+      database.prepare(sql`
+INSERT INTO slack_moderation_pending (
+  event_id, message_id, nonce, ciphertext, auth_tag, content_digest
+) VALUES (
+  ${event.eventId},
+  ${message.id},
+  ${pending.nonce},
+  ${pending.ciphertext},
+  ${pending.authTag},
+  ${pending.contentDigest}
+);
+`).run();
+    }
     database.prepare(`
 DELETE FROM slack_event_receipts
 WHERE processed_at IS NOT NULL
@@ -1611,6 +1656,9 @@ WHERE processed_at IS NOT NULL
 DELETE FROM slack_outbox
 WHERE status IN ('sent', 'failed')
   AND updated_at < datetime('now', '-30 days');
+
+DELETE FROM slack_moderation_decisions
+WHERE julianday(created_at) < julianday('now', '-180 days');
 `).run();
     return {
       queued: inserted.changes > 0,
@@ -1618,6 +1666,194 @@ WHERE status IN ('sent', 'failed')
       threadId: Number(thread.id),
       messageId: Number(message.id)
     };
+  });
+}
+
+export function archiveSlackInbound(dbPath, event) {
+  return insertSlackInbound(dbPath, event);
+}
+
+export function queueSlackInboundForModeration(dbPath, event, pending) {
+  if (!pending?.nonce || !pending?.ciphertext || !pending?.authTag || !pending?.contentDigest) {
+    throw new Error("Encrypted Slack moderation payload is incomplete.");
+  }
+  return insertSlackInbound(dbPath, event, pending);
+}
+
+function insertSlackModerationDecision(database, values) {
+  const minimalRetention = values.verdict === "block" || values.verdict === "error";
+  database.prepare(sql`
+INSERT INTO slack_moderation_decisions (
+  reference_key, message_id, direction, verdict, category, categories_json,
+  scores_json, model, policy_version, content_digest, latency_ms, error_code
+) VALUES (
+  ${values.referenceKey},
+  ${values.messageId || null},
+  ${values.direction},
+  ${values.verdict},
+  ${values.category || null},
+  ${JSON.stringify(minimalRetention ? {} : values.categories || {})},
+  ${JSON.stringify(minimalRetention ? {} : values.categoryScores || {})},
+  ${minimalRetention ? null : values.model || null},
+  ${values.policyVersion},
+  ${values.contentDigest || null},
+  ${!minimalRetention && Number.isFinite(Number(values.latencyMs)) ? Number(values.latencyMs) : null},
+  ${minimalRetention ? null : values.errorCode || null}
+)
+ON CONFLICT(direction, reference_key) DO UPDATE SET
+  message_id = excluded.message_id,
+  verdict = excluded.verdict,
+  category = excluded.category,
+  categories_json = excluded.categories_json,
+  scores_json = excluded.scores_json,
+  model = excluded.model,
+  policy_version = excluded.policy_version,
+  content_digest = excluded.content_digest,
+  latency_ms = excluded.latency_ms,
+  error_code = excluded.error_code,
+  created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`).run();
+}
+
+export function allowSlackInboundModeration(dbPath, eventId, text, decision) {
+  return sqliteTransaction(dbPath, database => {
+    const pending = database.prepare(sql`
+SELECT
+  slack_event_receipts.message_id AS messageId,
+  slack_moderation_pending.content_digest AS pendingContentDigest
+FROM slack_event_receipts
+LEFT JOIN slack_moderation_pending ON slack_moderation_pending.event_id = slack_event_receipts.event_id
+WHERE slack_event_receipts.event_id = ${eventId}
+LIMIT 1;
+`).get();
+    if (!pending) {
+      throw new Error(`Slack moderation payload ${eventId} was not found`);
+    }
+    database.prepare(sql`
+UPDATE slack_messages
+SET text = ${text},
+    delivery_status = 'received'
+WHERE id = ${pending.messageId};
+`).run();
+    insertSlackModerationDecision(database, {
+      ...decision,
+      referenceKey: eventId,
+      messageId: Number(pending.messageId),
+      direction: "inbound",
+      verdict: "allow",
+      contentDigest: pending.pendingContentDigest || decision.contentDigest || null
+    });
+    database.prepare(sql`
+DELETE FROM slack_moderation_pending WHERE event_id = ${eventId};
+`).run();
+    return {
+      messageId: Number(pending.messageId),
+      contentDigest: pending.pendingContentDigest || decision.contentDigest || null
+    };
+  });
+}
+
+export function rejectSlackInboundModeration(dbPath, eventId, decision) {
+  return sqliteTransaction(dbPath, database => {
+    const pending = database.prepare(sql`
+SELECT
+  slack_event_receipts.message_id AS messageId,
+  slack_moderation_pending.content_digest AS pendingContentDigest
+FROM slack_event_receipts
+LEFT JOIN slack_moderation_pending ON slack_moderation_pending.event_id = slack_event_receipts.event_id
+WHERE slack_event_receipts.event_id = ${eventId}
+LIMIT 1;
+`).get();
+    if (!pending) {
+      return { changed: false };
+    }
+    const verdict = decision.verdict === "error" ? "error" : "block";
+    const placeholder = verdict === "error"
+      ? "[MODERATION_ERROR]"
+      : `[BLOCKED_BY_MODERATION:${String(decision.category || "policy_violation")}]`;
+    database.prepare(sql`
+UPDATE slack_messages
+SET text = ${placeholder},
+    delivery_status = ${verdict === "error" ? "moderation_error" : "moderation_blocked"}
+WHERE id = ${pending.messageId};
+`).run();
+    insertSlackModerationDecision(database, {
+      ...decision,
+      referenceKey: eventId,
+      messageId: Number(pending.messageId),
+      direction: "inbound",
+      verdict,
+      contentDigest: pending.pendingContentDigest || decision.contentDigest || null
+    });
+    database.prepare(sql`
+DELETE FROM slack_moderation_pending WHERE event_id = ${eventId};
+`).run();
+    return {
+      changed: true,
+      messageId: Number(pending.messageId),
+      contentDigest: pending.pendingContentDigest || decision.contentDigest || null
+    };
+  });
+}
+
+export function recordSlackOutboundModeration(dbPath, referenceKey, decision) {
+  sqliteTransaction(dbPath, database => {
+    insertSlackModerationDecision(database, {
+      ...decision,
+      referenceKey,
+      messageId: null,
+      direction: "outbound"
+    });
+  });
+}
+
+export function recoverSlackModerationPending(dbPath, policyVersion) {
+  return sqliteTransaction(dbPath, database => {
+    const pending = database.prepare(`
+SELECT
+  slack_moderation_pending.event_id AS eventId,
+  slack_moderation_pending.message_id AS messageId,
+  slack_moderation_pending.content_digest AS contentDigest,
+  slack_messages.thread_id AS threadId,
+  slack_messages.slack_issue_id AS slackIssueId,
+  slack_messages.channel_id AS channelId,
+  slack_messages.root_ts AS rootTs
+FROM slack_moderation_pending
+JOIN slack_messages ON slack_messages.id = slack_moderation_pending.message_id
+ORDER BY slack_moderation_pending.created_at, slack_moderation_pending.event_id;
+`).all().map(row => ({ ...row }));
+    for (const item of pending) {
+      database.prepare(sql`
+UPDATE slack_messages
+SET text = '[MODERATION_ERROR]',
+    delivery_status = 'moderation_error'
+WHERE id = ${item.messageId};
+`).run();
+      database.prepare(sql`
+UPDATE slack_event_receipts
+SET status = 'completed',
+    error = 'Moderation interrupted by media issue agent restart.',
+    processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE event_id = ${item.eventId};
+`).run();
+      insertSlackModerationDecision(database, {
+        referenceKey: item.eventId,
+        messageId: Number(item.messageId),
+        direction: "inbound",
+        verdict: "error",
+        category: "service_restart",
+        policyVersion,
+        contentDigest: item.contentDigest,
+        errorCode: "service_restart"
+      });
+    }
+    database.prepare("DELETE FROM slack_moderation_pending;").run();
+    return pending.map(item => ({
+      ...item,
+      messageId: Number(item.messageId),
+      threadId: Number(item.threadId),
+      slackIssueId: item.slackIssueId ? Number(item.slackIssueId) : null
+    }));
   });
 }
 
@@ -1678,15 +1914,26 @@ SELECT
   slack_messages.user_id AS userId,
   slack_messages.user_name AS userName,
   slack_messages.text,
+  slack_messages.delivery_status AS messageStatus,
   slack_threads.kind AS threadKind,
   slack_threads.state AS threadState,
   slack_issues.id AS slackIssueId,
   slack_issues.status AS issueStatus,
-  slack_issues.evidence_version AS evidenceVersion
+  slack_issues.evidence_version AS evidenceVersion,
+  slack_moderation_pending.nonce AS pendingNonce,
+  slack_moderation_pending.ciphertext AS pendingCiphertext,
+  slack_moderation_pending.auth_tag AS pendingAuthTag,
+  slack_moderation_pending.content_digest AS contentDigest,
+  slack_moderation_decisions.verdict AS moderationVerdict,
+  slack_moderation_decisions.category AS moderationCategory
 FROM slack_event_receipts
 JOIN slack_messages ON slack_messages.id = slack_event_receipts.message_id
 JOIN slack_threads ON slack_threads.id = slack_messages.thread_id
 LEFT JOIN slack_issues ON slack_issues.thread_id = slack_threads.id
+LEFT JOIN slack_moderation_pending ON slack_moderation_pending.event_id = slack_event_receipts.event_id
+LEFT JOIN slack_moderation_decisions
+  ON slack_moderation_decisions.reference_key = slack_event_receipts.event_id
+  AND slack_moderation_decisions.direction = 'inbound'
 WHERE slack_event_receipts.event_id = ${receipt.eventId}
 LIMIT 1;
 `).get();
@@ -1765,7 +2012,8 @@ WHERE id = ${threadId};
     database.prepare(sql`
 UPDATE slack_messages
 SET slack_issue_id = ${issue.id}
-WHERE thread_id = ${threadId};
+WHERE thread_id = ${threadId}
+  AND delivery_status IN ('received', 'sent');
 `).run();
     return Number(issue.id);
   });
@@ -1826,6 +2074,7 @@ SELECT
   created_at AS createdAt
 FROM slack_messages
 WHERE thread_id = ${threadId}
+  AND delivery_status IN ('received', 'sent')
 ORDER BY created_at DESC, id DESC
 LIMIT ${capped};
 `, { json: true }).reverse();
@@ -1901,6 +2150,7 @@ FROM slack_messages
 WHERE id = ${messageId}
   AND slack_issue_id = ${issueId}
   AND direction = 'inbound'
+  AND delivery_status = 'received'
 LIMIT 1;
 `).get();
     if (!message) {
@@ -2204,6 +2454,75 @@ VALUES (${teamId}, ${userId}, ${kind});
 DELETE FROM slack_rate_events
 WHERE created_at < datetime('now', '-2 days');
 `);
+}
+
+export function slackModerationStatus(dbPath) {
+  const counts = sqliteExec(dbPath, `
+SELECT
+  SUM(CASE WHEN verdict = 'allow' THEN 1 ELSE 0 END) AS allowed,
+  SUM(CASE WHEN verdict = 'block' THEN 1 ELSE 0 END) AS blocked,
+  SUM(CASE WHEN verdict = 'error' THEN 1 ELSE 0 END) AS errors,
+  MAX(created_at) AS lastDecisionAt
+FROM slack_moderation_decisions
+WHERE julianday(created_at) >= julianday('now', '-24 hours');
+`, { json: true })[0] || {};
+  const latestRemoteSuccess = sqliteExec(dbPath, `
+SELECT created_at AS createdAt
+FROM slack_moderation_decisions
+WHERE verdict IN ('allow', 'block')
+  AND model IS NOT NULL
+  AND model <> 'local'
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+`, { json: true })[0] || null;
+  const latestError = sqliteExec(dbPath, `
+SELECT error_code AS errorCode, category, created_at AS createdAt
+FROM slack_moderation_decisions
+WHERE verdict = 'error'
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+`, { json: true })[0] || null;
+  const pending = sqliteExec(dbPath, `
+SELECT COUNT(*) AS count FROM slack_moderation_pending;
+`, { json: true })[0] || {};
+  return {
+    pending: Number(pending.count || 0),
+    recent: {
+      allowed: Number(counts.allowed || 0),
+      blocked: Number(counts.blocked || 0),
+      errors: Number(counts.errors || 0)
+    },
+    lastSuccessAt: latestRemoteSuccess?.createdAt || null,
+    lastDecisionAt: counts.lastDecisionAt || null,
+    lastError: latestError
+  };
+}
+
+export function slackModerationDecisions(dbPath, limit = 100) {
+  const capped = Math.max(1, Math.min(Number(limit || 100), 1000));
+  return sqliteExec(dbPath, sql`
+SELECT
+  reference_key AS referenceKey,
+  message_id AS messageId,
+  direction,
+  verdict,
+  category,
+  categories_json AS categoriesJson,
+  scores_json AS scoresJson,
+  model,
+  policy_version AS policyVersion,
+  content_digest AS contentDigest,
+  latency_ms AS latencyMs,
+  error_code AS errorCode,
+  created_at AS createdAt
+FROM slack_moderation_decisions
+ORDER BY created_at DESC, id DESC
+LIMIT ${capped};
+`, { json: true }).map(row => ({
+    ...row,
+    categories: JSON.parse(row.categoriesJson || "{}"),
+    categoryScores: JSON.parse(row.scoresJson || "{}")
+  }));
 }
 
 export function slackQueueStatus(dbPath) {
