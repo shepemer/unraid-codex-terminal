@@ -153,6 +153,204 @@ function compactLine(value, maxLength = 180) {
   return `${text.slice(0, maxLength - 1).trim()}...`;
 }
 
+function safeSlackPublicLabel(value, fallback = "that title") {
+  const redacted = redactText(value).replace(/<[^>]*>/g, " ");
+  if (/\[REDACTED(?:_[A-Z]+)?\]/.test(redacted)) {
+    return fallback;
+  }
+  return compactLine(redacted, 120) || fallback;
+}
+
+function formatPublicBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 1) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const amount = bytes / (1024 ** unitIndex);
+  const precision = amount >= 100 || unitIndex === 0 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatPublicCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0
+    ? Math.floor(number).toLocaleString("en-US")
+    : "0";
+}
+
+function mediaTitleLabel(value) {
+  const title = safeSlackPublicLabel(value?.title);
+  return `${title}${value?.year ? ` (${value.year})` : ""}`;
+}
+
+function mediaInfoLibraryMessage(result) {
+  const parts = [];
+  if (result?.tv?.available) {
+    parts.push(
+      `${formatPublicCount(result.tv.seriesCount)} TV shows across ${formatPublicCount(result.tv.seasonCount)} seasons, `
+      + `${formatPublicCount(result.tv.episodeFileCount)} episode files, ${formatPublicCount(result.tv.missingEpisodeCount)} aired episodes missing, `
+      + `${formatPublicBytes(result.tv.sizeOnDiskBytes)} on disk`
+    );
+  }
+  if (result?.movies?.available) {
+    parts.push(
+      `${formatPublicCount(result.movies.movieCount)} movies, ${formatPublicCount(result.movies.movieFileCount)} available, `
+      + `${formatPublicCount(result.movies.missingMovieCount)} missing, ${formatPublicBytes(result.movies.sizeOnDiskBytes)} on disk`
+    );
+  }
+  return parts.length
+    ? `The managed library has ${parts.join("; ")}. Combined storage: ${formatPublicBytes(result.totalSizeOnDiskBytes)}.`
+    : "I could not read the TV or movie library summary right now.";
+}
+
+function mediaInfoTitleMessage(result) {
+  if (result?.status === "matched" && result.result) {
+    const item = result.result;
+    const label = mediaTitleLabel(item);
+    if (item.mediaType === "tv") {
+      return `${label} is ${item.monitored ? "monitored" : "not monitored"} and ${item.lifecycle || "status unknown"}. `
+        + `${formatPublicCount(item.episodeFileCount)} of ${formatPublicCount(item.airedEpisodeCount)} aired episodes are on disk, `
+        + `${formatPublicCount(item.missingEpisodeCount)} are missing, across ${formatPublicCount(item.seasonCount)} seasons. `
+        + `Storage: ${formatPublicBytes(item.sizeOnDiskBytes)}.`;
+    }
+    return `${label} is ${item.available ? "available" : "missing"}, ${item.monitored ? "monitored" : "not monitored"}, `
+      + `and ${item.lifecycle || "status unknown"}. Storage: ${formatPublicBytes(item.sizeOnDiskBytes)}.`;
+  }
+  if (result?.status === "ambiguous") {
+    const choices = (result.candidates || []).map(mediaTitleLabel).join(", ");
+    return `I found multiple exact matches${choices ? `: ${choices}` : ""}. Add the year and whether it is a movie or show.`;
+  }
+  return result?.status === "not_found"
+    ? "I could not find that exact title in the managed TV or movie libraries."
+    : "I could not read title status from Sonarr or Radarr right now.";
+}
+
+function mediaInfoBandwidthMessage(result) {
+  if (!result?.available) {
+    return "I could not read Plex bandwidth statistics right now.";
+  }
+  const month = new Date(result.periodStart).toLocaleDateString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC"
+  });
+  return `Plex has used ${formatPublicBytes(result.totalBytes)} in ${month}: `
+    + `${formatPublicBytes(result.wanBytes)} WAN and ${formatPublicBytes(result.lanBytes)} LAN.`;
+}
+
+function mediaInfoHealthMessage(result) {
+  const entries = Object.entries(result?.services || {});
+  const configured = entries.filter(([, status]) => status.configured);
+  if (!configured.length) {
+    return "None of the requested media services are configured.";
+  }
+  const online = configured.filter(([, status]) => status.online).map(([name]) => name);
+  const offline = configured.filter(([, status]) => !status.online).map(([name]) => name);
+  const summary = `${online.length} of ${configured.length} configured media services are online.`;
+  return offline.length
+    ? `${summary} Offline or unreachable: ${offline.join(", ")}.`
+    : `${summary} Everything checked is reachable.`;
+}
+
+function mediaInfoQueueMessage(result) {
+  const labels = {
+    sonarr: "Sonarr",
+    radarr: "Radarr",
+    qbittorrent: "qBittorrent",
+    nzbget: "NZBGet"
+  };
+  const available = Object.entries(labels)
+    .filter(([name]) => result?.[name]?.available)
+    .map(([name, label]) => ({
+      label,
+      queued: Number(result[name].queuedCount) || 0,
+      problems: Number(result[name].problemCount) || 0
+    }));
+  if (!available.length) {
+    return "I could not read the download queues right now.";
+  }
+  const totalQueued = available.reduce((sum, item) => sum + item.queued, 0);
+  const totalProblems = available.reduce((sum, item) => sum + item.problems, 0);
+  const details = available.map(item =>
+    `${item.label} ${formatPublicCount(item.queued)} queued/${formatPublicCount(item.problems)} problematic`
+  ).join(", ");
+  return `${formatPublicCount(totalQueued)} item${totalQueued === 1 ? " is" : "s are"} queued and `
+    + `${formatPublicCount(totalProblems)} ${totalProblems === 1 ? "looks" : "look"} stalled, blocked, or failed. ${details}.`;
+}
+
+function mediaInfoSubtitleMessage(result) {
+  if (!result?.available) {
+    return "I could not read Bazarr's subtitle summary right now.";
+  }
+  return `Bazarr wants subtitles for ${formatPublicCount(result.wantedEpisodeCount)} episodes and `
+    + `${formatPublicCount(result.wantedMovieCount)} movies. `
+    + `${formatPublicCount(result.configuredProviderCount)} subtitle providers are configured.`;
+}
+
+function mediaInfoRecentMessage(result) {
+  if (!result?.available) {
+    return "I could not read Plex's recent additions right now.";
+  }
+  const records = Array.isArray(result.records) ? result.records : [];
+  if (!records.length) {
+    return "Plex did not report any recent additions for that filter.";
+  }
+  const items = records.map(record => {
+    const label = mediaTitleLabel(record);
+    if (record.mediaType === "tv" && record.seasonNumber && record.episodeNumber) {
+      return `${label} S${String(record.seasonNumber).padStart(2, "0")}E${String(record.episodeNumber).padStart(2, "0")}`;
+    }
+    return label;
+  });
+  return `Recently added: ${items.join(", ")}.`;
+}
+
+function mediaInfoRequestStatusMessage(result) {
+  if (result?.status === "matched" && result.result) {
+    const labels = {
+      unknown: "not requested",
+      pending: "pending",
+      processing: "being processed",
+      partially_available: "partially available",
+      available: "available",
+      deleted: "not available"
+    };
+    return `${mediaTitleLabel(result.result)} is ${labels[result.result.status] || "in an unknown request state"}.`;
+  }
+  if (result?.status === "ambiguous") {
+    const choices = (result.candidates || []).map(mediaTitleLabel).join(", ");
+    return `I found multiple exact matches${choices ? `: ${choices}` : ""}. Add the year and whether it is a movie or show.`;
+  }
+  return result?.status === "not_found"
+    ? "I could not find an exact Seerr match for that title."
+    : "I could not read Seerr request status right now.";
+}
+
+function mediaInfoMessage(queryType, result) {
+  switch (queryType) {
+    case "library_summary":
+      return mediaInfoLibraryMessage(result);
+    case "title_summary":
+      return mediaInfoTitleMessage(result);
+    case "plex_bandwidth":
+      return mediaInfoBandwidthMessage(result);
+    case "service_health":
+      return mediaInfoHealthMessage(result);
+    case "queue_summary":
+      return mediaInfoQueueMessage(result);
+    case "subtitle_summary":
+      return mediaInfoSubtitleMessage(result);
+    case "recent_additions":
+      return mediaInfoRecentMessage(result);
+    case "request_status":
+      return mediaInfoRequestStatusMessage(result);
+    default:
+      return "I need a more specific media question before I can look that up.";
+  }
+}
+
 function cleanActionStep(value) {
   const text = compactLine(String(value || "")
     .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "")
@@ -2533,6 +2731,111 @@ export class MediaIssueAgent {
         error: error.message
       });
       throw new Error("Plex status could not be verified through media-mcp.");
+    }
+  }
+
+  async slackMediaInfo(request, metadata = {}) {
+    const queryType = String(request?.queryType || "");
+    const title = String(request?.mediaTitle || "").trim();
+    this.diagnostic("info", "slack_media_info_started", {
+      threadId: metadata.threadId || null,
+      queryType,
+      mediaType: request?.mediaType || null,
+      titleLength: title.length,
+      yearProvided: Boolean(request?.year),
+      service: request?.service || null
+    });
+    let toolName;
+    let args;
+    switch (queryType) {
+      case "library_summary":
+        toolName = "media_public_library_summary";
+        args = {};
+        break;
+      case "title_summary":
+        if (!title) {
+          return {
+            completed: false,
+            kind: "media_info_clarification",
+            message: "Which movie or show should I look up?"
+          };
+        }
+        toolName = "media_public_title_summary";
+        args = {
+          title,
+          ...(request.mediaType ? { mediaType: request.mediaType } : {}),
+          ...(request.year ? { year: request.year } : {})
+        };
+        break;
+      case "plex_bandwidth":
+        toolName = "plex_public_bandwidth_summary";
+        args = {};
+        break;
+      case "service_health":
+        toolName = "media_public_health_summary";
+        args = request.service ? { service: request.service } : {};
+        break;
+      case "queue_summary":
+        toolName = "media_public_queue_summary";
+        args = {};
+        break;
+      case "subtitle_summary":
+        toolName = "media_public_subtitle_summary";
+        args = {};
+        break;
+      case "recent_additions":
+        toolName = "media_public_recent_additions";
+        args = {
+          ...(request.mediaType ? { mediaType: request.mediaType } : {}),
+          limit: 5
+        };
+        break;
+      case "request_status":
+        if (!title) {
+          return {
+            completed: false,
+            kind: "media_info_clarification",
+            message: "Which movie or show request should I check?"
+          };
+        }
+        toolName = "media_public_request_status";
+        args = {
+          title,
+          ...(request.mediaType ? { mediaType: request.mediaType } : {}),
+          ...(request.year ? { year: request.year } : {})
+        };
+        break;
+      default:
+        return {
+          completed: false,
+          kind: "media_info_clarification",
+          message: "Ask me about library counts, one title, bandwidth, service health, queues, subtitles, recent additions, or request status."
+        };
+    }
+    try {
+      const result = await this.client.callTool(toolName, args);
+      this.diagnostic("info", "slack_media_info_completed", {
+        threadId: metadata.threadId || null,
+        queryType,
+        toolName
+      });
+      return {
+        completed: true,
+        kind: "media_info",
+        message: mediaInfoMessage(queryType, result)
+      };
+    } catch (error) {
+      this.diagnostic("warn", "slack_media_info_failed", {
+        threadId: metadata.threadId || null,
+        queryType,
+        toolName,
+        error: error.message
+      });
+      return {
+        completed: false,
+        kind: "media_info_unavailable",
+        message: "That read-only media lookup failed. The server has chosen mystery for the moment."
+      };
     }
   }
 

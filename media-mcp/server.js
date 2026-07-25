@@ -5937,6 +5937,489 @@ async function plexAvailability() {
   }
 }
 
+function publicCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function publicInteger(value) {
+  return Math.floor(publicCount(value));
+}
+
+function publicTitleKey(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s*\((?:18|19|20)\d{2}\)\s*$/, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function publicYear(value) {
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 1870 && year <= new Date().getUTCFullYear() + 10
+    ? year
+    : null;
+}
+
+function publicLifecycle(value) {
+  const status = String(value || "").trim().toLowerCase();
+  if (status === "incinemas") {
+    return "in_cinemas";
+  }
+  return [
+    "announced",
+    "continuing",
+    "deleted",
+    "ended",
+    "in_cinemas",
+    "released",
+    "upcoming"
+  ].includes(status) ? status : "unknown";
+}
+
+function publicTimestamp(value) {
+  const numeric = Number(value);
+  const timestamp = Number.isFinite(numeric)
+    ? numeric < 1_000_000_000_000 ? numeric * 1000 : numeric
+    : Date.parse(String(value || ""));
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+async function publicServiceResult(name, loader) {
+  if (!configuredServices[name]) {
+    return { configured: false, available: false };
+  }
+  try {
+    return { configured: true, available: true, ...(await loader()) };
+  } catch {
+    return { configured: true, available: false };
+  }
+}
+
+function sonarrPublicSeriesSummary(series) {
+  const statistics = series?.statistics || {};
+  const airedEpisodeCount = publicInteger(statistics.episodeCount);
+  const episodeFileCount = publicInteger(statistics.episodeFileCount);
+  const seasons = Array.isArray(series?.seasons) ? series.seasons : [];
+  return {
+    mediaType: "tv",
+    title: String(series?.title || "").trim(),
+    year: publicYear(series?.year),
+    monitored: series?.monitored === true,
+    lifecycle: publicLifecycle(series?.status),
+    seasonCount: publicInteger(statistics.seasonCount)
+      || seasons.filter(season => Number(season?.seasonNumber) > 0).length,
+    monitoredSeasonCount: seasons.filter(season =>
+      Number(season?.seasonNumber) > 0 && season?.monitored === true
+    ).length,
+    airedEpisodeCount,
+    totalEpisodeCount: publicInteger(statistics.totalEpisodeCount) || airedEpisodeCount,
+    episodeFileCount,
+    missingEpisodeCount: Math.max(0, airedEpisodeCount - episodeFileCount),
+    sizeOnDiskBytes: publicInteger(statistics.sizeOnDisk)
+  };
+}
+
+function radarrPublicMovieSummary(movie) {
+  const movieFileSize = movie?.movieFile?.size;
+  return {
+    mediaType: "movie",
+    title: String(movie?.title || "").trim(),
+    year: publicYear(movie?.year),
+    monitored: movie?.monitored === true,
+    lifecycle: publicLifecycle(movie?.status),
+    available: movie?.hasFile === true || Boolean(movie?.movieFile),
+    sizeOnDiskBytes: publicInteger(movie?.sizeOnDisk ?? movieFileSize)
+  };
+}
+
+async function mediaPublicLibrarySummary() {
+  const [tv, movies] = await Promise.all([
+    publicServiceResult("sonarr", async () => {
+      const records = await arrApi("sonarr", "v3", "series");
+      const summaries = (Array.isArray(records) ? records : []).map(sonarrPublicSeriesSummary);
+      return {
+        seriesCount: summaries.length,
+        monitoredSeriesCount: summaries.filter(item => item.monitored).length,
+        seasonCount: summaries.reduce((total, item) => total + item.seasonCount, 0),
+        airedEpisodeCount: summaries.reduce((total, item) => total + item.airedEpisodeCount, 0),
+        episodeFileCount: summaries.reduce((total, item) => total + item.episodeFileCount, 0),
+        missingEpisodeCount: summaries.reduce((total, item) => total + item.missingEpisodeCount, 0),
+        sizeOnDiskBytes: summaries.reduce((total, item) => total + item.sizeOnDiskBytes, 0)
+      };
+    }),
+    publicServiceResult("radarr", async () => {
+      const records = await arrApi("radarr", "v3", "movie");
+      const summaries = (Array.isArray(records) ? records : []).map(radarrPublicMovieSummary);
+      return {
+        movieCount: summaries.length,
+        monitoredMovieCount: summaries.filter(item => item.monitored).length,
+        movieFileCount: summaries.filter(item => item.available).length,
+        missingMovieCount: summaries.filter(item => !item.available).length,
+        sizeOnDiskBytes: summaries.reduce((total, item) => total + item.sizeOnDiskBytes, 0)
+      };
+    })
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    tv,
+    movies,
+    totalSizeOnDiskBytes: publicInteger(tv.sizeOnDiskBytes) + publicInteger(movies.sizeOnDiskBytes)
+  };
+}
+
+function publicTitleMatches(record, title, year) {
+  const requested = publicTitleKey(title);
+  const titles = [record?.title, record?.originalTitle, record?.sortTitle]
+    .map(publicTitleKey)
+    .filter(Boolean);
+  return titles.includes(requested) && (!year || publicYear(record?.year) === year);
+}
+
+async function mediaPublicTitleSummary({ title, mediaType, year }) {
+  const candidates = [];
+  const searched = [];
+  const unavailable = [];
+  const requestedYear = publicYear(year);
+  if (!mediaType || mediaType === "tv") {
+    if (!configuredServices.sonarr) {
+      unavailable.push("sonarr");
+    } else {
+      try {
+        const records = await arrApi("sonarr", "v3", "series");
+        searched.push("sonarr");
+        candidates.push(...(Array.isArray(records) ? records : [])
+          .filter(record => publicTitleMatches(record, title, requestedYear))
+          .map(sonarrPublicSeriesSummary));
+      } catch {
+        unavailable.push("sonarr");
+      }
+    }
+  }
+  if (!mediaType || mediaType === "movie") {
+    if (!configuredServices.radarr) {
+      unavailable.push("radarr");
+    } else {
+      try {
+        const records = await arrApi("radarr", "v3", "movie");
+        searched.push("radarr");
+        candidates.push(...(Array.isArray(records) ? records : [])
+          .filter(record => publicTitleMatches(record, title, requestedYear))
+          .map(radarrPublicMovieSummary));
+      } catch {
+        unavailable.push("radarr");
+      }
+    }
+  }
+  if (candidates.length === 1) {
+    return {
+      status: "matched",
+      generatedAt: new Date().toISOString(),
+      result: candidates[0],
+      searched,
+      unavailable
+    };
+  }
+  return {
+    status: candidates.length > 1 ? "ambiguous" : searched.length ? "not_found" : "unavailable",
+    generatedAt: new Date().toISOString(),
+    candidates: candidates.slice(0, 8).map(candidate => ({
+      mediaType: candidate.mediaType,
+      title: candidate.title,
+      year: candidate.year
+    })),
+    searched,
+    unavailable
+  };
+}
+
+async function plexPublicBandwidthSummary() {
+  if (!configuredServices.plex) {
+    return { configured: false, available: false };
+  }
+  try {
+    const body = await plexApi("statistics/bandwidth", { query: { timespan: 1 } });
+    const records = Array.isArray(body?.MediaContainer?.StatisticsBandwidth)
+      ? body.MediaContainer.StatisticsBandwidth
+      : Array.isArray(body?.StatisticsBandwidth) ? body.StatisticsBandwidth : [];
+    const now = new Date();
+    const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+    const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+    let lanBytes = 0;
+    let wanBytes = 0;
+    let sampleCount = 0;
+    for (const record of records) {
+      const at = Date.parse(publicTimestamp(record?.at) || "");
+      if (!Number.isFinite(at) || at < start || at >= end) {
+        continue;
+      }
+      const bytes = publicInteger(record?.bytes);
+      const lan = record?.lan === true
+        || record?.lan === 1
+        || record?.lan === "1"
+        || String(record?.lan || "").toLowerCase() === "true";
+      if (lan) {
+        lanBytes += bytes;
+      } else {
+        wanBytes += bytes;
+      }
+      sampleCount += 1;
+    }
+    return {
+      configured: true,
+      available: true,
+      periodStart: new Date(start).toISOString(),
+      periodEnd: new Date(end).toISOString(),
+      totalBytes: lanBytes + wanBytes,
+      lanBytes,
+      wanBytes,
+      sampleCount
+    };
+  } catch {
+    return { configured: true, available: false };
+  }
+}
+
+async function publicHealthProbe(name) {
+  switch (name) {
+    case "sonarr":
+      await arrApi("sonarr", "v3", "system/status");
+      return;
+    case "radarr":
+      await arrApi("radarr", "v3", "system/status");
+      return;
+    case "plex":
+      await plexApi();
+      return;
+    case "bazarr":
+      await bazarrApi("system/status");
+      return;
+    case "prowlarr":
+      await arrApi("prowlarr", "v1", "system/status");
+      return;
+    case "qbittorrent":
+      await qbitRequest("app/version");
+      return;
+    case "nzbget":
+      await nzbgetRpc("status");
+      return;
+    case "seerr":
+      await seerrApi("status");
+      return;
+    case "tautulli":
+      await tautulliApi("server_status");
+      return;
+    case "tracearr":
+      await tracearrApi("health");
+      return;
+    case "threadfin":
+      await threadfinStatus(false);
+  }
+}
+
+async function mediaPublicHealthSummary(service) {
+  const names = service ? [service] : [
+    "plex",
+    "sonarr",
+    "radarr",
+    "bazarr",
+    "seerr",
+    "prowlarr",
+    "qbittorrent",
+    "nzbget",
+    "tautulli",
+    "tracearr",
+    "threadfin"
+  ];
+  const entries = await Promise.all(names.map(async name => {
+    if (!configuredServices[name]) {
+      return [name, { configured: false, online: false }];
+    }
+    try {
+      await publicHealthProbe(name);
+      return [name, { configured: true, online: true }];
+    } catch {
+      return [name, { configured: true, online: false }];
+    }
+  }));
+  return {
+    generatedAt: new Date().toISOString(),
+    services: Object.fromEntries(entries)
+  };
+}
+
+async function mediaPublicQueueSummary() {
+  const [sonarr, radarr, qbittorrent, nzbget] = await Promise.all([
+    publicServiceResult("sonarr", async () => {
+      const overview = await arrQueueOverview("sonarr");
+      return {
+        queuedCount: publicInteger(overview.queueCount),
+        problemCount: publicInteger(overview.blockedOrImportFailedCount)
+      };
+    }),
+    publicServiceResult("radarr", async () => {
+      const overview = await arrQueueOverview("radarr");
+      return {
+        queuedCount: publicInteger(overview.queueCount),
+        problemCount: publicInteger(overview.blockedOrImportFailedCount)
+      };
+    }),
+    publicServiceResult("qbittorrent", async () => {
+      const overview = await qbittorrentOverview();
+      return {
+        queuedCount: publicInteger(overview.torrentCount),
+        problemCount: publicInteger(overview.erroredOrStalledCount)
+      };
+    }),
+    publicServiceResult("nzbget", async () => {
+      const overview = await nzbgetOverview();
+      return {
+        queuedCount: publicInteger(overview.activeQueueCount),
+        problemCount: publicInteger(overview.failedHistoryCount)
+      };
+    })
+  ]);
+  return {
+    generatedAt: new Date().toISOString(),
+    sonarr,
+    radarr,
+    qbittorrent,
+    nzbget
+  };
+}
+
+function publicListTotal(value) {
+  const direct = value?.total ?? value?.totalRecords ?? value?.count;
+  if (Number.isFinite(Number(direct))) {
+    return publicInteger(direct);
+  }
+  for (const candidate of [value?.data, value?.records, value?.results, value]) {
+    if (Array.isArray(candidate)) {
+      return candidate.length;
+    }
+  }
+  return 0;
+}
+
+async function mediaPublicSubtitleSummary() {
+  return publicServiceResult("bazarr", async () => {
+    const [movies, episodes, providers] = await Promise.all([
+      bazarrApi("movies/wanted", { query: { start: 0, length: 1 } }),
+      bazarrApi("episodes/wanted", { query: { start: 0, length: 1 } }),
+      bazarrApi("providers")
+    ]);
+    return {
+      wantedMovieCount: publicListTotal(movies),
+      wantedEpisodeCount: publicListTotal(episodes),
+      configuredProviderCount: publicListTotal(providers)
+    };
+  });
+}
+
+function plexRecentPublicRecord(record) {
+  const type = String(record?.type || "").toLowerCase();
+  const addedAt = publicTimestamp(record?.addedAt);
+  if (type === "movie") {
+    return {
+      mediaType: "movie",
+      title: String(record?.title || "").trim(),
+      year: publicYear(record?.year),
+      addedAt
+    };
+  }
+  if (type === "episode") {
+    return {
+      mediaType: "tv",
+      title: String(record?.grandparentTitle || record?.title || "").trim(),
+      year: publicYear(record?.year),
+      seasonNumber: publicInteger(record?.parentIndex),
+      episodeNumber: publicInteger(record?.index),
+      episodeTitle: String(record?.title || "").trim(),
+      addedAt
+    };
+  }
+  if (type === "show") {
+    return {
+      mediaType: "tv",
+      title: String(record?.title || "").trim(),
+      year: publicYear(record?.year),
+      addedAt
+    };
+  }
+  return null;
+}
+
+async function mediaPublicRecentAdditions({ mediaType, limit }) {
+  if (!configuredServices.plex) {
+    return { configured: false, available: false, records: [] };
+  }
+  try {
+    const body = await plexApi("library/recentlyAdded", {
+      query: {
+        "X-Plex-Container-Start": 0,
+        "X-Plex-Container-Size": Math.min(100, Math.max(limit * 4, limit))
+      }
+    });
+    const records = (Array.isArray(body?.MediaContainer?.Metadata) ? body.MediaContainer.Metadata : [])
+      .map(plexRecentPublicRecord)
+      .filter(Boolean)
+      .filter(record => !mediaType || record.mediaType === mediaType)
+      .sort((left, right) => String(right.addedAt || "").localeCompare(String(left.addedAt || "")))
+      .slice(0, limit);
+    return {
+      configured: true,
+      available: true,
+      generatedAt: new Date().toISOString(),
+      records
+    };
+  } catch {
+    return { configured: true, available: false, records: [] };
+  }
+}
+
+function seerrPublicSearchRecord(record) {
+  const mediaType = String(record?.mediaType || "").toLowerCase();
+  const date = String(record?.releaseDate || record?.firstAirDate || "");
+  if (!["movie", "tv"].includes(mediaType)) {
+    return null;
+  }
+  return {
+    mediaType,
+    title: String(record?.title || record?.name || record?.originalTitle || record?.originalName || "").trim(),
+    year: publicYear(date.slice(0, 4)),
+    status: mediaStatusName(record?.mediaInfo?.status ?? 1)
+  };
+}
+
+async function mediaPublicRequestStatus({ title, mediaType, year }) {
+  if (!configuredServices.seerr) {
+    return { configured: false, available: false, status: "unavailable", candidates: [] };
+  }
+  try {
+    const body = await seerrApi("search", { query: { query: title, page: 1 } });
+    const requestedYear = publicYear(year);
+    const matches = (Array.isArray(body?.results) ? body.results : [])
+      .map(seerrPublicSearchRecord)
+      .filter(Boolean)
+      .filter(record => !mediaType || record.mediaType === mediaType)
+      .filter(record => publicTitleKey(record.title) === publicTitleKey(title))
+      .filter(record => !requestedYear || record.year === requestedYear)
+      .slice(0, 8);
+    return {
+      configured: true,
+      available: true,
+      status: matches.length === 1 ? "matched" : matches.length > 1 ? "ambiguous" : "not_found",
+      result: matches.length === 1 ? matches[0] : undefined,
+      candidates: matches.length > 1 ? matches : []
+    };
+  } catch {
+    return { configured: true, available: false, status: "unavailable", candidates: [] };
+  }
+}
+
 async function seerrOverview() {
   const [issueCounts, pendingRequests] = await Promise.all([
     seerrApi("issue/count"),
@@ -10423,6 +10906,80 @@ function createServer() {
     description: "Return compact actionable counts for queues, download clients, Plex streams, and Seerr issues/requests."
   }, async () => jsonText(await mediaAdminOverview()));
 
+  server.registerTool("media_public_library_summary", {
+    title: "Privacy-Safe Media Library Summary",
+    description: "Return aggregate TV and movie library counts, missing-item counts, and storage totals without users, paths, service IDs, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {}
+  }, async () => jsonText(await mediaPublicLibrarySummary()));
+
+  server.registerTool("media_public_title_summary", {
+    title: "Privacy-Safe Media Title Summary",
+    description: "Return exact-title TV or movie availability, monitoring, episode counts, lifecycle, and storage without users, paths, service IDs, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      title: z.string().min(1).max(200),
+      mediaType: z.enum(["tv", "movie"]).optional(),
+      year: z.number().int().min(1870).max(2100).optional()
+    }
+  }, async (input) => jsonText(await mediaPublicTitleSummary(input)));
+
+  server.registerTool("media_public_health_summary", {
+    title: "Privacy-Safe Media Service Health",
+    description: "Return configured and online flags for media services without versions, URLs, credentials, host details, or raw status data.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      service: z.enum([
+        "plex",
+        "sonarr",
+        "radarr",
+        "bazarr",
+        "seerr",
+        "prowlarr",
+        "qbittorrent",
+        "nzbget",
+        "tautulli",
+        "tracearr",
+        "threadfin"
+      ]).optional()
+    }
+  }, async ({ service }) => jsonText(await mediaPublicHealthSummary(service)));
+
+  server.registerTool("media_public_queue_summary", {
+    title: "Privacy-Safe Download Queue Summary",
+    description: "Return aggregate download queue and problem counts without download names, hashes, paths, users, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {}
+  }, async () => jsonText(await mediaPublicQueueSummary()));
+
+  server.registerTool("media_public_subtitle_summary", {
+    title: "Privacy-Safe Subtitle Summary",
+    description: "Return aggregate Bazarr wanted-subtitle and provider counts without titles, paths, users, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {}
+  }, async () => jsonText(await mediaPublicSubtitleSummary()));
+
+  server.registerTool("media_public_recent_additions", {
+    title: "Privacy-Safe Recent Media Additions",
+    description: "Return a bounded list of recently added public media titles and dates without users, paths, service IDs, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      mediaType: z.enum(["tv", "movie"]).optional(),
+      limit: z.number().int().min(1).max(10).default(5)
+    }
+  }, async (input) => jsonText(await mediaPublicRecentAdditions(input)));
+
+  server.registerTool("media_public_request_status", {
+    title: "Privacy-Safe Media Request Status",
+    description: "Return exact-title Seerr availability/request status without requester identity, internal IDs, service URLs, or raw records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      title: z.string().min(1).max(200),
+      mediaType: z.enum(["tv", "movie"]).optional(),
+      year: z.number().int().min(1870).max(2100).optional()
+    }
+  }, async (input) => jsonText(await mediaPublicRequestStatus(input)));
+
   server.registerTool("media_diagnostics_bundle", {
     title: "Media Diagnostics Bundle",
     description: "Collect a concise diagnosis bundle across queues, requests, issues, subtitles, and indexers.",
@@ -10507,6 +11064,13 @@ function createServer() {
     title: "Plex Availability",
     description: "Check whether Plex is reachable and return only its active stream count."
   }, async () => jsonText(await plexAvailability()));
+
+  server.registerTool("plex_public_bandwidth_summary", {
+    title: "Privacy-Safe Plex Monthly Bandwidth",
+    description: "Return current-month aggregate Plex LAN, WAN, and total bandwidth without users, accounts, devices, titles, or raw statistics.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {}
+  }, async () => jsonText(await plexPublicBandwidthSummary()));
 
   server.registerTool("plex_list_libraries", {
     title: "Plex List Libraries",

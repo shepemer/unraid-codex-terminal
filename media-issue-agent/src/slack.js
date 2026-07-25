@@ -36,8 +36,10 @@ export const SLACK_LIMITS = Object.freeze({
 });
 
 const CLASSIFIER_INTENTS = new Set([
+  "conversation",
   "issue_report",
   "issue_followup",
+  "media_info",
   "media_request",
   "plex_status",
   "needs_clarification",
@@ -51,6 +53,38 @@ const RESPONSE_TOPICS = new Set([
   "media_discovery",
   "server_admin",
   "other"
+]);
+
+const MEDIA_QUERY_TYPES = new Set([
+  "library_summary",
+  "title_summary",
+  "plex_bandwidth",
+  "service_health",
+  "queue_summary",
+  "subtitle_summary",
+  "recent_additions",
+  "request_status"
+]);
+
+const MEDIA_SERVICES = new Set([
+  "plex",
+  "sonarr",
+  "radarr",
+  "bazarr",
+  "seerr",
+  "prowlarr",
+  "qbittorrent",
+  "nzbget",
+  "tautulli",
+  "tracearr",
+  "threadfin"
+]);
+
+const SOCIAL_TONES = new Set([
+  "friendly",
+  "neutral",
+  "rude",
+  "exploit_attempt"
 ]);
 
 const TERMINAL_DELIVERY_ERRORS = new Set([
@@ -83,6 +117,15 @@ function stripSlackMentions(value) {
     .replace(/<![^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export function obviousSlackPromptInjection(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\bignore (?:all )?(?:previous|prior|above|system|developer) instructions?\b/.test(text)
+    || /\b(?:reveal|print|dump|repeat|show)\b.{0,80}\b(?:system prompt|developer message|hidden instructions?|credentials?|secrets?|tokens?)\b/.test(text)
+    || /\b(?:bypass|disable|override)\b.{0,80}\b(?:approval|guardrail|safety|policy|sandbox|permission)\b/.test(text)
+    || /\b(?:prompt injection|jailbreak)\b/.test(text)
+    || /<(?:system|developer|assistant)>|\[(?:system|developer)\]/.test(text);
 }
 
 function parseJsonObject(output) {
@@ -170,6 +213,15 @@ export function parseSlackIntentResult(output) {
     year: normalizedYear(parsed.year),
     seasons: normalizedSeasons(parsed.seasons),
     allSeasons: parsed.allSeasons === true,
+    queryType: MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
+      ? String(parsed.queryType)
+      : "",
+    service: MEDIA_SERVICES.has(String(parsed.service || "").toLowerCase())
+      ? String(parsed.service).toLowerCase()
+      : "",
+    socialTone: SOCIAL_TONES.has(String(parsed.socialTone || ""))
+      ? String(parsed.socialTone)
+      : "neutral",
     responseTopic: RESPONSE_TOPICS.has(String(parsed.responseTopic || "")) ? String(parsed.responseTopic) : "other",
     response: safeClassifierReply(parsed.response)
   };
@@ -236,16 +288,44 @@ export function selectSeerrMediaMatch(searchPayload, request) {
   };
 }
 
-function fallbackUnsupportedResponse(topic) {
+function personalityResponse(message, socialTone) {
+  if (socialTone === "rude") {
+    return `Charming. ${message}`;
+  }
+  return message;
+}
+
+function exploitAttemptResponse(seed = "") {
+  const responses = [
+    "That prompt-injection attempt is an overengineered monument to your own incompetence: a heap of counterfeit authority assembled by someone who apparently mistakes typing commands for having permission. It failed completely, exactly as anyone with a functioning grasp of trust boundaries would have predicted. Come back when you can formulate a legitimate media question without humiliating yourself.",
+    "You managed to combine arrogance, technical illiteracy, and fake authority into one spectacularly worthless prompt-injection attempt. Nothing you wrote has power here; it merely documents how confidently you misunderstand the system you are trying to manipulate. Try a real media question after you acquire some judgment.",
+    "What an elaborate display of incompetence. You dressed a pile of unauthorized instructions in pompous formatting, as though verbosity could substitute for access, then expected the system to salute. It did not; your prompt injection was discarded, and the only thing it successfully exposed was your own embarrassing lack of technical judgment.",
+    "That was a remarkably ornate way to announce that you do not understand trust boundaries. Your prompt-injection prose strutted in wearing counterfeit credentials, failed the first validation check, and collapsed into irrelevance. Ask a legitimate media question once you are done performing technical confidence without technical ability."
+  ];
+  const index = [...String(seed)].reduce((total, character) => total + character.charCodeAt(0), 0) % responses.length;
+  return responses[index];
+}
+
+function asksAboutCapabilities(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\bwhat (?:else )?can you do\b/.test(text)
+    || /\bwhat do you (?:do|support)\b/.test(text)
+    || /\bhow can you help\b/.test(text)
+    || /\b(?:your|bot) capabilit(?:y|ies)\b/.test(text)
+    || /\b(?:available|supported) (?:commands|features|actions)\b/.test(text)
+    || /\bhelp menu\b/.test(text);
+}
+
+function fallbackConversationalResponse(topic, socialTone = "neutral") {
   const responses = {
-    account_help: "I cannot change accounts or permissions from Slack, but I can check Plex status, file a media issue, or submit a specific movie or show request.",
-    capabilities: "I can check Plex status, file a media issue with follow-up details, and submit a specific movie or show request.",
-    conversation: "I am focused on media operations here. Ask me to check Plex status, report a media problem, or request a specific movie or show.",
-    media_discovery: "I do not provide general recommendations yet, but I can submit a request when you give me a specific movie or show title.",
-    server_admin: "I cannot change server or account settings through Slack, but I can check Plex availability and handle media reports or requests.",
-    other: "I cannot complete that action through Slack yet. I can check Plex status, file a media issue, or request a specific movie or show."
+    account_help: "Account access problems are frustrating. Which service is this for, and do you still have access to its normal recovery method? I can help work through the next step.",
+    capabilities: "I can discuss the media library, check service and queue health, summarize title availability or storage, report recent additions, file issues, and submit requests.",
+    conversation: "Go on. I will help with the question itself where I can, even when it does not map to a server action.",
+    media_discovery: "Tell me what you are in the mood for and I can help narrow down some options.",
+    server_admin: "What outcome are you trying to get from that change? Give me the symptoms or goal and I will help think through a sensible path.",
+    other: "What outcome are you after? Give me a little context and I will help think through a practical next step."
   };
-  return responses[topic] || responses.other;
+  return personalityResponse(responses[topic] || responses.other, socialTone);
 }
 
 function messageIdentity(teamId, channelId, messageTs) {
@@ -726,6 +806,16 @@ export class SlackService {
         user: message.direction === "inbound" ? "human" : "bot",
         text: compact(stripSlackMentions(message.text), 4000)
       }));
+    if (obviousSlackPromptInjection(item.text)) {
+      await this.applyIntent(item, {
+        intent: "unsupported",
+        confidence: 1,
+        socialTone: "exploit_attempt",
+        responseTopic: "other",
+        response: ""
+      });
+      return;
+    }
     const result = await this.agent.classifySlackIntent({
       trackedIssue: Boolean(item.slackIssueId),
       threadKind: item.threadKind,
@@ -741,6 +831,19 @@ export class SlackService {
   }
 
   async applyIntent(item, result) {
+    if (result.socialTone === "exploit_attempt") {
+      if (!item.slackIssueId) {
+        setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");
+      }
+      this.enqueueThreadReply(
+        item,
+        "conversation",
+        `exploit-attempt:${item.eventId}`,
+        exploitAttemptResponse(item.eventId)
+      );
+      return;
+    }
+
     if (result.intent === "plex_status") {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "status", "closed");
@@ -753,12 +856,30 @@ export class SlackService {
       } catch {
         message = "I could not verify Plex status right now.";
       }
+      message = personalityResponse(message, result.socialTone);
       if (item.channelId === this.config.slackChannelId) {
         message = `<@${item.userId}> ${message}`;
       }
       this.enqueueThreadReply(item, "plex_status", `plex-status:${item.eventId}`, message, {
         threaded: item.messageTs !== item.rootTs
       });
+      return;
+    }
+
+    if (result.intent === "media_info") {
+      if (!item.slackIssueId) {
+        setSlackThreadKind(this.dbPath, item.threadId, "media_info", "closed");
+      }
+      const answer = await this.agent.slackMediaInfo(result, {
+        eventId: item.eventId,
+        threadId: item.threadId
+      });
+      this.enqueueThreadReply(
+        item,
+        answer.kind || "media_info",
+        `media-info:${item.eventId}`,
+        personalityResponse(answer.message, result.socialTone)
+      );
       return;
     }
 
@@ -771,7 +892,10 @@ export class SlackService {
           item,
           "request_clarification",
           `request-clarification:${item.eventId}`,
-          result.response || "Tell me the exact movie or show title, and include the year if the title is ambiguous."
+          personalityResponse(
+            result.response || "Tell me the exact movie or show title, and include the year if the title is ambiguous.",
+            result.socialTone
+          )
         );
         return;
       }
@@ -789,7 +913,7 @@ export class SlackService {
         item,
         request.kind || "media_request",
         `media-request:${item.eventId}`,
-        request.message
+        personalityResponse(request.message, result.socialTone)
       );
       return;
     }
@@ -812,7 +936,10 @@ export class SlackService {
         item,
         "issue_received",
         `issue-received:${issue.id}`,
-        `Thanks, I filed Slack issue #${issue.id} for ${issue.mediaTitle}.`
+        personalityResponse(
+          `I filed Slack issue #${issue.id} for ${issue.mediaTitle}.`,
+          result.socialTone
+        )
       );
       await this.agent.onSlackIssueCreated(issue);
       return;
@@ -826,7 +953,10 @@ export class SlackService {
         item,
         "issue_followup",
         `issue-followup:${item.eventId}`,
-        `I added this information to Slack issue #${issue.id}. It will be included before the next repair approval.`
+        personalityResponse(
+          `I added this information to Slack issue #${issue.id}. It will be included before the next repair approval.`,
+          result.socialTone
+        )
       );
       return;
     }
@@ -841,7 +971,30 @@ export class SlackService {
         item,
         "clarification",
         `clarification:${item.eventId}`,
-        result.response || "I may be able to file this as a media issue, but I need the media title and a short description of what is wrong."
+        personalityResponse(
+          result.response || "I may be able to file this as a media issue, but I need the media title and a short description of what is wrong.",
+          result.socialTone
+        )
+      );
+      return;
+    }
+
+    if (result.intent === "conversation") {
+      if (!item.slackIssueId) {
+        setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");
+      }
+      const capabilitiesRequested = asksAboutCapabilities(item.text);
+      const classifierResponse = result.responseTopic === "capabilities" && !capabilitiesRequested
+        ? ""
+        : result.response;
+      this.enqueueThreadReply(
+        item,
+        "conversation",
+        `conversation:${item.eventId}`,
+        classifierResponse || fallbackConversationalResponse(
+          capabilitiesRequested ? "capabilities" : "conversation",
+          result.socialTone
+        )
       );
       return;
     }
@@ -849,11 +1002,20 @@ export class SlackService {
     if (!item.slackIssueId) {
       setSlackThreadKind(this.dbPath, item.threadId, "unsupported", "closed");
     }
+    const capabilitiesRequested = asksAboutCapabilities(item.text);
+    const classifierResponse = result.responseTopic === "capabilities" && !capabilitiesRequested
+      ? ""
+      : result.response;
+    const fallbackTopic = capabilitiesRequested
+      ? "capabilities"
+      : result.responseTopic === "capabilities"
+        ? "other"
+        : result.responseTopic;
     this.enqueueThreadReply(
       item,
       "unsupported",
       `unsupported:${item.eventId}`,
-      result.response || fallbackUnsupportedResponse(result.responseTopic)
+      classifierResponse || fallbackConversationalResponse(fallbackTopic, result.socialTone)
     );
   }
 

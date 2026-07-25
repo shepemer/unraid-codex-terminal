@@ -58,6 +58,7 @@ jobs:
           npm --prefix media-mcp run test:seerr-issues
           npm --prefix media-mcp run test:arr-commands
           npm --prefix media-mcp run test:bazarr-subtitles
+          npm --prefix media-mcp run test:public-info
           npm --prefix media-mcp run test:repair-capabilities
           npm --prefix media-mcp run test:threadfin
 
