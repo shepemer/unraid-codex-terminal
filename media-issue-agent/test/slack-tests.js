@@ -22,7 +22,13 @@ import {
   slackQueueStatus,
   slackRateCounts
 } from "../src/db.js";
-import { parseSlackIntentResult, SLACK_LIMITS, SlackService, SlackSocketTransport } from "../src/slack.js";
+import {
+  parseSlackIntentResult,
+  selectSeerrMediaMatch,
+  SLACK_LIMITS,
+  SlackService,
+  SlackSocketTransport
+} from "../src/slack.js";
 import { redactText } from "../src/redact.js";
 import { slackMessagePushoverPayload } from "../src/pushover.js";
 
@@ -144,8 +150,57 @@ async function testConfigAndClassifierContract() {
     confidence: 0.94,
     mediaTitle: "Fixture Movie",
     description: "Playback fails after ten minutes.",
-    clarification: ""
+    clarification: "",
+    mediaType: "",
+    year: null,
+    seasons: [],
+    allSeasons: false,
+    responseTopic: "other",
+    response: ""
   });
+  assert.deepEqual(parseSlackIntentResult({
+    intent: "media_request",
+    confidence: 0.97,
+    mediaTitle: "Fixture Show",
+    description: "",
+    clarification: "",
+    mediaType: "tv",
+    year: 2024,
+    seasons: [3, 1, 3, -1],
+    allSeasons: false,
+    responseTopic: "media_discovery",
+    response: "I can submit that show request."
+  }), {
+    intent: "media_request",
+    confidence: 0.97,
+    mediaTitle: "Fixture Show",
+    description: "",
+    clarification: "",
+    mediaType: "tv",
+    year: 2024,
+    seasons: [1, 3],
+    allSeasons: false,
+    responseTopic: "media_discovery",
+    response: "I can submit that show request."
+  });
+  assert.equal(parseSlackIntentResult({
+    intent: "unsupported",
+    confidence: 0.99,
+    responseTopic: "account_help",
+    response: "Contact fixture@example.test at http://192.0.2.1/private"
+  }).response, "");
+  assert.equal(parseSlackIntentResult({
+    intent: "unsupported",
+    confidence: 0.99,
+    responseTopic: "conversation",
+    response: "Ask <#C12345678|private-channel> for help."
+  }).response, "Ask for help.");
+  assert.equal(parseSlackIntentResult({
+    intent: "issue_report",
+    confidence: 0.99,
+    mediaTitle: "<#C12345678|private-channel> Fixture Movie",
+    description: "Playback fails after ten minutes."
+  }).mediaTitle, "Fixture Movie");
   assert.equal(validateDraftComment("slack", "The repair is complete.").valid, true);
   assert.equal(validateDraftComment("plex", "The repair is complete.").valid, false);
   assert.equal(redactText("xoxb-1234567890-secretfixture"), "[REDACTED_SLACK_TOKEN]");
@@ -222,6 +277,28 @@ async function testSocketTransportStartupAndAck() {
   assert.match(posts[0].client_msg_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(posts[0].client_msg_id, posts[1].client_msg_id);
   await transport.stop();
+
+  const missingScopeTransport = new SlackSocketTransport({
+    slackAppToken: "xapp-fixture",
+    slackBotToken: "xoxb-fixture",
+    slackChannelId: "C-ISSUES"
+  }, {
+    socketClient: socket,
+    webClient: {
+      ...web,
+      conversations: {
+        info: async () => {
+          const error = new Error("missing_scope");
+          error.data = { error: "missing_scope", needed: "groups:read" };
+          throw error;
+        }
+      }
+    }
+  });
+  await assert.rejects(
+    missingScopeTransport.start(async () => {}),
+    /configured Slack channel appears to be private/
+  );
 }
 
 async function testSlackMessageWorkflow() {
@@ -237,6 +314,32 @@ async function testSlackMessageWorkflow() {
       diagnostic() {},
       async classifySlackIntent(context) {
         classifiedContexts.push(context);
+        if (/request Fixture Show/i.test(context.newestMessage)) {
+          return {
+            intent: "media_request",
+            confidence: 0.99,
+            mediaTitle: "Fixture Show",
+            description: "",
+            clarification: "",
+            mediaType: "tv",
+            year: 2024,
+            seasons: [1],
+            allSeasons: false,
+            responseTopic: "other",
+            response: ""
+          };
+        }
+        if (/reset my password/i.test(context.newestMessage)) {
+          return {
+            intent: "unsupported",
+            confidence: 0.99,
+            mediaTitle: "",
+            description: "",
+            clarification: "",
+            responseTopic: "account_help",
+            response: "I cannot reset an account password, but I can help with a Plex status check, media report, or media request."
+          };
+        }
         if (/server up/i.test(context.newestMessage)) {
           return {
             intent: "plex_status",
@@ -266,6 +369,13 @@ async function testSlackMessageWorkflow() {
       async slackPlexStatus() {
         return { up: true, activeStreamCount: 3 };
       },
+      async slackRequestMedia(result) {
+        return {
+          completed: true,
+          kind: "media_request_submitted",
+          message: `I submitted a Seerr request for ${result.mediaTitle}.`
+        };
+      },
       async onSlackIssueCreated(issue) {
         callbacks.push(["created", issue.id]);
       },
@@ -277,7 +387,7 @@ async function testSlackMessageWorkflow() {
     service.botUserId = "B-BOT";
     service.teamId = "T-FIXTURE";
 
-  assert.deepEqual(await service.ingestEnvelope(envelope({
+    assert.deepEqual(await service.ingestEnvelope(envelope({
       eventId: "EV-IGNORED",
       channel: "C-OTHER",
       ts: "1.000",
@@ -314,11 +424,18 @@ async function testSlackMessageWorkflow() {
     assert.deepEqual(callbacks, [["created", 1]]);
 
     assert.deepEqual(await service.ingestEnvelope(envelope({
+      eventId: "EV-FOLLOWUP-UNMENTIONED",
+      type: "message",
+      ts: "2.050",
+      threadTs: "2.000",
+      text: "This should be ignored because the bot was not mentioned."
+    })), { accepted: false });
+    assert.deepEqual(await service.ingestEnvelope(envelope({
       eventId: "EV-FOLLOWUP",
       type: "message",
       ts: "2.100",
       threadTs: "2.000",
-      text: "It also fails on a second player."
+      text: "<@B-BOT> It also fails on a second player."
     })), { accepted: true, duplicate: false });
     assert.equal(await service.processPendingForTest(), 1);
     assert.equal(classifiedContexts[1].recentMessages.length, 1);
@@ -329,6 +446,17 @@ async function testSlackMessageWorkflow() {
     const repeatedEvidence = applySlackIssueEvidenceMessage(config.dbPath, 1, followupMessage.id);
     assert.equal(repeatedEvidence.applied, false);
     assert.equal(repeatedEvidence.issue.evidenceVersion, 2);
+    assert.match(slackIssueDetails(config.dbPath, 1).conversation
+      .find(message => message.messageTs === "2.100").text, /It also fails on a second player/);
+
+    assert.deepEqual(await service.ingestEnvelope(envelope({
+      eventId: "EV-STATUS-THREAD",
+      type: "message",
+      ts: "2.200",
+      threadTs: "2.000",
+      text: "<@B-BOT> Is the Plex server up?"
+    })), { accepted: true, duplicate: false });
+    assert.equal(await service.processPendingForTest(), 1);
 
     assert.deepEqual(await service.ingestEnvelope(envelope({
       eventId: "EV-STATUS",
@@ -340,9 +468,11 @@ async function testSlackMessageWorkflow() {
 
     const received = transport.posts.find(post => post.kind === "issue_received");
     const followup = transport.posts.find(post => post.kind === "issue_followup");
-    const status = transport.posts.find(post => post.kind === "plex_status");
+    const status = transport.posts.find(post => post.dedupeKey === "plex-status:EV-STATUS");
+    const threadedStatus = transport.posts.find(post => post.dedupeKey === "plex-status:EV-STATUS-THREAD");
     assert.equal(received.threadTs, "2.000");
     assert.equal(followup.threadTs, "2.000");
+    assert.equal(threadedStatus.threadTs, "2.000");
     assert.equal(status.threadTs, null);
     assert.match(status.message, /^<@U-REPORTER> Plex is online\. 3 active streams\.$/);
 
@@ -371,10 +501,113 @@ async function testSlackMessageWorkflow() {
     assert.match(unavailable.message, /could not verify Plex status/i);
     assert.doesNotMatch(unavailable.message, /offline/i);
 
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-REQUEST",
+      ts: "3.200",
+      text: "<@B-BOT> Please request Fixture Show season 1."
+    }));
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-UNSUPPORTED",
+      ts: "3.300",
+      text: "<@B-BOT> Can you reset my password?"
+    }));
+    assert.equal(await service.processPendingForTest(), 2);
+    await service.sendPendingForTest();
+    const request = transport.posts.find(post => post.dedupeKey === "media-request:EV-REQUEST");
+    const unsupported = transport.posts.find(post => post.dedupeKey === "unsupported:EV-UNSUPPORTED");
+    assert.equal(request.threadTs, "3.200");
+    assert.match(request.message, /submitted a Seerr request for Fixture Show/);
+    assert.equal(unsupported.threadTs, "3.300");
+    assert.match(unsupported.message, /cannot reset an account password/);
+
     assert.deepEqual(slackQueueStatus(config.dbPath).inbound, {
       pending: 0,
       processing: 0,
       failed: 0
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testMediaRequestSelectionAndSubmission() {
+  const search = {
+    results: [
+      {
+        id: 101,
+        mediaType: "movie",
+        title: "Fixture Feature",
+        releaseDate: "2025-02-10",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 202,
+        mediaType: "tv",
+        name: "Fixture Feature",
+        firstAirDate: "2024-03-11",
+        mediaInfo: { status: 2 }
+      }
+    ]
+  };
+  assert.equal(selectSeerrMediaMatch(search, {
+    mediaTitle: "Fixture Feature",
+    mediaType: "",
+    year: null
+  }).status, "ambiguous");
+  assert.equal(selectSeerrMediaMatch(search, {
+    mediaTitle: "Fixture Feature",
+    mediaType: "tv",
+    year: 2024
+  }).match.mediaId, 202);
+
+  const root = await tempDir();
+  try {
+    const calls = [];
+    const agent = new MediaIssueAgent(baseConfig(root), {
+      async callTool(name, args) {
+        calls.push({ name, args });
+        if (name === "seerr_search_media") {
+          return search;
+        }
+        if (name === "seerr_request_media") {
+          return { id: 303, status: 1 };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    });
+    const ambiguous = await agent.slackRequestMedia({
+      mediaTitle: "Fixture Feature",
+      mediaType: "",
+      year: null,
+      seasons: []
+    });
+    assert.equal(ambiguous.completed, false);
+    assert.equal(calls.filter(call => call.name === "seerr_request_media").length, 0);
+
+    const missingSeasonScope = await agent.slackRequestMedia({
+      mediaTitle: "Fixture Feature",
+      mediaType: "tv",
+      year: 2024,
+      seasons: [],
+      allSeasons: false
+    });
+    assert.equal(missingSeasonScope.completed, false);
+    assert.equal(missingSeasonScope.kind, "request_clarification");
+    assert.match(missingSeasonScope.message, /which season|all seasons/i);
+    assert.equal(calls.filter(call => call.name === "seerr_request_media").length, 0);
+
+    const requested = await agent.slackRequestMedia({
+      mediaTitle: "Fixture Feature",
+      mediaType: "tv",
+      year: 2024,
+      seasons: [],
+      allSeasons: true
+    });
+    assert.equal(requested.completed, true);
+    assert.match(requested.message, /all available seasons/);
+    assert.deepEqual(calls.at(-1), {
+      name: "seerr_request_media",
+      args: { mediaId: 202, mediaType: "tv", seasons: "all" }
     });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -472,20 +705,22 @@ async function testRateAccounting() {
   try {
     const dbPath = path.join(root, "state.sqlite");
     await initDb(dbPath);
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < SLACK_LIMITS.userInteractionsPerTenMinutes; index += 1) {
       recordSlackRateEvent(dbPath, "T-RATE", "U-RATE", "interaction");
     }
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < SLACK_LIMITS.userClassifiersPerHour; index += 1) {
       recordSlackRateEvent(dbPath, "T-RATE", "U-RATE", "classifier");
     }
     const counts = slackRateCounts(dbPath, "T-RATE", "U-RATE");
-    assert.equal(counts.userInteractions, 12);
-    assert.equal(counts.workspaceInteractions, 12);
-    assert.equal(counts.userClassifiers, 5);
-    assert.equal(counts.workspaceClassifiers, 5);
+    assert.equal(counts.userInteractions, 36);
+    assert.equal(counts.workspaceInteractions, 36);
+    assert.equal(counts.userClassifiers, 15);
+    assert.equal(counts.workspaceClassifiers, 15);
     const blocked = consumeSlackRateLimit(dbPath, "T-RATE", "U-RATE", SLACK_LIMITS);
     assert.equal(blocked.allowed, false);
     assert.equal(blocked.reason, "user_interaction_limit");
+    const otherUser = consumeSlackRateLimit(dbPath, "T-RATE", "U-OTHER", SLACK_LIMITS);
+    assert.equal(otherUser.allowed, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -582,6 +817,7 @@ async function testSlackLifecycleActionsStayLocal() {
 await testConfigAndClassifierContract();
 await testSocketTransportStartupAndAck();
 await testSlackMessageWorkflow();
+await testMediaRequestSelectionAndSubmission();
 await testIssueCreationRetryIsIdempotent();
 await testSlackQueueRecoveryOnlyRunsAtSlackStartup();
 await testRateAccounting();

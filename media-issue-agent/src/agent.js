@@ -71,7 +71,7 @@ import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, vali
 import { redactText, sanitizeValue } from "./redact.js";
 import { createDiagnosticLogger } from "./diagnostic-log.js";
 import { pushoverConfigured, sendPushoverMessage } from "./pushover.js";
-import { parseSlackIntentResult, queueSlackIssueMessage, SlackService } from "./slack.js";
+import { parseSlackIntentResult, queueSlackIssueMessage, selectSeerrMediaMatch, SlackService } from "./slack.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -2536,6 +2536,95 @@ export class MediaIssueAgent {
     }
   }
 
+  async slackRequestMedia(request, metadata = {}) {
+    const requestedTitle = String(request?.mediaTitle || "").trim();
+    this.diagnostic("info", "slack_media_request_started", {
+      threadId: metadata.threadId || null,
+      mediaType: request?.mediaType || null,
+      titleLength: requestedTitle.length,
+      yearProvided: Boolean(request?.year),
+      seasonCount: Array.isArray(request?.seasons) ? request.seasons.length : 0,
+      allSeasons: request?.allSeasons === true
+    });
+    try {
+      const search = await this.client.callTool("seerr_search_media", {
+        query: requestedTitle,
+        page: 1
+      });
+      const selection = selectSeerrMediaMatch(search, request);
+      if (selection.status !== "matched") {
+        const candidateText = selection.candidates
+          .map(candidate => `${candidate.title}${candidate.year ? ` (${candidate.year})` : ""} [${candidate.mediaType === "tv" ? "TV" : "movie"}]`)
+          .join(", ");
+        const message = selection.status === "ambiguous"
+          ? `I found more than one possible match${candidateText ? `: ${candidateText}` : ""}. Mention me again with the exact title, year, and whether it is a movie or show.`
+          : `I could not find an exact Seerr match for ${requestedTitle}. Check the title and include the release year if available.`;
+        this.diagnostic("info", "slack_media_request_needs_clarification", {
+          threadId: metadata.threadId || null,
+          reason: selection.status,
+          candidateCount: selection.candidates.length
+        });
+        return { completed: false, kind: "request_clarification", message };
+      }
+      const match = selection.match;
+      const label = `${match.title}${match.year ? ` (${match.year})` : ""}`;
+      if (match.available) {
+        return {
+          completed: true,
+          kind: "media_already_available",
+          message: `${label} is already available in the media library.`
+        };
+      }
+      if (match.mediaType === "tv"
+        && !request.seasons?.length
+        && request.allSeasons !== true) {
+        return {
+          completed: false,
+          kind: "request_clarification",
+          message: `Tell me which season of ${label} to request, or explicitly ask for all seasons.`
+        };
+      }
+      const args = {
+        mediaId: match.mediaId,
+        mediaType: match.mediaType
+      };
+      if (match.mediaType === "tv") {
+        args.seasons = request.seasons?.length ? request.seasons : "all";
+      }
+      await this.client.callTool("seerr_request_media", args);
+      const target = match.mediaType === "tv"
+        ? request.seasons?.length
+          ? `season${request.seasons.length === 1 ? "" : "s"} ${request.seasons.join(", ")} of ${label}`
+          : `all available seasons of ${label}`
+        : label;
+      this.diagnostic("info", "slack_media_request_completed", {
+        threadId: metadata.threadId || null,
+        mediaType: match.mediaType,
+        year: match.year,
+        seasonCount: request.seasons?.length || 0
+      });
+      return {
+        completed: true,
+        kind: "media_request_submitted",
+        message: `I submitted a Seerr request for ${target}.`
+      };
+    } catch (error) {
+      const duplicate = /already (?:been )?requested|duplicate|no seasons available/i.test(String(error?.message || ""));
+      this.diagnostic("warn", "slack_media_request_failed", {
+        threadId: metadata.threadId || null,
+        duplicate,
+        error: error.message
+      });
+      return {
+        completed: duplicate,
+        kind: duplicate ? "media_request_exists" : "media_request_failed",
+        message: duplicate
+          ? `${requestedTitle} is already available or already has an active request.`
+          : `I found ${requestedTitle}, but Seerr could not accept the request right now. Please try again later.`
+      };
+    }
+  }
+
   latestSnapshotLocationFor(source, issueId) {
     const snapshot = this.latestWithEntries();
     if (!snapshot) {
@@ -3033,7 +3122,8 @@ export class MediaIssueAgent {
       "queued_for_investigation",
       "awaiting_action_approval",
       "blocked_needs_human",
-      "failed_retryable"
+      "failed_retryable",
+      "failed_terminal"
     ], "investigating");
     if (options.force || slackEvidenceStale) {
       supersedePendingApprovals(this.config.dbPath, job.id);
@@ -3533,7 +3623,7 @@ export class MediaIssueAgent {
     };
   }
 
-  returnRepairToInvestigationReview(jobId, actor, message, context = {}) {
+  recordRepairFailureForOperatorReview(jobId, actor, message, context = {}) {
     const details = this.jobDetails(jobId);
     if (!details?.investigation) {
       const current = jobForId(this.config.dbPath, jobId);
@@ -3561,44 +3651,43 @@ export class MediaIssueAgent {
     supersedePendingApprovals(this.config.dbPath, jobId, "action");
     const current = jobForId(this.config.dbPath, jobId);
     if (!current) {
-      throw new Error(`Job ${jobId} was not found while returning repair to review`);
+      throw new Error(`Job ${jobId} was not found while recording repair failure`);
     }
-    const { approval } = transitionJobAndCreateApproval(
-      this.config.dbPath,
-      jobId,
-      [current.state],
-      "awaiting_action_approval",
-      "action",
-      buildPlan(details.job, evidence, investigation.summary),
-      "cli",
-      message
-    );
-    this.diagnostic("warn", "repair_returned_to_investigation_review", {
+    const resultStatus = String(context.repairResult?.status || "");
+    const targetState = resultStatus === "failed_terminal"
+      ? "failed_terminal"
+      : resultStatus === "needs_operator_decision"
+        ? "blocked_needs_human"
+        : "failed_retryable";
+    transitionJob(this.config.dbPath, jobId, [current.state], targetState, message);
+    this.diagnostic("warn", "repair_failed_awaiting_operator_review", {
       jobId,
       actor,
-      approvalId: approval.id,
       agentRunId: context.agentRunId || null,
+      targetState,
       message
     });
-    recordAudit(this.config.dbPath, "repair_returned_to_investigation_review", sanitizeValue({
+    recordAudit(this.config.dbPath, "repair_failed_awaiting_operator_review", sanitizeValue({
       actor,
-      approvalId: approval.id,
       agentRunId: context.agentRunId || null,
+      targetState,
+      repairResult: context.repairResult || null,
       message
     }), jobId);
     this.queueSlackJobUpdate(
       jobId,
       "repair_needs_review",
-      `repair-needs-review:${jobId}:${context.agentRunId || approval.id}`,
+      `repair-needs-review:${jobId}:${context.agentRunId || Date.now()}`,
       "The repair could not be completed automatically and needs operator review. The issue remains open."
     );
     return {
       jobId,
-      status: "awaiting_action_approval",
-      approvalId: approval.id,
-      approvalKind: "action",
-      message: "Repair did not complete. Review or steer the investigation, then approve the revised repair plan.",
-      summary: investigation.summary
+      status: targetState,
+      approvalId: null,
+      approvalKind: null,
+      message: "Repair did not complete. Review the result, then choose whether to re-investigate or close the issue with the recorded outcome.",
+      summary: investigation.summary,
+      repairResult: context.repairResult || null
     };
   }
 
@@ -3790,7 +3879,7 @@ export class MediaIssueAgent {
       const message = redactText(error.message);
       this.diagnostic("error", "repair_agent_preparation_failed", { jobId, actor, error: error.message });
       recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, error: error.message, phase: "preparation" }), jobId);
-      return this.returnRepairToInvestigationReview(jobId, actor, message);
+      return this.recordRepairFailureForOperatorReview(jobId, actor, message);
     }
     const { prompt: repairPrompt, workspace, settings, toolBriefing } = prepared;
     const agentRun = createAgentRun(this.config.dbPath, jobId, "repair", repairPrompt, settings);
@@ -3907,7 +3996,7 @@ export class MediaIssueAgent {
           proposedChoices: repairResult.proposedChoices
         });
         recordAudit(this.config.dbPath, "repair_agent_needs_operator_decision", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
-        return this.returnRepairToInvestigationReview(jobId, actor, redactText(message), {
+        return this.recordRepairFailureForOperatorReview(jobId, actor, redactText(message), {
           agentRunId: agentRun.id,
           repairResult
         });
@@ -3923,7 +4012,7 @@ export class MediaIssueAgent {
           missingMcpItemCount: repairResult.missingMcpItems.length
         });
         recordAudit(this.config.dbPath, "repair_agent_failed", sanitizeValue({ actor, runId: agentRun.id, repairResult }), jobId);
-        return this.returnRepairToInvestigationReview(jobId, actor, redactText(message), {
+        return this.recordRepairFailureForOperatorReview(jobId, actor, redactText(message), {
           agentRunId: agentRun.id,
           repairResult
         });
@@ -3969,7 +4058,7 @@ export class MediaIssueAgent {
       recordAudit(this.config.dbPath, "execution_failed", sanitizeValue({ actor, runId: agentRun.id, error: error.message }), jobId);
       const current = jobForId(this.config.dbPath, jobId);
       if (current?.state !== "awaiting_action_approval") {
-        return this.returnRepairToInvestigationReview(jobId, actor, message, {
+        return this.recordRepairFailureForOperatorReview(jobId, actor, message, {
           agentRunId: agentRun.id,
           repairResult
         });
@@ -4053,7 +4142,7 @@ export class MediaIssueAgent {
         reason: note
       });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message: draft }), jobId);
-      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+      return this.recordRepairFailureForOperatorReview(jobId, actor, note, {
         agentRunId: executionResult?.agentRunId || null,
         repairResult: executionResult
       });
@@ -4067,7 +4156,7 @@ export class MediaIssueAgent {
         reason: note
       });
       recordAudit(this.config.dbPath, "resolution_draft_rejected", sanitizeValue({ actor, message }), jobId);
-      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+      return this.recordRepairFailureForOperatorReview(jobId, actor, note, {
         agentRunId: executionResult?.agentRunId || null,
         repairResult: executionResult
       });
@@ -4081,7 +4170,7 @@ export class MediaIssueAgent {
         errors: validation.errors
       });
       recordAudit(this.config.dbPath, "resolution_draft_validation_failed", sanitizeValue({ actor, errors: validation.errors }), jobId);
-      return this.returnRepairToInvestigationReview(jobId, actor, note, {
+      return this.recordRepairFailureForOperatorReview(jobId, actor, note, {
         agentRunId: executionResult?.agentRunId || null,
         repairResult: executionResult
       });

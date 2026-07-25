@@ -109,6 +109,23 @@ async function run() {
     if (req.method === "GET" && url.pathname === "/seerr/api/v1/issue/1") {
       return sendJson(res, 200, clone(issue));
     }
+    if (req.method === "GET" && url.pathname === "/seerr/api/v1/search") {
+      return sendJson(res, 200, {
+        page: 1,
+        totalPages: 1,
+        totalResults: 1,
+        results: [{
+          id: 901,
+          mediaType: "tv",
+          name: "Fixture Series",
+          firstAirDate: "2024-01-01",
+          mediaInfo: { status: 2 }
+        }]
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/seerr/api/v1/request") {
+      return sendJson(res, 201, { id: 902, status: 1, ...body });
+    }
     if (req.method === "GET" && url.pathname === "/seerr/api/v1/issue/404") {
       return sendJson(res, 404, { message: "Issue not found." });
     }
@@ -226,6 +243,26 @@ async function run() {
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     assert.ok(toolNames.has("seerr_update_issue"));
     assert.ok(toolNames.has("seerr_update_issue_comment"));
+    assert.ok(toolNames.has("seerr_search_media"));
+    assert.ok(toolNames.has("seerr_request_media"));
+
+    const searched = await tool("seerr_search_media", {
+      query: "Fixture Series",
+      page: 1
+    });
+    assert.equal(searched.results[0].name, "Fixture Series");
+    const requested = await tool("seerr_request_media", {
+      mediaId: 901,
+      mediaType: "tv",
+      seasons: "all"
+    });
+    assert.equal(requested.seasons, "all");
+    const requestCall = requests.find(request => request.method === "POST" && request.path === "/seerr/api/v1/request");
+    assert.deepEqual(requestCall.body, {
+      mediaId: 901,
+      mediaType: "tv",
+      seasons: "all"
+    });
 
     const beforeDryRunPuts = requests.filter(request => request.method === "PUT").length;
     const dryRun = await tool("seerr_update_issue", {

@@ -7,6 +7,7 @@ import { chromium, expect } from "@playwright/test";
 import { MediaIssueAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
 import {
+  completeAgentRun,
   createApproval,
   createAgentRun,
   ensureJob,
@@ -323,7 +324,16 @@ async function testIssueStateActionMatrix(browser) {
     upsertInvestigation(dbPath, resolution.id, { status: "ready", summary: "Resolution summary", evidence: {} });
     createApproval(dbPath, resolution.id, "resolution", {
       message: "Draft resolution comment.\nAutomated response from Codex.",
-      executionResult: { outcome: "client_side", actionsExecuted: 0 }
+      executionResult: {
+        outcome: "client_side",
+        summary: "The report was verified as client-side; no media mutation was needed.",
+        actionsExecuted: 0,
+        actions: [],
+        verification: {
+          status: "not_applicable",
+          details: "No server-side media repair was required."
+        }
+      }
     });
 
     const closed = ensureJob(dbPath, "seerr", "205");
@@ -348,6 +358,22 @@ async function testIssueStateActionMatrix(browser) {
       plan: { classification: "server_action", executionMode: "approved_repair_agent", actions: [] }
     });
     setPendingApprovals(dbPath, terminal.id, "approved", "fixture", "action");
+    const terminalRun = createAgentRun(dbPath, terminal.id, "repair", "Fixture terminal repair prompt", {
+      model: "fixture-model"
+    });
+    completeAgentRun(dbPath, terminalRun.id, "failed_terminal", {
+      status: "failed_terminal",
+      summary: "The replacement was attempted, but the media source rejected every candidate.",
+      actionsTaken: ["Searched available replacement releases.", "Rejected candidates that failed validation."],
+      verification: {
+        status: "failed",
+        details: "No valid replacement was imported, so the original issue remains open."
+      },
+      draftComment: "",
+      closeRecommended: false,
+      proposedChoices: [],
+      missingMcpItems: []
+    }, "No valid replacement was available.");
     upsertMissingMcpItems(dbPath, terminal.id, null, [{
       title: "Replace a fixture episode",
       description: "Expose a test MCP tool for replacing fixture episodes from the Web UI test.",
@@ -508,14 +534,20 @@ async function testIssueStateActionMatrix(browser) {
     await row(page, 3).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
     await expect(row(page, 3)).toHaveClass(/issue-active/);
-    await expect(page.locator("#investigation-output")).toContainText("Job");
-    await expect(page.locator("#investigation-full-report")).toContainText("Approved summary");
+    await expect(page.locator("#repair-live-view")).toBeVisible();
+    await expect(page.locator("#repair-live-log")).toContainText(/waiting for the Codex runner/i);
+    await expect(page.locator("#investigation-output")).toBeHidden();
+    await expect(page.locator("#investigation-review")).toBeHidden();
+    await expect(page.locator("#investigation-report-button")).toBeHidden();
     await expect(page.locator("#continue-button")).toBeVisible();
-    await expect(page.locator("#investigation-output")).not.toContainText("Cannot transition");
 
     await row(page, 4).getByRole("button", { name: "Approve fix" }).click();
-    await expect(page.locator("#investigation-output")).toContainText("Approve fix");
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-title")).toHaveText("Repair completed");
+    await expect(page.locator("#repair-result-summary")).toContainText("verified as client-side");
+    await expect(page.locator("#repair-result-verification")).toContainText("No server-side media repair was required");
+    await expect(page.locator("#repair-result-comment")).toContainText("Draft resolution comment");
+    await expect(page.locator("#investigation-output")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
     await expect(page.locator("#continue-button")).toBeHidden();
 
@@ -551,8 +583,21 @@ async function testIssueStateActionMatrix(browser) {
 
     await row(page, 6).getByRole("button", { name: "Review repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
-    await expect(page.locator("#investigation-output")).toContainText("Failed");
-    await expect(page.locator("#steer-panel")).toBeVisible();
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-title")).toHaveText("Repair did not complete");
+    await expect(page.locator("#repair-result-summary")).toContainText("media source rejected every candidate");
+    await expect(page.locator("#repair-result-actions li")).toHaveCount(2);
+    await expect(page.locator("#repair-result-verification")).toContainText("No valid replacement was imported");
+    await expect(page.locator("#steer-panel")).toBeHidden();
+    await expect(page.locator("#reinvestigate-job-button")).toBeVisible();
+    await expect(page.locator("#retry-same-repair-button")).toBeVisible();
+    await expect(page.locator("#close-failed-repair-button")).toBeVisible();
+    await page.locator("#close-failed-repair-button").click();
+    await expect(page.locator("#close-dialog")).toBeVisible();
+    await expect(page.locator("#close-dialog-title")).toHaveText("Close After Failed Repair");
+    await expect(page.locator("#close-comment")).toHaveValue(/Searched available replacement releases/);
+    await expect(page.locator("#close-confirm-button")).toHaveText("Close anyway");
+    await page.locator("#close-cancel-button").click();
     await expect(page.locator("#approval-actions")).toBeHidden();
   } finally {
     await context?.close();
@@ -623,27 +668,29 @@ async function testJobListRowsDoNotOverlap(browser) {
     await expect(page.locator(".job-row").first().locator(".job-main strong")).toHaveText("Issue repair");
     await expect(page.locator(".job-row").first().locator(".job-main span")).toContainText(`Job ${activeJob.id} · Plex issue active-repair`);
     await page.locator(".job-row").first().click();
-    await expect(page.locator("#investigation-output")).toContainText("Live repair activity:");
-    await expect(page.locator("#investigation-output")).toContainText("Run 1 · repair · running · model fixture-model");
-    await expect(page.locator("#investigation-output")).toContainText("Calling sonarr_replace_episode");
-    await expect(page.locator("#investigation-output")).toContainText("Result from sonarr_replace_episode: HTTP 200");
-    await expect(page.locator("#investigation-output")).toContainText("accepted by Sonarr");
-    await expect(page.locator("#investigation-output")).toContainText("Codex completed plex_refresh_metadata");
-    await expect(page.locator("#investigation-output")).toContainText("Codex reported Sonarr history shows the root of the confusion");
-    await expect(page.locator("#investigation-output")).toContainText("Codex reported fixed: Season history shows the repair completed");
-    await expect(page.locator("#investigation-output")).not.toContainText("hi tory");
-    await expect(page.locator("#investigation-output")).not.toContainText("confu ion");
-    await expect(page.locator("#investigation-output")).not.toContainText("reque t accepted");
-    await expect(page.locator("#investigation-output")).not.toContainText('"toolName"');
-    await page.locator("#investigation-output").evaluate(element => {
+    await expect(page.locator("#repair-live-view")).toBeVisible();
+    await expect(page.locator("#investigation-output")).toBeHidden();
+    await expect(page.locator("#investigation-review")).toBeHidden();
+    await expect(page.locator("#repair-result-view")).toBeHidden();
+    await expect(page.locator("#repair-live-log")).toContainText("Calling sonarr_replace_episode");
+    await expect(page.locator("#repair-live-log")).toContainText("Received HTTP 200 from sonarr_replace_episode");
+    await expect(page.locator("#repair-live-log")).toContainText("accepted by Sonarr");
+    await expect(page.locator("#repair-live-log")).toContainText("Codex completed plex_refresh_metadata");
+    await expect(page.locator("#repair-live-log")).toContainText("Codex reported Sonarr history shows the root of the confusion");
+    await expect(page.locator("#repair-live-log")).toContainText("Codex reported fixed: Season history shows the repair completed");
+    await expect(page.locator("#repair-live-log")).not.toContainText("hi tory");
+    await expect(page.locator("#repair-live-log")).not.toContainText("confu ion");
+    await expect(page.locator("#repair-live-log")).not.toContainText("reque t accepted");
+    await expect(page.locator("#repair-live-log")).not.toContainText('"toolName"');
+    await page.locator("#repair-live-log").evaluate(element => {
       element.scrollTop = element.scrollHeight;
     });
     recordAgentRunEvent(dbPath, activeRun.id, activeJob.id, "stdout", {
       type: "stdout",
       text: "fresh activity marker after background refresh"
     });
-    await expect(page.locator("#investigation-output")).toContainText("activity marker after background", { timeout: 4000 });
-    const bottomGap = await page.locator("#investigation-output").evaluate(element => {
+    await expect(page.locator("#repair-live-log")).toContainText("full details were saved to logs", { timeout: 4000 });
+    const bottomGap = await page.locator("#repair-live-log").evaluate(element => {
       return element.scrollHeight - element.scrollTop - element.clientHeight;
     });
     assert.ok(bottomGap < 48, `Expected output scroll to stay near bottom, got gap ${bottomGap}`);
@@ -763,14 +810,16 @@ async function testFullBrowserWorkflow(browser) {
       "Verify the current fixture state.",
       "Select a repair only after verification."
     ]);
-    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
-    await expect(page.locator("#investigation-full-report")).toBeHidden();
-    await page.locator("#investigation-full-details summary").click();
+    await expect(page.locator("#investigation-report-button")).toBeVisible();
+    await expect(page.locator("#investigation-report-dialog")).toBeHidden();
+    await page.locator("#investigation-report-button").click();
+    await expect(page.locator("#investigation-report-dialog")).toBeVisible();
     await expect(page.locator("#investigation-full-report")).toBeVisible();
     await expect(page.locator("#investigation-full-report")).toContainText("### Investigation summary");
-    await page.locator("#investigation-full-details summary").click();
-    await expect(page.locator("#investigation-output")).toContainText("Action summary");
-    await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
+    await page.locator("#investigation-report-close-button").click();
+    await expect(page.locator("#investigation-report-dialog")).toBeHidden();
+    await expect(page.locator("#investigation-output")).toContainText("Suggested action");
+    await expect(page.locator("#investigation-output")).not.toContainText("Repair prompt preview");
     await expect(page.locator("#detail-processing")).toBeHidden();
     await expect(page.locator("#approval-actions")).toBeVisible();
     await expect(investigationActivity).toHaveClass(/success/);
@@ -780,8 +829,8 @@ async function testFullBrowserWorkflow(browser) {
     await expect(row(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
     await row(page, 1).getByRole("button", { name: "Re-investigate" }).click();
     await expect(page.locator("#investigation-full-report")).toContainText("### Investigation summary");
-    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
-    assert.equal(await codexInvocationCount(harness.codexLogPath), 2);
+    await expect(page.locator("#investigation-report-dialog")).toBeHidden();
+    await expect.poll(() => codexInvocationCount(harness.codexLogPath)).toBe(2);
 
     const emptySteeringBox = await page.locator("#steer-input").evaluate(element => {
       const style = window.getComputedStyle(element);
@@ -822,7 +871,7 @@ async function testFullBrowserWorkflow(browser) {
     assert.ok(steeringBox.height <= fiveRowMax, JSON.stringify(steeringBox));
     await page.locator("#steer-button").click();
     await expect(page.locator("#steer-input")).toHaveValue("");
-    await expect(page.locator("#investigation-output")).toContainText("Pending action approval", { timeout: 10_000 });
+    await expect(page.locator("#investigation-output")).toContainText("Decision needed", { timeout: 10_000 });
     await expect(page.locator("#investigation-review-title")).toHaveText("Client-side resolution recommended");
     await expect(page.locator("#investigation-review-summary")).toContainText("client-side app playback issue");
     await expect(page.locator("#investigation-next-steps-list li")).toHaveText([
@@ -830,22 +879,23 @@ async function testFullBrowserWorkflow(browser) {
       "Explain the client-side resolution to the reporter."
     ]);
     await expect(page.locator("#investigation-full-report")).toContainText("### Revised investigation");
-    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
+    await expect(page.locator("#investigation-report-dialog")).toBeHidden();
     await expect(page.locator("#investigation-output")).toContainText("No server-side repair will run");
     await expect(page.locator("#investigation-output")).toContainText("Steering history:");
     await expect(page.locator("#investigation-output")).toContainText("Mention that the user should restart the app.");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 3);
 
     await page.locator("#approve-button").click();
-    await expect(page.locator("#investigation-output")).toContainText("Approve fix");
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-title")).toHaveText("Repair completed");
+    await expect(page.locator("#repair-result-comment")).toContainText("Reviewed as a client-side playback problem");
     await expect(page.locator("#approval-actions")).toBeVisible();
     assert.equal(await codexInvocationCount(harness.codexLogPath), 4);
 
     await expect(row(page, 1).getByRole("button", { name: "Approve fix" })).toBeVisible();
     await row(page, 1).getByRole("button", { name: "Approve fix" }).click();
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
-    await expect(page.locator("#investigation-output")).not.toContainText("Cannot transition");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-comment")).toContainText("Reviewed as a client-side playback problem");
 
     await page.locator("#approve-button").click();
     await expect(page.locator("#investigation-output")).toContainText("Closed");
@@ -1015,8 +1065,11 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
 
     await row(page, 1).getByRole("button", { name: "View repair" }).click();
     await expect(page.locator("#detail-heading")).toHaveText("Job Detail");
-    await expect(page.locator("#investigation-output")).toContainText(`Job ${job.id} · Executing repair`);
-    await expect(page.locator("#investigation-output")).not.toContainText("No cached investigation");
+    await expect(page.locator("#repair-live-view")).toBeVisible();
+    await expect(page.locator("#repair-live-log")).toContainText("starting the repair session");
+    await expect(page.locator("#investigation-output")).toBeHidden();
+    await expect(page.locator("#investigation-review")).toBeHidden();
+    await expect(page.locator("#repair-result-view")).toBeHidden();
     await expect(page.locator("#detail-processing")).toBeVisible();
     await expect(page.locator("#detail-processing")).toContainText("Executing repair");
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
@@ -1092,7 +1145,10 @@ async function testAbortBecomesAvailableDuringApprovalExecution(browser) {
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
     await expect(page.locator("#detail-processing")).toContainText("Executing repair");
     await page.locator("#abort-repair-button").click();
-    await expect(page.locator("#investigation-output")).toContainText(/aborted|Review or steer/i, { timeout: 10_000 });
+    await expect(page.locator("#repair-result-view")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("#repair-result-summary")).toContainText(/aborted/i);
+    await expect(page.locator("#reinvestigate-job-button")).toBeVisible();
+    await expect(page.locator("#close-failed-repair-button")).toBeVisible();
     await expect(page.locator("#abort-repair-button")).toBeHidden();
   } finally {
     await context?.close();
@@ -1332,9 +1388,10 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await expect(page.locator("#investigation-review")).toBeVisible();
     await expect(page.locator("#investigation-review-summary")).toContainText("Fixture diagnostics require operator review");
     await expect(page.locator("#investigation-next-steps-list li")).toHaveCount(2);
-    await expect(page.locator("#investigation-full-details")).not.toHaveAttribute("open", "");
-    await expect(page.locator("#investigation-output")).toContainText("Action summary");
-    await expect(page.locator("#investigation-output")).toContainText("Repair prompt preview");
+    await expect(page.locator("#investigation-report-button")).toBeVisible();
+    await expect(page.locator("#investigation-report-dialog")).toBeHidden();
+    await expect(page.locator("#investigation-output")).toContainText("Suggested action");
+    await expect(page.locator("#investigation-output")).not.toContainText("Repair prompt preview");
     await expect(card(page, 1)).toHaveClass(/issue-active/);
     await assertMobileDetailSheet(page);
     await assertNoHorizontalOverflow(page);
@@ -1351,7 +1408,7 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await expect(card(page, 1).getByRole("button", { name: "Re-investigate" })).toBeVisible();
 
     await card(page, 1).getByRole("button", { name: "Re-investigate" }).click();
-    await expect(page.locator("#investigation-output")).toContainText("Action summary");
+    await expect(page.locator("#investigation-output")).toContainText("Suggested action");
     assert.equal(await codexInvocationCount(harness.codexLogPath), 2);
     const mobileSteeringFontSize = await page.locator("#steer-input").evaluate(element =>
       Number.parseFloat(window.getComputedStyle(element).fontSize)
@@ -1376,7 +1433,8 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await expect(page.locator("#investigation-output")).toContainText(steeringMessage);
     await expect(page.locator("#approval-actions")).toBeVisible();
     await page.locator("#approve-button").click();
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-comment")).toContainText("Reviewed as a client-side playback problem");
     await expect(page.locator("#approval-actions")).toBeVisible();
 
     await page.locator("#detail-close-button").click();
@@ -1385,7 +1443,8 @@ async function testMobileDetailSheetAndJobControls(browser) {
     await page.locator(".job-row").first().click();
     await expect(page.locator("#app-shell")).not.toHaveClass(/activity-open/);
     await expect(page.locator("#detail-band")).toBeVisible();
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-comment")).toContainText("Reviewed as a client-side playback problem");
     await assertMobileDetailSheet(page);
   } finally {
     await context?.close();
@@ -1466,6 +1525,22 @@ async function testMobileSeededApprovalRejectAndRetryControls(browser) {
       }
     });
     setPendingApprovals(dbPath, retryJob.id, "approved", "fixture", "action");
+    const retryRun = createAgentRun(dbPath, retryJob.id, "repair", "Retry fixture repair", {
+      model: "fixture-model"
+    });
+    completeAgentRun(dbPath, retryRun.id, "failed_retryable", {
+      status: "failed_retryable",
+      summary: "The first mobile repair attempt could not finish.",
+      actionsTaken: ["Inspected the fixture media state."],
+      verification: {
+        status: "failed",
+        details: "The fixture remained unresolved."
+      },
+      draftComment: "",
+      closeRecommended: false,
+      proposedChoices: [],
+      missingMcpItems: []
+    }, "The first mobile repair attempt could not finish.");
 
     const pageHandle = await newPage(browser, harness.baseUrl, { width: 390, height: 844 });
     context = pageHandle.context;
@@ -1488,17 +1563,20 @@ async function testMobileSeededApprovalRejectAndRetryControls(browser) {
     await expect(page.locator("#approval-actions")).toBeVisible();
     await expect(page.locator("#approve-button")).toBeVisible();
     await page.locator("#approve-button").click();
-    await expect(page.locator("#investigation-output")).toContainText("Draft resolution comment");
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-comment")).toContainText("Reviewed as a client-side playback problem");
     await expect(page.locator("#approval-actions")).toBeVisible();
 
     await page.locator("#detail-close-button").click();
     await page.locator("#activity-drawer-button").click();
     await page.locator(`[data-job-id="${retryJob.id}"]`).click();
     await expect(page.locator("#repair-retry-panel")).toBeHidden();
-    await expect(page.locator("#steer-panel")).toBeVisible();
+    await expect(page.locator("#repair-result-view")).toBeVisible();
+    await expect(page.locator("#repair-result-summary")).toContainText("first mobile repair attempt");
+    await expect(page.locator("#steer-panel")).toBeHidden();
+    await expect(page.locator("#reinvestigate-job-button")).toBeVisible();
+    await expect(page.locator("#close-failed-repair-button")).toBeVisible();
     await expect(page.locator("#retry-same-repair-button")).toBeVisible();
-    await page.locator("#steer-input").fill("Revise the failed mobile repair plan.");
-    await expect(page.locator("#steer-button")).toBeEnabled();
     await assertMobileDetailSheet(page);
     await assertNoHorizontalOverflow(page);
   } finally {

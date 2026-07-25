@@ -1060,15 +1060,16 @@ async function testRepairRunnerRejectsOwnerDelegation() {
     assert.equal(actionApproval.payload.plan.classification, "server_action");
     assert.equal(actionApproval.payload.plan.executionMode, "approved_repair_agent");
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
-    assert.match(returned.message, /Review or steer the investigation/);
+    assert.equal(returned.status, "failed_retryable");
+    assert.match(returned.message, /re-investigate or close/);
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /delegated media-side work/);
     assert.equal(details.agentRuns.length, 1);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
-    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 0);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
+    assert.equal(details.auditEvents.some(event => event.eventType === "repair_failed_awaiting_operator_review"), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -1142,12 +1143,12 @@ async function testRepairRunnerInvalidJsonFailsWithoutResolution() {
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
+    assert.equal(returned.status, "failed_retryable");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /valid final JSON/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
-    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 0);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1242,12 +1243,12 @@ async function testRepairRunnerRecordsMissingMcpItems() {
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
+    assert.equal(returned.status, "failed_retryable");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /does not expose a Sonarr episode replacement tool/);
     assert.equal(details.agentRuns[0].finalResult.missingMcpItems.length, 2);
-    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 0);
     assert.equal(details.missingMcpItems.length, 2);
     const missingItemText = JSON.stringify({
       runResult: details.agentRuns[0].finalResult.missingMcpItems,
@@ -1348,9 +1349,9 @@ async function testRepairTimeoutRecordsMissingMcpItem() {
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
+    assert.equal(returned.status, "failed_retryable");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /timed out/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
     assert.match(details.agentRuns[0].finalResult.summary, /timed out/);
@@ -1742,12 +1743,12 @@ async function testRepairRunnerNeedsOperatorDecisionCanRetryWithNote() {
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
-    assert.match(returned.message, /Review or steer the investigation/);
+    assert.equal(returned.status, "blocked_needs_human");
+    assert.match(returned.message, /re-investigate or close/);
     let details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "blocked_needs_human");
     assert.equal(details.approvals[0].kind, "action");
-    assert.equal(details.approvals[0].status, "pending");
+    assert.equal(details.approvals[0].status, "approved");
     assert.equal(details.agentRuns[0].status, "needs_operator_decision");
     assert.deepEqual(details.agentRuns[0].finalResult.proposedChoices, ["Replace episode", "Refresh only"]);
 
@@ -2022,17 +2023,17 @@ async function testAbortExecutingRepairTerminatesRunAndReturnsToReview() {
     assert.equal(abort.status, "abort_requested");
     assert.match(abort.message, /Repair aborted by fixture/);
     const result = await approvalPromise;
-    assert.equal(result.status, "awaiting_action_approval");
+    assert.equal(result.status, "failed_retryable");
     const signalText = await readFile(signalPath, "utf8");
     assert.equal(signalText, "terminated");
     const details = jobDetails(dbPath, job.id);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /Repair aborted by fixture/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
     assert.match(details.agentRuns[0].error, /Repair aborted by fixture/);
     assert.equal(details.agentRunEvents.some(event => event.eventType === "repair_abort_requested"), true);
     assert.equal(details.auditEvents.some(event => event.eventType === "repair_abort_requested"), true);
-    assert.equal(details.approvals.some(approval => approval.kind === "action" && approval.status === "pending"), true);
+    assert.equal(details.approvals.some(approval => approval.kind === "action" && approval.status === "pending"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(codexHome, { recursive: true, force: true });
@@ -2195,12 +2196,12 @@ async function testRepairRunnerUnverifiedFixedFailsWithoutResolution() {
     }]);
     const investigated = await agent.investigate(snapshot.id, 1, { force: true });
     const returned = await agent.approve(investigated.jobId, "fixture");
-    assert.equal(returned.status, "awaiting_action_approval");
+    assert.equal(returned.status, "failed_retryable");
     const details = jobDetails(dbPath, investigated.jobId);
-    assert.equal(details.job.state, "awaiting_action_approval");
+    assert.equal(details.job.state, "failed_retryable");
     assert.match(details.job.lastError, /passed verification/);
     assert.equal(details.agentRuns[0].status, "failed_retryable");
-    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 1);
+    assert.equal(details.approvals.filter(approval => approval.kind === "action" && approval.status === "pending").length, 0);
     assert.equal(details.approvals.filter(approval => approval.kind === "resolution" && approval.status === "pending").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -3182,7 +3183,14 @@ async function testWebAuthAndApi() {
     assert.match(pageText, /id="detail-processing"/);
     assert.match(pageText, /id="investigation-review"/);
     assert.match(pageText, /id="investigation-next-steps-list"/);
-    assert.match(pageText, /id="investigation-full-details"/);
+    assert.match(pageText, /id="investigation-report-button"/);
+    assert.match(pageText, /id="investigation-report-dialog"/);
+    assert.match(pageText, /id="investigation-full-report"/);
+    assert.match(pageText, /id="repair-live-view"/);
+    assert.match(pageText, /id="repair-live-log"/);
+    assert.match(pageText, /id="repair-result-view"/);
+    assert.match(pageText, /id="reinvestigate-job-button"/);
+    assert.match(pageText, /id="close-failed-repair-button"/);
     assert.match(pageText, /Retry same repair/);
     assert.match(pageText, /id="continue-button"/);
     assert.match(pageText, /id="reopen-button"/);
@@ -3231,7 +3239,9 @@ async function testWebAuthAndApi() {
     assert.match(cssText, /@keyframes activityProgress/);
     assert.match(cssText, /\.investigation-review/);
     assert.match(cssText, /\.investigation-next-steps/);
-    assert.match(cssText, /\.investigation-full-details/);
+    assert.match(cssText, /\.investigation-report-body/);
+    assert.match(cssText, /\.repair-live-view/);
+    assert.match(cssText, /\.repair-result-view/);
     assert.match(cssText, /\.runner-strip/);
     assert.match(cssText, /\.compact-field/);
     assert.match(cssText, /\.mobile-only/);
@@ -3276,17 +3286,21 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function steerInvestigation/);
     assert.match(jsText, /function autoResizeSteerInput/);
     assert.match(jsText, /function formatSteeringHistory/);
-    assert.match(jsText, /function formatRepairActivityEvent/);
-    assert.match(jsText, /function formatAgentRunSummary/);
+    assert.match(jsText, /function repairActivityDescription/);
+    assert.match(jsText, /function renderRepairLive/);
+    assert.match(jsText, /function renderRepairResult/);
+    assert.match(jsText, /function renderJobSurface/);
+    assert.match(jsText, /function openInvestigationReportDialog/);
+    assert.match(jsText, /function closeInvestigationReportDialog/);
     assert.match(jsText, /function retrySameRepair/);
     assert.match(jsText, /function captureOutputScroll/);
     assert.match(jsText, /function restoreOutputScroll/);
     assert.match(jsText, /Steering history:/);
-    assert.match(jsText, /Live repair activity:/);
-    assert.match(jsText, /Repair prompt preview:/);
+    assert.doesNotMatch(jsText, /Live repair activity:/);
+    assert.doesNotMatch(jsText, /Repair prompt preview:/);
     assert.doesNotMatch(jsText, /Full repair context:/);
     assert.match(jsText, /Calling /);
-    assert.match(jsText, /Result from /);
+    assert.match(jsText, /Received /);
     assert.match(jsText, /function openCloseDialog/);
     assert.match(jsText, /function showIssueSummary/);
     assert.match(jsText, /function reopenIssue/);
@@ -3327,7 +3341,7 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /function handleIssueListClick/);
     assert.match(jsText, /\/api\/settings\/codex/);
     assert.match(jsText, /function updateIssueRowHighlights/);
-    assert.match(jsText, /Verification checks:/);
+    assert.match(jsText, /function repairVerificationText/);
     assert.match(jsText, /reopening_issue/);
     assert.match(jsText, /stateLabel\(job\.state\)/);
     assert.match(jsText, /data-job-id/);

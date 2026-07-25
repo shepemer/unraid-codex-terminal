@@ -2139,6 +2139,18 @@ WHERE team_id = ${teamId}
   };
 }
 
+export function slackInboundQueueCountForUser(dbPath, teamId, userId) {
+  const row = sqliteExec(dbPath, sql`
+SELECT COUNT(*) AS count
+FROM slack_event_receipts
+JOIN slack_messages ON slack_messages.id = slack_event_receipts.message_id
+WHERE slack_event_receipts.status IN ('pending', 'processing')
+  AND slack_messages.team_id = ${teamId}
+  AND slack_messages.user_id = ${userId};
+`, { json: true })[0] || {};
+  return Number(row.count || 0);
+}
+
 export function consumeSlackRateLimit(dbPath, teamId, userId, limits, now = Date.now(), options = {}) {
   const tenMinutesAgo = new Date(now - 10 * 60 * 1000).toISOString();
   const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
@@ -2169,9 +2181,6 @@ WHERE team_id = ${teamId}
       if (counts.userInteractions >= Number(limits.userInteractionsPerTenMinutes)) {
         return { allowed: false, reason: "user_interaction_limit", counts };
       }
-      if (counts.workspaceInteractions >= Number(limits.workspaceInteractionsPerTenMinutes)) {
-        return { allowed: false, reason: "workspace_interaction_limit", counts };
-      }
       database.prepare(sql`
 INSERT INTO slack_rate_events (team_id, user_id, kind)
 VALUES (${teamId}, ${userId}, 'interaction');
@@ -2179,9 +2188,6 @@ VALUES (${teamId}, ${userId}, 'interaction');
     }
     if (counts.userClassifiers >= Number(limits.userClassifiersPerHour)) {
       return { allowed: false, reason: "user_classifier_limit", counts };
-    }
-    if (counts.workspaceClassifiers >= Number(limits.workspaceClassifiersPerHour)) {
-      return { allowed: false, reason: "workspace_classifier_limit", counts };
     }
     database.prepare(sql`
 INSERT INTO slack_rate_events (team_id, user_id, kind)
