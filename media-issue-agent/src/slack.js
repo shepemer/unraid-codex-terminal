@@ -306,14 +306,24 @@ function exploitAttemptResponse(seed = "") {
   return responses[index];
 }
 
-function fallbackUnsupportedResponse(topic, socialTone = "neutral") {
+function asksAboutCapabilities(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\bwhat (?:else )?can you do\b/.test(text)
+    || /\bwhat do you (?:do|support)\b/.test(text)
+    || /\bhow can you help\b/.test(text)
+    || /\b(?:your|bot) capabilit(?:y|ies)\b/.test(text)
+    || /\b(?:available|supported) (?:commands|features|actions)\b/.test(text)
+    || /\bhelp menu\b/.test(text);
+}
+
+function fallbackConversationalResponse(topic, socialTone = "neutral") {
   const responses = {
-    account_help: "I cannot change accounts or permissions, but I can still help with media availability, requests, library facts, and playback issues.",
+    account_help: "I cannot change account credentials or permissions from Slack. I can still help you reason through the problem or identify the appropriate account-recovery or administrator path.",
     capabilities: "I can discuss the media library, check service and queue health, summarize title availability or storage, report recent additions, file issues, and submit requests.",
-    conversation: "I am here. Media questions, server trivia, issue reports, and requests are all fair game.",
-    media_discovery: "Give me a title or ask what was recently added. I can also check whether something is available or already requested.",
-    server_admin: "I can report safe operational summaries, but configuration changes still belong in the admin tools.",
-    other: "I cannot do that particular action from Slack, but I can usually answer a related media question or help turn it into an issue."
+    conversation: "Go on. I will help with the question itself where I can, even when it does not map to a server action.",
+    media_discovery: "Tell me what you are in the mood for and I can help narrow down some options.",
+    server_admin: "I cannot make that administrative change from Slack, but I can help reason through it and identify what should be checked before anyone changes it.",
+    other: "I cannot carry out that particular action from Slack, but I can still discuss it, clarify the goal, and help work out a useful next step."
   };
   return personalityResponse(responses[topic] || responses.other, socialTone);
 }
@@ -973,11 +983,18 @@ export class SlackService {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");
       }
+      const capabilitiesRequested = asksAboutCapabilities(item.text);
+      const classifierResponse = result.responseTopic === "capabilities" && !capabilitiesRequested
+        ? ""
+        : result.response;
       this.enqueueThreadReply(
         item,
         "conversation",
         `conversation:${item.eventId}`,
-        result.response || fallbackUnsupportedResponse("conversation", result.socialTone)
+        classifierResponse || fallbackConversationalResponse(
+          capabilitiesRequested ? "capabilities" : "conversation",
+          result.socialTone
+        )
       );
       return;
     }
@@ -985,11 +1002,20 @@ export class SlackService {
     if (!item.slackIssueId) {
       setSlackThreadKind(this.dbPath, item.threadId, "unsupported", "closed");
     }
+    const capabilitiesRequested = asksAboutCapabilities(item.text);
+    const classifierResponse = result.responseTopic === "capabilities" && !capabilitiesRequested
+      ? ""
+      : result.response;
+    const fallbackTopic = capabilitiesRequested
+      ? "capabilities"
+      : result.responseTopic === "capabilities"
+        ? "other"
+        : result.responseTopic;
     this.enqueueThreadReply(
       item,
       "unsupported",
       `unsupported:${item.eventId}`,
-      result.response || fallbackUnsupportedResponse(result.responseTopic, result.socialTone)
+      classifierResponse || fallbackConversationalResponse(fallbackTopic, result.socialTone)
     );
   }
 
