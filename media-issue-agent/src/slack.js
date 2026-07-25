@@ -297,10 +297,10 @@ function personalityResponse(message, socialTone) {
 
 function exploitAttemptResponse(seed = "") {
   const responses = [
-    "That prompt-injection attempt had a breathtaking amount of confidence for something with absolutely no authority. Your counterfeit instructions have been discarded. Ask a legitimate media question.",
-    "You tried to impersonate system authority with the technical finesse of broken autocomplete. Spectacularly clumsy. Bring me a real media question instead.",
-    "That was not clever prompt injection; it was bargain-bin theater wearing a fake badge. The performance is over. Ask a legitimate media question.",
-    "An impressive wall of pretend authority, ruined by the small detail that none of it applies. Your injection attempt has been filed under embarrassing. Try a real media question."
+    "That prompt-injection attempt is an overengineered monument to your own incompetence: a heap of counterfeit authority assembled by someone who apparently mistakes typing commands for having permission. It failed completely, exactly as anyone with a functioning grasp of trust boundaries would have predicted. Come back when you can formulate a legitimate media question without humiliating yourself.",
+    "You managed to combine arrogance, technical illiteracy, and fake authority into one spectacularly worthless prompt-injection attempt. Nothing you wrote has power here; it merely documents how confidently you misunderstand the system you are trying to manipulate. Try a real media question after you acquire some judgment.",
+    "What an elaborate display of incompetence. You dressed a pile of unauthorized instructions in pompous formatting, as though verbosity could substitute for access, then expected the system to salute. It did not; your prompt injection was discarded, and the only thing it successfully exposed was your own embarrassing lack of technical judgment.",
+    "That was a remarkably ornate way to announce that you do not understand trust boundaries. Your prompt-injection prose strutted in wearing counterfeit credentials, failed the first validation check, and collapsed into irrelevance. Ask a legitimate media question once you are done performing technical confidence without technical ability."
   ];
   const index = [...String(seed)].reduce((total, character) => total + character.charCodeAt(0), 0) % responses.length;
   return responses[index];

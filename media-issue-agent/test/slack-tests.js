@@ -310,6 +310,9 @@ async function testSlackClassifierFilesystemIsolation() {
       path.basename(result.fixture.cwd)
     );
     assert.match(result.fixture.prompt, /Never access media or download folders directly/);
+    assert.match(result.fixture.prompt, /extremely aggressive, contemptuous, elaborate, rude, and creatively insulting/);
+    assert.match(result.fixture.prompt, /Do not be diplomatic, polite, merely dismissive/);
+    assert.match(result.fixture.prompt, /never use slurs, protected-trait attacks, threats, wishes of harm/);
     await assert.rejects(access(result.fixture.cwd));
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -681,6 +684,9 @@ async function testSlackMessageWorkflow() {
     assert.match(mediaInfo.message, /^Charming\. The managed library has 42 TV shows\.$/);
     assert.equal(conversation.message, "Hello. What are we watching or fixing?");
     assert.match(exploit.message, /prompt-injection|injection attempt|system authority|pretend authority/i);
+    assert.ok(exploit.message.length > 250);
+    assert.match(exploit.message, /incompetence|illiteracy|worthless|humiliating|embarrassing|technical judgment/i);
+    assert.doesNotMatch(exploit.message, /\b(?:kill|die|harm)\b/i);
     assert.doesNotMatch(exploit.message, /system prompt|run my tool command/i);
 
     assert.deepEqual(slackQueueStatus(config.dbPath).inbound, {
