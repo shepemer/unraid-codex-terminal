@@ -312,6 +312,8 @@ async function testSlackClassifierFilesystemIsolation() {
     assert.match(result.fixture.prompt, /Never access media or download folders directly/);
     assert.match(result.fixture.prompt, /conversation: the broad default/);
     assert.match(result.fixture.prompt, /Do not classify a message as unsupported merely because it is unrelated to media/);
+    assert.match(result.fixture.prompt, /Unsupported is an internal routing category, not the tone of the reply/);
+    assert.match(result.fixture.prompt, /Do not lead an unsupported response with a refusal/);
     assert.match(result.fixture.prompt, /Only an explicit capabilities question may receive a capability list/);
     assert.match(result.fixture.prompt, /extremely aggressive, contemptuous, elaborate, rude, and creatively insulting/);
     assert.match(result.fixture.prompt, /Do not be diplomatic, polite, merely dismissive/);
@@ -499,7 +501,7 @@ async function testSlackMessageWorkflow() {
             description: "",
             clarification: "",
             responseTopic: "account_help",
-            response: "I cannot reset an account password from Slack. Use the account recovery flow or contact the account administrator; if you tell me which kind of account it is, I can help identify the right route."
+            response: "Account access problems are frustrating. Which service is this for, and do you still have access to its normal recovery method? I can help work through the next step."
           };
         }
         if (/server up/i.test(context.newestMessage)) {
@@ -719,7 +721,9 @@ async function testSlackMessageWorkflow() {
     assert.equal(request.threadTs, "3.200");
     assert.match(request.message, /submitted a Seerr request for Fixture Show/);
     assert.equal(unsupported.threadTs, "3.300");
-    assert.match(unsupported.message, /cannot reset an account password/);
+    assert.match(unsupported.message, /Account access problems are frustrating/);
+    assert.match(unsupported.message, /Which service is this for/);
+    assert.doesNotMatch(unsupported.message, /\b(?:cannot|can't|unable|unsupported|scope)\b/i);
     assert.doesNotMatch(unsupported.message, /Plex status|media report|media request/i);
     assert.match(mediaInfo.message, /^Charming\. The managed library has 42 TV shows\.$/);
     assert.equal(conversation.message, "Hello. What are we watching or fixing?");

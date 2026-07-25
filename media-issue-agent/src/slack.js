@@ -318,12 +318,12 @@ function asksAboutCapabilities(value) {
 
 function fallbackConversationalResponse(topic, socialTone = "neutral") {
   const responses = {
-    account_help: "I cannot change account credentials or permissions from Slack. I can still help you reason through the problem or identify the appropriate account-recovery or administrator path.",
+    account_help: "Account access problems are frustrating. Which service is this for, and do you still have access to its normal recovery method? I can help work through the next step.",
     capabilities: "I can discuss the media library, check service and queue health, summarize title availability or storage, report recent additions, file issues, and submit requests.",
     conversation: "Go on. I will help with the question itself where I can, even when it does not map to a server action.",
     media_discovery: "Tell me what you are in the mood for and I can help narrow down some options.",
-    server_admin: "I cannot make that administrative change from Slack, but I can help reason through it and identify what should be checked before anyone changes it.",
-    other: "I cannot carry out that particular action from Slack, but I can still discuss it, clarify the goal, and help work out a useful next step."
+    server_admin: "What outcome are you trying to get from that change? Give me the symptoms or goal and I will help think through a sensible path.",
+    other: "What outcome are you after? Give me a little context and I will help think through a practical next step."
   };
   return personalityResponse(responses[topic] || responses.other, socialTone);
 }
