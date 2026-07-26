@@ -180,6 +180,30 @@ function formatPublicCount(value) {
     : "0";
 }
 
+function formatPublicDuration(value) {
+  let seconds = Math.max(0, Math.floor(Number(value) || 0));
+  if (seconds < 60) {
+    return seconds ? "less than 1 minute" : "0 minutes";
+  }
+  const units = [
+    ["day", 24 * 60 * 60],
+    ["hour", 60 * 60],
+    ["minute", 60]
+  ];
+  const parts = [];
+  for (const [label, size] of units) {
+    const amount = Math.floor(seconds / size);
+    if (amount) {
+      parts.push(`${formatPublicCount(amount)} ${label}${amount === 1 ? "" : "s"}`);
+      seconds -= amount * size;
+    }
+    if (parts.length === 2) {
+      break;
+    }
+  }
+  return parts.join(" ");
+}
+
 function mediaTitleLabel(value) {
   const title = safeSlackPublicLabel(value?.title);
   return `${title}${value?.year ? ` (${value.year})` : ""}`;
@@ -238,6 +262,33 @@ function mediaInfoBandwidthMessage(result) {
   });
   return `Plex has used ${formatPublicBytes(result.totalBytes)} in ${month}: `
     + `${formatPublicBytes(result.wanBytes)} WAN and ${formatPublicBytes(result.lanBytes)} LAN.`;
+}
+
+function mediaInfoWatchtimeMessage(result, request) {
+  if (!result?.available) {
+    return "I could not read aggregate Plex watch-time statistics right now.";
+  }
+  const days = Number.isInteger(Number(result.periodDays)) ? Number(result.periodDays) : 30;
+  const playCount = Math.max(0, Math.floor(Number(result.playCount) || 0));
+  const duration = formatPublicDuration(result.totalWatchSeconds);
+  const range = `the last ${formatPublicCount(days)} day${days === 1 ? "" : "s"}`;
+  if (result.scope === "title") {
+    const label = mediaTitleLabel({
+      title: request?.mediaTitle,
+      year: request?.year
+    });
+    if (result.complete === false && !result.matched) {
+      return `I could not finish scanning aggregate watch history for ${label} over ${range}.`;
+    }
+    if (!result.matched) {
+      return `Tautulli did not find any plays for ${label} over ${range}.`;
+    }
+    const qualifier = result.complete === false ? "at least " : "";
+    return `Over ${range}, ${label} was played ${qualifier}${formatPublicCount(playCount)} time${playCount === 1 ? "" : "s"} `
+      + `for ${qualifier}${duration} in aggregate.`;
+  }
+  return `Over ${range}, Plex recorded ${formatPublicCount(playCount)} play${playCount === 1 ? "" : "s"} `
+    + `for ${duration} in aggregate.`;
 }
 
 function mediaInfoHealthMessage(result) {
@@ -328,12 +379,14 @@ function mediaInfoRequestStatusMessage(result) {
     : "I could not read Seerr request status right now.";
 }
 
-function mediaInfoMessage(queryType, result) {
+function mediaInfoMessage(queryType, result, request = {}) {
   switch (queryType) {
     case "library_summary":
       return mediaInfoLibraryMessage(result);
     case "title_summary":
       return mediaInfoTitleMessage(result);
+    case "watchtime_summary":
+      return mediaInfoWatchtimeMessage(result, request);
     case "plex_bandwidth":
       return mediaInfoBandwidthMessage(result);
     case "service_health":
@@ -2772,6 +2825,20 @@ export class MediaIssueAgent {
           ...(request.year ? { year: request.year } : {})
         };
         break;
+      case "watchtime_summary": {
+        const requestedDays = Number(request.periodDays);
+        const periodDays = Number.isInteger(requestedDays) && requestedDays >= 1 && requestedDays <= 366
+          ? requestedDays
+          : 30;
+        toolName = "media_public_watchtime_summary";
+        args = {
+          periodDays,
+          ...(title ? { title } : {}),
+          ...(request.mediaType ? { mediaType: request.mediaType } : {}),
+          ...(request.year ? { year: request.year } : {})
+        };
+        break;
+      }
       case "plex_bandwidth":
         toolName = "plex_public_bandwidth_summary";
         args = {};
@@ -2814,7 +2881,7 @@ export class MediaIssueAgent {
         return {
           completed: false,
           kind: "media_info_clarification",
-          message: "Ask me about library counts, one title, bandwidth, service health, queues, subtitles, recent additions, or request status."
+          message: "Ask me about library counts, one title, aggregate watch time, bandwidth, service health, queues, subtitles, recent additions, or request status."
         };
     }
     try {
@@ -2827,7 +2894,7 @@ export class MediaIssueAgent {
       return {
         completed: true,
         kind: "media_info",
-        message: mediaInfoMessage(queryType, result)
+        message: mediaInfoMessage(queryType, result, request)
       };
     } catch (error) {
       this.diagnostic("warn", "slack_media_info_failed", {

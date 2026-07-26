@@ -2374,8 +2374,7 @@ SELECT
   SUM(CASE WHEN kind = 'interaction' AND user_id = ${userId} AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS userInteractions,
   SUM(CASE WHEN kind = 'interaction' AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS workspaceInteractions,
   SUM(CASE WHEN kind = 'classifier' AND user_id = ${userId} AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS userClassifiers,
-  SUM(CASE WHEN kind = 'classifier' AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS workspaceClassifiers,
-  MAX(CASE WHEN kind = 'rate_notice' AND user_id = ${userId} THEN created_at ELSE NULL END) AS lastRateNoticeAt
+  SUM(CASE WHEN kind = 'classifier' AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS workspaceClassifiers
 FROM slack_rate_events
 WHERE team_id = ${teamId}
   AND created_at >= ${oneHourAgo};
@@ -2384,8 +2383,7 @@ WHERE team_id = ${teamId}
     userInteractions: Number(rows.userInteractions || 0),
     workspaceInteractions: Number(rows.workspaceInteractions || 0),
     userClassifiers: Number(rows.userClassifiers || 0),
-    workspaceClassifiers: Number(rows.workspaceClassifiers || 0),
-    lastRateNoticeAt: rows.lastRateNoticeAt || null
+    workspaceClassifiers: Number(rows.workspaceClassifiers || 0)
   };
 }
 
@@ -2404,6 +2402,13 @@ WHERE slack_event_receipts.status IN ('pending', 'processing')
 export function consumeSlackRateLimit(dbPath, teamId, userId, limits, now = Date.now(), options = {}) {
   const tenMinutesAgo = new Date(now - 10 * 60 * 1000).toISOString();
   const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+  const retryAfterSeconds = (oldestAt, windowMilliseconds) => {
+    const oldest = Date.parse(oldestAt || "");
+    if (!Number.isFinite(oldest)) {
+      return Math.ceil(windowMilliseconds / 1000);
+    }
+    return Math.max(1, Math.ceil((oldest + windowMilliseconds - now) / 1000));
+  };
   return sqliteTransaction(dbPath, database => {
     database.prepare(`
 DELETE FROM slack_rate_events
@@ -2415,7 +2420,8 @@ SELECT
   SUM(CASE WHEN kind = 'interaction' AND created_at >= ${tenMinutesAgo} THEN 1 ELSE 0 END) AS workspaceInteractions,
   SUM(CASE WHEN kind = 'classifier' AND user_id = ${userId} AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS userClassifiers,
   SUM(CASE WHEN kind = 'classifier' AND created_at >= ${oneHourAgo} THEN 1 ELSE 0 END) AS workspaceClassifiers,
-  MAX(CASE WHEN kind = 'rate_notice' AND user_id = ${userId} THEN created_at ELSE NULL END) AS lastRateNoticeAt
+  MIN(CASE WHEN kind = 'interaction' AND user_id = ${userId} AND created_at >= ${tenMinutesAgo} THEN created_at ELSE NULL END) AS oldestUserInteractionAt,
+  MIN(CASE WHEN kind = 'classifier' AND user_id = ${userId} AND created_at >= ${oneHourAgo} THEN created_at ELSE NULL END) AS oldestUserClassifierAt
 FROM slack_rate_events
 WHERE team_id = ${teamId}
   AND created_at >= ${oneHourAgo};
@@ -2424,12 +2430,16 @@ WHERE team_id = ${teamId}
       userInteractions: Number(rows.userInteractions || 0),
       workspaceInteractions: Number(rows.workspaceInteractions || 0),
       userClassifiers: Number(rows.userClassifiers || 0),
-      workspaceClassifiers: Number(rows.workspaceClassifiers || 0),
-      lastRateNoticeAt: rows.lastRateNoticeAt || null
+      workspaceClassifiers: Number(rows.workspaceClassifiers || 0)
     };
     if (options.countInteraction !== false) {
       if (counts.userInteractions >= Number(limits.userInteractionsPerTenMinutes)) {
-        return { allowed: false, reason: "user_interaction_limit", counts };
+        return {
+          allowed: false,
+          reason: "user_interaction_limit",
+          retryAfterSeconds: retryAfterSeconds(rows.oldestUserInteractionAt, 10 * 60 * 1000),
+          counts
+        };
       }
       database.prepare(sql`
 INSERT INTO slack_rate_events (team_id, user_id, kind)
@@ -2437,13 +2447,18 @@ VALUES (${teamId}, ${userId}, 'interaction');
 `).run();
     }
     if (counts.userClassifiers >= Number(limits.userClassifiersPerHour)) {
-      return { allowed: false, reason: "user_classifier_limit", counts };
+      return {
+        allowed: false,
+        reason: "user_classifier_limit",
+        retryAfterSeconds: retryAfterSeconds(rows.oldestUserClassifierAt, 60 * 60 * 1000),
+        counts
+      };
     }
     database.prepare(sql`
 INSERT INTO slack_rate_events (team_id, user_id, kind)
 VALUES (${teamId}, ${userId}, 'classifier');
 `).run();
-    return { allowed: true, reason: null, counts };
+    return { allowed: true, reason: null, retryAfterSeconds: 0, counts };
   });
 }
 

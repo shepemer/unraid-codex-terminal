@@ -60,6 +60,9 @@ async function run() {
     if (url.pathname.startsWith("/bazarr") || url.pathname.startsWith("/seerr")) {
       assert.ok(req.headers["x-api-key"]);
     }
+    if (url.pathname.startsWith("/tautulli")) {
+      assert.equal(url.searchParams.get("apikey"), "tautulli-key");
+    }
 
     if (url.pathname === "/sonarr/api/v3/series") {
       return sendJson(res, 200, [{
@@ -196,6 +199,60 @@ async function run() {
         }]
       });
     }
+    if (url.pathname === "/tautulli/api/v2" && url.searchParams.get("cmd") === "get_history") {
+      assert.equal(url.searchParams.get("grouping"), "0");
+      assert.equal(url.searchParams.get("include_activity"), "0");
+      assert.match(url.searchParams.get("after"), /^\d{4}-\d{2}-\d{2}$/);
+      if (url.searchParams.get("search") === "Fixture Series") {
+        assert.equal(url.searchParams.get("media_type"), "episode");
+        return sendJson(res, 200, {
+          response: {
+            result: "success",
+            data: {
+              recordsTotal: 50,
+              recordsFiltered: 3,
+              data: [{
+                media_type: "episode",
+                grandparent_title: "Fixture Series",
+                grandparent_year: 2024,
+                duration: 1800,
+                friendly_name: "Private User",
+                user_id: 7001,
+                player: "private-device"
+              }, {
+                media_type: "episode",
+                grandparent_title: "Fixture Series",
+                grandparent_year: 2024,
+                duration: 900,
+                friendly_name: "Another Private User",
+                user_id: 7002
+              }, {
+                media_type: "episode",
+                grandparent_title: "Other Series",
+                duration: 99_999,
+                friendly_name: "Fixture Series"
+              }]
+            }
+          }
+        });
+      }
+      return sendJson(res, 200, {
+        response: {
+          result: "success",
+          data: {
+            recordsTotal: 50,
+            recordsFiltered: 5,
+            filter_duration: "4 hrs 30 mins",
+            data: [{
+              media_type: "movie",
+              title: "Private Watch Record",
+              duration: 1200,
+              friendly_name: "Private User"
+            }]
+          }
+        }
+      });
+    }
 
     return sendJson(res, 404, { error: `unexpected ${req.method} ${url.pathname}` });
   });
@@ -219,7 +276,9 @@ async function run() {
       BAZARR_URL: `http://127.0.0.1:${mockPort}/bazarr`,
       BAZARR_API_KEY: "bazarr-key",
       SEERR_URL: `http://127.0.0.1:${mockPort}/seerr`,
-      SEERR_API_KEY: "seerr-key"
+      SEERR_API_KEY: "seerr-key",
+      TAUTULLI_URL: `http://127.0.0.1:${mockPort}/tautulli`,
+      TAUTULLI_API_KEY: "tautulli-key"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -284,6 +343,7 @@ async function run() {
     const expectedTools = [
       "media_public_library_summary",
       "media_public_title_summary",
+      "media_public_watchtime_summary",
       "media_public_health_summary",
       "media_public_queue_summary",
       "media_public_subtitle_summary",
@@ -311,6 +371,24 @@ async function run() {
     assert.equal(series.result.title, "Fixture Series");
     assert.equal(series.result.missingEpisodeCount, 2);
     assert.equal(Object.hasOwn(series.result, "id"), false);
+
+    const aggregateWatchtime = await tool("media_public_watchtime_summary", { periodDays: 7 });
+    assert.equal(aggregateWatchtime.scope, "library");
+    assert.equal(aggregateWatchtime.playCount, 5);
+    assert.equal(aggregateWatchtime.totalWatchSeconds, 16_200);
+    assert.equal(aggregateWatchtime.periodDays, 7);
+
+    const titleWatchtime = await tool("media_public_watchtime_summary", {
+      periodDays: 30,
+      title: "Fixture Series",
+      mediaType: "tv",
+      year: 2024
+    });
+    assert.equal(titleWatchtime.scope, "title");
+    assert.equal(titleWatchtime.matched, true);
+    assert.equal(titleWatchtime.playCount, 2);
+    assert.equal(titleWatchtime.totalWatchSeconds, 2700);
+    assert.equal(titleWatchtime.complete, true);
 
     const bandwidth = await tool("plex_public_bandwidth_summary");
     assert.equal(bandwidth.totalBytes, 3_000_000);
@@ -351,6 +429,8 @@ async function run() {
     const allResults = JSON.stringify({
       library,
       series,
+      aggregateWatchtime,
+      titleWatchtime,
       bandwidth,
       health,
       queues,
@@ -360,9 +440,13 @@ async function run() {
     });
     assert.doesNotMatch(allResults, /\/private|accountID|deviceID|ratingKey|requestedBy|private@|Private User|private-machine|private-version/i);
     assert.doesNotMatch(allResults, /Private\.Download|Private\.Movie\.Download/);
+    assert.doesNotMatch(allResults, /friendly_name|user_id|private-device|Private Watch Record/i);
     assert.ok(calls.some(call =>
       call.path === "/plex/statistics/bandwidth" && call.query.timespan === "1"
     ));
+    assert.ok(calls
+      .filter(call => call.path === "/tautulli/api/v2")
+      .every(call => !Object.hasOwn(call.query, "user") && !Object.hasOwn(call.query, "user_id")));
   } finally {
     child.kill("SIGTERM");
     mock.close();

@@ -6136,6 +6136,175 @@ async function mediaPublicTitleSummary({ title, mediaType, year }) {
   };
 }
 
+function publicDurationSeconds(value) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return Math.floor(numeric);
+  }
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) {
+    return null;
+  }
+  const sizes = {
+    day: 24 * 60 * 60,
+    days: 24 * 60 * 60,
+    hr: 60 * 60,
+    hrs: 60 * 60,
+    hour: 60 * 60,
+    hours: 60 * 60,
+    min: 60,
+    mins: 60,
+    minute: 60,
+    minutes: 60,
+    sec: 1,
+    secs: 1,
+    second: 1,
+    seconds: 1
+  };
+  let matched = false;
+  let seconds = 0;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(days?|hrs?|hours?|mins?|minutes?|secs?|seconds?)/g)) {
+    matched = true;
+    seconds += Number(match[1]) * sizes[match[2]];
+  }
+  return matched ? Math.floor(seconds) : null;
+}
+
+function tautulliPublicHistoryMediaType(row) {
+  const type = String(row?.media_type || row?.mediaType || "").trim().toLowerCase();
+  if (["episode", "season", "show"].includes(type)) {
+    return "tv";
+  }
+  return type === "movie" ? "movie" : "";
+}
+
+function tautulliPublicHistoryMatches(row, { title, mediaType, year }) {
+  const rowMediaType = tautulliPublicHistoryMediaType(row);
+  if (mediaType && rowMediaType !== mediaType) {
+    return false;
+  }
+  if (title) {
+    const candidates = rowMediaType === "tv"
+      ? [row?.grandparent_title, row?.grandparentTitle]
+      : [row?.title, row?.full_title, row?.fullTitle];
+    if (!candidates.map(publicTitleKey).filter(Boolean).includes(publicTitleKey(title))) {
+      return false;
+    }
+  }
+  const requestedYear = publicYear(year);
+  const rowYear = publicYear(
+    rowMediaType === "tv"
+      ? row?.grandparent_year ?? row?.grandparentYear
+      : row?.year
+  );
+  return !requestedYear || !rowYear || requestedYear === rowYear;
+}
+
+function tautulliPublicHistoryQuery({ title, mediaType, periodStartDate }) {
+  return {
+    grouping: 0,
+    include_activity: 0,
+    after: periodStartDate,
+    order_column: "date",
+    order_dir: "desc",
+    ...(title ? { search: title } : {}),
+    ...(mediaType ? { media_type: mediaType === "tv" ? "episode" : "movie" } : {})
+  };
+}
+
+async function tautulliPublicHistoryTotals(input, periodStartDate) {
+  const query = tautulliPublicHistoryQuery({ ...input, periodStartDate });
+  if (!input.title) {
+    const summary = await tautulliApi("get_history", {
+      query: { ...query, start: 0, length: 1 }
+    });
+    const playCount = Number(summary?.recordsFiltered);
+    const totalWatchSeconds = publicDurationSeconds(summary?.filter_duration);
+    if (Number.isFinite(playCount) && playCount >= 0 && totalWatchSeconds !== null) {
+      return {
+        playCount: Math.floor(playCount),
+        totalWatchSeconds,
+        complete: true
+      };
+    }
+  }
+
+  const pageSize = 1000;
+  const maximumRows = 50_000;
+  let start = 0;
+  let expectedRows = null;
+  let playCount = 0;
+  let totalWatchSeconds = 0;
+  while (start < maximumRows) {
+    const requestedLength = Math.min(pageSize, maximumRows - start);
+    const page = await tautulliApi("get_history", {
+      query: {
+        ...query,
+        start,
+        length: requestedLength
+      }
+    });
+    const rows = tautulliTableRows(page);
+    const filteredTotal = Number(page?.recordsFiltered);
+    if (Number.isFinite(filteredTotal) && filteredTotal >= 0) {
+      expectedRows = Math.floor(filteredTotal);
+    }
+    for (const row of rows) {
+      if (!tautulliPublicHistoryMatches(row, input)) {
+        continue;
+      }
+      playCount += 1;
+      totalWatchSeconds += publicInteger(row?.duration);
+    }
+    start += rows.length;
+    if (
+      !rows.length
+      || (expectedRows !== null ? start >= expectedRows : rows.length < requestedLength)
+    ) {
+      break;
+    }
+  }
+  return {
+    playCount,
+    totalWatchSeconds,
+    complete: expectedRows === null ? start < maximumRows : start >= expectedRows
+  };
+}
+
+async function mediaPublicWatchtimeSummary({ title, mediaType, year, periodDays }) {
+  if (!configuredServices.tautulli) {
+    return { configured: false, available: false };
+  }
+  const days = Math.min(366, Math.max(1, publicInteger(periodDays) || 30));
+  const now = new Date();
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const periodStart = new Date(today - (days - 1) * 24 * 60 * 60 * 1000);
+  try {
+    const totals = await tautulliPublicHistoryTotals({
+      title: String(title || "").trim(),
+      mediaType,
+      year
+    }, periodStart.toISOString().slice(0, 10));
+    return {
+      configured: true,
+      available: true,
+      generatedAt: now.toISOString(),
+      periodDays: days,
+      periodStart: periodStart.toISOString(),
+      periodEnd: now.toISOString(),
+      scope: title ? "title" : "library",
+      mediaType: mediaType || "all",
+      matched: title ? totals.playCount > 0 : undefined,
+      ...totals
+    };
+  } catch {
+    return { configured: true, available: false };
+  }
+}
+
 async function plexPublicBandwidthSummary() {
   if (!configuredServices.plex) {
     return { configured: false, available: false };
@@ -10923,6 +11092,18 @@ function createServer() {
       year: z.number().int().min(1870).max(2100).optional()
     }
   }, async (input) => jsonText(await mediaPublicTitleSummary(input)));
+
+  server.registerTool("media_public_watchtime_summary", {
+    title: "Privacy-Safe Aggregate Watch-Time Summary",
+    description: "Return aggregate Plex play count and watch time for a bounded period, optionally for one exact title, without users, devices, paths, service IDs, or raw history records.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      periodDays: z.number().int().min(1).max(366).default(30),
+      title: z.string().min(1).max(200).optional(),
+      mediaType: z.enum(["tv", "movie"]).optional(),
+      year: z.number().int().min(1870).max(2100).optional()
+    }
+  }, async (input) => jsonText(await mediaPublicWatchtimeSummary(input)));
 
   server.registerTool("media_public_health_summary", {
     title: "Privacy-Safe Media Service Health",

@@ -13,7 +13,6 @@ import {
   enqueueSlackOutbox,
   failSlackOutbox,
   queueSlackInboundForModeration,
-  recordSlackRateEvent,
   recordSlackOutboundModeration,
   recoverSlackModerationPending,
   recoverSlackQueues,
@@ -49,11 +48,10 @@ import { redactText } from "./redact.js";
 import { pushoverConfigured, sendSlackPushoverMessage } from "./pushover.js";
 
 export const SLACK_LIMITS = Object.freeze({
-  userInteractionsPerTenMinutes: 36,
-  userClassifiersPerHour: 15,
+  userInteractionsPerTenMinutes: 180,
+  userClassifiersPerHour: 75,
   classifierConcurrency: 6,
-  queueSize: 60,
-  rateNoticeSeconds: 300
+  queueSize: 300
 });
 
 export const SLACK_RESPONSE_MAX_CHARACTERS = 2000;
@@ -81,6 +79,7 @@ const RESPONSE_TOPICS = new Set([
 const MEDIA_QUERY_TYPES = new Set([
   "library_summary",
   "title_summary",
+  "watchtime_summary",
   "plex_bandwidth",
   "service_health",
   "queue_summary",
@@ -131,6 +130,25 @@ function compact(value, maxLength) {
     return text;
   }
   return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function formatSlackWait(value) {
+  let remaining = Math.max(1, Math.ceil(Number(value) || 1));
+  const parts = [];
+  const hours = Math.floor(remaining / 3600);
+  if (hours) {
+    parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+    remaining -= hours * 3600;
+  }
+  const minutes = Math.floor(remaining / 60);
+  if (minutes) {
+    parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+    remaining -= minutes * 60;
+  }
+  if (remaining || !parts.length) {
+    parts.push(`${remaining} second${remaining === 1 ? "" : "s"}`);
+  }
+  return parts.slice(0, 2).join(" ");
 }
 
 function stripSlackMentions(value) {
@@ -216,6 +234,11 @@ function normalizedSeasons(value) {
     .slice(0, 50);
 }
 
+function normalizedWatchtimePeriodDays(value) {
+  const days = Number(value);
+  return Number.isInteger(days) && days >= 1 && days <= 366 ? days : 30;
+}
+
 export function parseSlackIntentResult(output) {
   const parsed = typeof output === "string" ? parseJsonObject(output) : output;
   const intent = String(parsed?.intent || "").trim();
@@ -226,6 +249,9 @@ export function parseSlackIntentResult(output) {
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw new Error("Slack intent classifier confidence must be between 0 and 1.");
   }
+  const queryType = MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
+    ? String(parsed.queryType)
+    : "";
   return {
     intent,
     confidence,
@@ -236,9 +262,10 @@ export function parseSlackIntentResult(output) {
     year: normalizedYear(parsed.year),
     seasons: normalizedSeasons(parsed.seasons),
     allSeasons: parsed.allSeasons === true,
-    queryType: MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
-      ? String(parsed.queryType)
-      : "",
+    queryType,
+    ...(queryType === "watchtime_summary"
+      ? { periodDays: normalizedWatchtimePeriodDays(parsed.periodDays) }
+      : {}),
     service: MEDIA_SERVICES.has(String(parsed.service || "").toLowerCase())
       ? String(parsed.service).toLowerCase()
       : "",
@@ -720,10 +747,10 @@ export class SlackService {
       enqueueSlackOutbox(this.dbPath, {
         threadId: archived.threadId,
         kind: "queue_full",
-        dedupeKey: `queue-full:${event.teamId}:${event.userId}:${Math.floor(Date.now() / (SLACK_LIMITS.rateNoticeSeconds * 1000))}`,
+        dedupeKey: `queue-full:${event.eventId}`,
         channelId: event.channelId,
         threadTs: event.rootTs,
-        message: blockedSlackResponse("rate_limit")
+        message: "Your per-user Slack queue is full. It has no fixed timer; the limit lifts as soon as one of your earlier messages finishes processing."
       });
       void this.notifyPushover({
         direction: "inbound",
@@ -807,23 +834,21 @@ export class SlackService {
   }
 
   async maybeEnqueueRateNotice(item, limit) {
-    const previous = Date.parse(limit.counts.lastRateNoticeAt || "");
-    if (Number.isFinite(previous) && Date.now() - previous < SLACK_LIMITS.rateNoticeSeconds * 1000) {
-      return;
-    }
-    recordSlackRateEvent(this.dbPath, item.teamId, item.userId, "rate_notice");
+    const wait = formatSlackWait(limit.retryAfterSeconds);
+    const label = limit.reason === "user_classifier_limit" ? "processing" : "message";
     await this.enqueueThreadReply(
       item,
       "rate_limited",
-      `rate-limit:${item.teamId}:${item.userId}:${Math.floor(Date.now() / (SLACK_LIMITS.rateNoticeSeconds * 1000))}`,
-      "I am receiving too many requests right now. Please wait a few minutes and try again.",
+      `rate-limit:${item.eventId}`,
+      `You have hit the per-user ${label} limit. Try again in ${wait}.`,
       { trustedTemplate: true }
     );
     this.agent.diagnostic("warn", "slack_message_rate_limited", {
       eventRef: opaqueSlackRef(item.eventId),
       userRef: opaqueSlackRef(item.userId),
       teamRef: opaqueSlackRef(item.teamId),
-      reason: limit.reason
+      reason: limit.reason,
+      retryAfterSeconds: limit.retryAfterSeconds
     });
   }
 
