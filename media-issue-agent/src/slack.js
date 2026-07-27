@@ -102,6 +102,14 @@ const MEDIA_SERVICES = new Set([
   "threadfin"
 ]);
 
+const MEDIA_REQUEST_SELECTIONS = new Set([
+  "best",
+  "latest",
+  "oldest"
+]);
+
+const MAX_MEDIA_REQUEST_ITEMS = 5;
+
 const SOCIAL_TONES = new Set([
   "friendly",
   "neutral",
@@ -239,6 +247,59 @@ function normalizedWatchtimePeriodDays(value) {
   return Number.isInteger(days) && days >= 1 && days <= 366 ? days : 30;
 }
 
+function normalizedMediaRequestCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 1
+    ? Math.min(MAX_MEDIA_REQUEST_ITEMS, count)
+    : 1;
+}
+
+function normalizedMediaRequestSelection(value) {
+  const selection = String(value || "").trim().toLowerCase();
+  return MEDIA_REQUEST_SELECTIONS.has(selection) ? selection : "best";
+}
+
+function normalizedMediaRequest(value) {
+  const mediaTitle = compact(redactText(stripSlackMentions(value?.mediaTitle)), 160);
+  if (!mediaTitle) {
+    return null;
+  }
+  return {
+    mediaTitle,
+    mediaType: normalizedMediaType(value?.mediaType),
+    year: normalizedYear(value?.year),
+    seasons: normalizedSeasons(value?.seasons),
+    allSeasons: value?.allSeasons === true,
+    selection: normalizedMediaRequestSelection(value?.selection),
+    count: normalizedMediaRequestCount(value?.count)
+  };
+}
+
+function normalizedMediaRequests(parsed, fallback) {
+  const supplied = Array.isArray(parsed?.mediaRequests)
+    ? parsed.mediaRequests
+    : [];
+  const source = supplied.length ? supplied : [fallback];
+  const requests = [];
+  let remaining = MAX_MEDIA_REQUEST_ITEMS;
+  for (const value of source) {
+    const request = normalizedMediaRequest(value);
+    if (!request || remaining <= 0) {
+      continue;
+    }
+    request.count = Math.min(request.count, remaining);
+    requests.push(request);
+    remaining -= request.count;
+  }
+  if (!requests.length && supplied.length) {
+    const request = normalizedMediaRequest(fallback);
+    if (request) {
+      requests.push(request);
+    }
+  }
+  return requests;
+}
+
 export function parseSlackIntentResult(output) {
   const parsed = typeof output === "string" ? parseJsonObject(output) : output;
   const intent = String(parsed?.intent || "").trim();
@@ -252,7 +313,7 @@ export function parseSlackIntentResult(output) {
   const queryType = MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
     ? String(parsed.queryType)
     : "";
-  return {
+  const result = {
     intent,
     confidence,
     mediaTitle: compact(redactText(stripSlackMentions(parsed.mediaTitle)), 160),
@@ -275,6 +336,18 @@ export function parseSlackIntentResult(output) {
     responseTopic: RESPONSE_TOPICS.has(String(parsed.responseTopic || "")) ? String(parsed.responseTopic) : "other",
     response: safeClassifierReply(parsed.response)
   };
+  if (intent === "media_request") {
+    result.mediaRequests = normalizedMediaRequests(parsed, {
+      mediaTitle: result.mediaTitle,
+      mediaType: result.mediaType,
+      year: result.year,
+      seasons: result.seasons,
+      allSeasons: result.allSeasons,
+      selection: parsed.selection,
+      count: parsed.count
+    });
+  }
+  return result;
 }
 
 function normalizeMediaTitle(value) {
@@ -285,6 +358,128 @@ function normalizeMediaTitle(value) {
     .replace(/[^a-zA-Z0-9]+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function inferredMediaRequestTitle(value) {
+  return compact(redactText(stripSlackMentions(value)
+    .replace(/^(?:the\s+)?/i, "")
+    .replace(/\s+(?:part\s+)?(?:one|1)$/i, "")), 160);
+}
+
+export function inferSlackMediaRequests(value) {
+  const text = stripSlackMentions(value).replace(/\s+/g, " ").trim();
+  const comparative = text.match(
+    /\b(?:have|got)\s+(.+?)\s+(?:2|two|part\s+two)\s+but\s+(?:do\s+you\s+)?(?:not|don't)\s+(?:have\s+)?(.+?)\s+(?:1|one|part\s+one)\b/i
+  );
+  if (comparative) {
+    const presentTitle = inferredMediaRequestTitle(comparative[1]);
+    const missingTitle = inferredMediaRequestTitle(comparative[2]);
+    if (
+      presentTitle
+      && missingTitle
+      && normalizeMediaTitle(presentTitle) === normalizeMediaTitle(missingTitle)
+    ) {
+      return [{
+        mediaTitle: missingTitle,
+        mediaType: "movie",
+        year: null,
+        seasons: [],
+        allSeasons: false,
+        selection: "latest",
+        count: 1
+      }];
+    }
+  }
+
+  const countWords = {
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5
+  };
+  const latest = text.match(
+    /\b(?:get|request|add|grab|want)\s+(?:me\s+)?(?:the\s+)?(2|3|4|5|two|three|four|five)\s+(?:latest|newest|most\s+recent)\s+(.+?)\s+(movies?|films?|shows?|series)\b/i
+  );
+  if (!latest) {
+    return [];
+  }
+  const mediaTitle = inferredMediaRequestTitle(latest[2]);
+  if (!mediaTitle) {
+    return [];
+  }
+  return [{
+    mediaTitle,
+    mediaType: /^(?:movie|film)/i.test(latest[3]) ? "movie" : "tv",
+    year: null,
+    seasons: [],
+    allSeasons: /^(?:show|series)/i.test(latest[3]),
+    selection: "latest",
+    count: Number(latest[1]) || countWords[latest[1].toLowerCase()] || 1
+  }];
+}
+
+function slackCandidateChoices(recentMessages) {
+  const messages = Array.isArray(recentMessages) ? [...recentMessages].reverse() : [];
+  for (const message of messages) {
+    if (message?.direction !== "outbound") {
+      continue;
+    }
+    const choices = [];
+    for (const match of String(message.text || "").matchAll(
+      /^\s*(\d+)\.\s+(.+?)(?:\s+\((\d{4})\))?\s+\[(TV|movie)\]\s*$/gim
+    )) {
+      const mediaTitle = inferredMediaRequestTitle(match[2]);
+      if (!mediaTitle) {
+        continue;
+      }
+      choices.push({
+        option: Number(match[1]),
+        mediaTitle,
+        mediaType: match[4].toLowerCase() === "tv" ? "tv" : "movie",
+        year: normalizedYear(match[3])
+      });
+    }
+    if (choices.length) {
+      return choices;
+    }
+  }
+  return [];
+}
+
+export function inferSlackMediaRequestChoice(value, recentMessages) {
+  const choices = slackCandidateChoices(recentMessages);
+  if (!choices.length) {
+    return [];
+  }
+  const text = stripSlackMentions(value).replace(/\s+/g, " ").trim();
+  const optionMatch = text.match(/\boption\s+(\d+)\b/i)
+    || text.match(/^\s*(\d+)(?:\s+please)?[.!]?\s*$/i);
+  let matching = optionMatch
+    ? choices.filter(choice => choice.option === Number(optionMatch[1]))
+    : [];
+  if (!matching.length) {
+    const yearMatch = text.match(/\b((?:18|19|20)\d{2})\b/);
+    if (yearMatch) {
+      matching = choices.filter(choice => choice.year === Number(yearMatch[1]));
+    }
+  }
+  if (!matching.length) {
+    const normalized = normalizeMediaTitle(text);
+    matching = choices.filter(choice => normalized.includes(normalizeMediaTitle(choice.mediaTitle)));
+  }
+  if (matching.length !== 1) {
+    return [];
+  }
+  const choice = matching[0];
+  return [{
+    mediaTitle: choice.mediaTitle,
+    mediaType: choice.mediaType,
+    year: choice.year,
+    seasons: [],
+    allSeasons: false,
+    selection: "best",
+    count: 1
+  }];
 }
 
 function seerrResultTitle(result) {
@@ -311,14 +506,56 @@ function seerrResultCandidate(result) {
     mediaType,
     title,
     year: seerrResultYear(result),
+    releaseTimestamp: Date.parse(result?.releaseDate || result?.firstAirDate || "") || 0,
     available: Number(result?.mediaInfo?.status) === 5
   };
+}
+
+function mediaTitleRelevance(candidateTitle, requestedTitle) {
+  const candidate = normalizeMediaTitle(candidateTitle);
+  const requested = normalizeMediaTitle(requestedTitle);
+  if (!candidate || !requested) {
+    return 0;
+  }
+  if (candidate === requested) {
+    return 100;
+  }
+  if (candidate.startsWith(`${requested} `)) {
+    return 90;
+  }
+  const requestedTokens = requested.split(" ");
+  const candidateTokens = new Set(candidate.split(" "));
+  return requestedTokens.every(token => candidateTokens.has(token)) ? 70 : 0;
+}
+
+function orderSeerrCandidates(candidates, selection) {
+  const now = Date.now();
+  return [...candidates].sort((left, right) => {
+    if (selection === "latest") {
+      const leftFuture = left.releaseTimestamp > now;
+      const rightFuture = right.releaseTimestamp > now;
+      if (leftFuture !== rightFuture) {
+        return leftFuture ? 1 : -1;
+      }
+      return right.releaseTimestamp - left.releaseTimestamp
+        || right.year - left.year
+        || left.title.localeCompare(right.title);
+    }
+    if (selection === "oldest") {
+      return left.releaseTimestamp - right.releaseTimestamp
+        || left.year - right.year
+        || left.title.localeCompare(right.title);
+    }
+    return 0;
+  });
 }
 
 export function selectSeerrMediaMatch(searchPayload, request) {
   const requestedTitle = normalizeMediaTitle(request?.mediaTitle);
   const requestedType = normalizedMediaType(request?.mediaType);
   const requestedYear = normalizedYear(request?.year);
+  const selection = normalizedMediaRequestSelection(request?.selection);
+  const count = normalizedMediaRequestCount(request?.count);
   const candidates = (Array.isArray(searchPayload?.results) ? searchPayload.results : [])
     .map(seerrResultCandidate)
     .filter(Boolean)
@@ -327,14 +564,74 @@ export function selectSeerrMediaMatch(searchPayload, request) {
   const exactYear = requestedYear
     ? exactTitle.filter(candidate => candidate.year === requestedYear)
     : exactTitle;
-  if (exactYear.length === 1) {
-    return { status: "matched", match: exactYear[0], candidates: exactYear };
+  const relevant = candidates
+    .map(candidate => ({
+      candidate,
+      relevance: mediaTitleRelevance(candidate.title, requestedTitle)
+    }))
+    .filter(entry => entry.relevance > 0)
+    .sort((left, right) => right.relevance - left.relevance)
+    .map(entry => entry.candidate);
+  const relevantYear = requestedYear
+    ? relevant.filter(candidate => candidate.year === requestedYear)
+    : relevant;
+
+  if (selection !== "best") {
+    const pool = count === 1 && exactYear.length ? exactYear : relevantYear;
+    const matches = orderSeerrCandidates(pool, selection).slice(0, count);
+    if (matches.length === count) {
+      return { status: "matched", match: matches[0], matches, candidates: matches };
+    }
+    let suggestionPool = candidates;
+    if (relevant.length) {
+      suggestionPool = relevant;
+    }
+    if (relevantYear.length) {
+      suggestionPool = relevantYear;
+    }
+    const suggestions = orderSeerrCandidates(suggestionPool, selection)
+      .slice(0, MAX_MEDIA_REQUEST_ITEMS);
+    return {
+      status: suggestions.length ? "ambiguous" : "not_found",
+      match: null,
+      matches: [],
+      candidates: suggestions
+    };
   }
-  const relevant = (exactYear.length ? exactYear : exactTitle.length ? exactTitle : candidates).slice(0, 3);
+  if (exactYear.length === 1) {
+    return { status: "matched", match: exactYear[0], matches: exactYear, candidates: exactYear };
+  }
+  if (!requestedYear && exactTitle.length === 1) {
+    return { status: "matched", match: exactTitle[0], matches: exactTitle, candidates: exactTitle };
+  }
+  if (!exactTitle.length && relevantYear.length === 1) {
+    return {
+      status: "matched",
+      match: relevantYear[0],
+      matches: relevantYear,
+      candidates: relevantYear
+    };
+  }
+  let suggestionPool = candidates;
+  if (relevant.length) {
+    suggestionPool = relevant;
+  }
+  if (relevantYear.length) {
+    suggestionPool = relevantYear;
+  }
+  if (exactTitle.length) {
+    suggestionPool = exactTitle;
+  }
+  if (exactYear.length) {
+    suggestionPool = exactYear;
+  }
+  const suggestions = orderSeerrCandidates(suggestionPool, "latest")
+    .slice(0, MAX_MEDIA_REQUEST_ITEMS);
   return {
-    status: relevant.length ? "ambiguous" : "not_found",
+    status: suggestions.length ? "ambiguous" : "not_found",
     match: null,
-    candidates: relevant
+    matches: [],
+    candidates: suggestions
   };
 }
 
@@ -1109,7 +1406,7 @@ export class SlackService {
         user: message.direction === "inbound" ? "human" : "bot",
         text: compact(stripSlackMentions(message.text), 4000)
       }));
-    const result = await this.agent.classifySlackIntent({
+    let result = await this.agent.classifySlackIntent({
       trackedIssue: Boolean(item.slackIssueId),
       threadKind: item.threadKind,
       channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm",
@@ -1120,6 +1417,31 @@ export class SlackService {
       threadId: item.threadId,
       slackIssueId: item.slackIssueId || null
     });
+    const inferredChoice = item.slackIssueId
+      ? []
+      : inferSlackMediaRequestChoice(item.text, recentMessages);
+    const inferredRequests = inferredChoice.length
+      ? inferredChoice
+      : item.slackIssueId
+        ? []
+        : inferSlackMediaRequests(item.text);
+    if (
+      inferredRequests.length
+      && result.socialTone !== "exploit_attempt"
+      && ["conversation", "issue_report", "media_info", "media_request", "needs_clarification"].includes(result.intent)
+    ) {
+      result = {
+        ...result,
+        intent: "media_request",
+        confidence: Math.max(0.95, result.confidence),
+        mediaTitle: inferredRequests[0].mediaTitle,
+        mediaType: inferredRequests[0].mediaType,
+        year: inferredRequests[0].year,
+        seasons: inferredRequests[0].seasons,
+        allSeasons: inferredRequests[0].allSeasons,
+        mediaRequests: inferredRequests
+      };
+    }
     await this.applyIntent(item, result);
   }
 
@@ -1177,7 +1499,10 @@ export class SlackService {
     }
 
     if (result.intent === "media_request") {
-      if (result.confidence < 0.9 || !result.mediaTitle) {
+      const requestCount = Array.isArray(result.mediaRequests)
+        ? result.mediaRequests.length
+        : Number(Boolean(result.mediaTitle));
+      if (result.confidence < 0.8 || !requestCount) {
         if (!item.slackIssueId) {
           setSlackThreadKind(this.dbPath, item.threadId, "request", "active");
         }
@@ -1186,7 +1511,7 @@ export class SlackService {
           "request_clarification",
           `request-clarification:${item.eventId}`,
           personalityResponse(
-            result.response || "Tell me the exact movie or show title, and include the year if the title is ambiguous.",
+            result.response || "Tell me which movie or show you want. A rough title is enough; I will show you likely matches if it is ambiguous.",
             result.socialTone
           )
         );
@@ -1197,7 +1522,8 @@ export class SlackService {
       }
       const request = await this.agent.slackRequestMedia(result, {
         eventId: item.eventId,
-        threadId: item.threadId
+        threadId: item.threadId,
+        channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm"
       });
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "request", request.completed ? "closed" : "active");

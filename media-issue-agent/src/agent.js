@@ -404,6 +404,49 @@ function mediaInfoMessage(queryType, result, request = {}) {
   }
 }
 
+function slackMediaRequestSpecs(request) {
+  const supplied = Array.isArray(request?.mediaRequests) && request.mediaRequests.length
+    ? request.mediaRequests
+    : [request];
+  const requests = [];
+  let remaining = 5;
+  for (const entry of supplied) {
+    const mediaTitle = String(entry?.mediaTitle || "").trim();
+    if (!mediaTitle || remaining <= 0) {
+      continue;
+    }
+    const count = Math.min(
+      remaining,
+      Number.isInteger(Number(entry?.count)) ? Math.max(1, Number(entry.count)) : 1
+    );
+    requests.push({ ...entry, mediaTitle, count });
+    remaining -= count;
+  }
+  return requests;
+}
+
+function slackMediaCandidateLabel(candidate) {
+  return `${candidate.title}${candidate.year ? ` (${candidate.year})` : ""} `
+    + `[${candidate.mediaType === "tv" ? "TV" : "movie"}]`;
+}
+
+function slackMediaRequestClarification(spec, selection, metadata) {
+  const candidates = Array.isArray(selection?.candidates)
+    ? selection.candidates.slice(0, 5)
+    : [];
+  if (!candidates.length) {
+    return `I could not find a likely match for ${spec.mediaTitle}. Try a shorter title or another name it is known by.`;
+  }
+  const choices = candidates
+    .map((candidate, index) => `${index + 1}. ${slackMediaCandidateLabel(candidate)}`)
+    .join("\n");
+  const reply = metadata.channelKind === "channel" ? "Mention me with" : "Reply with";
+  const quantity = Number(spec.count) > 1
+    ? `I found fewer than ${spec.count} confident matches for ${spec.mediaTitle}.`
+    : `I found a few possible matches for ${spec.mediaTitle}.`;
+  return `${quantity}\n${choices}\n${reply} the option number, title, or year you want.`;
+}
+
 function cleanActionStep(value) {
   const text = compactLine(String(value || "")
     .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "")
@@ -2912,92 +2955,147 @@ export class MediaIssueAgent {
   }
 
   async slackRequestMedia(request, metadata = {}) {
-    const requestedTitle = String(request?.mediaTitle || "").trim();
+    const specs = slackMediaRequestSpecs(request);
     this.diagnostic("info", "slack_media_request_started", {
       threadId: metadata.threadId || null,
-      mediaType: request?.mediaType || null,
-      titleLength: requestedTitle.length,
-      yearProvided: Boolean(request?.year),
-      seasonCount: Array.isArray(request?.seasons) ? request.seasons.length : 0,
-      allSeasons: request?.allSeasons === true
+      requestSpecCount: specs.length,
+      requestedItemCount: specs.reduce((total, spec) => total + spec.count, 0)
     });
-    try {
-      const search = await this.client.callTool("seerr_search_media", {
-        query: requestedTitle,
-        page: 1
-      });
-      const selection = selectSeerrMediaMatch(search, request);
+    if (!specs.length) {
+      return {
+        completed: false,
+        kind: "request_clarification",
+        message: "Tell me roughly which movie or show you want, and I will look for likely matches."
+      };
+    }
+
+    const outcomes = [];
+    const handledMedia = new Set();
+    for (const spec of specs) {
+      let selection;
+      try {
+        const search = await this.client.callTool("seerr_search_media", {
+          query: spec.mediaTitle,
+          page: 1
+        });
+        selection = selectSeerrMediaMatch(search, spec);
+      } catch (error) {
+        this.diagnostic("warn", "slack_media_request_search_failed", {
+          threadId: metadata.threadId || null,
+          titleLength: spec.mediaTitle.length,
+          error: error.message
+        });
+        outcomes.push({
+          completed: false,
+          kind: "media_request_failed",
+          message: `I could not search for ${spec.mediaTitle} right now. Please try again later.`
+        });
+        continue;
+      }
+
       if (selection.status !== "matched") {
-        const candidateText = selection.candidates
-          .map(candidate => `${candidate.title}${candidate.year ? ` (${candidate.year})` : ""} [${candidate.mediaType === "tv" ? "TV" : "movie"}]`)
-          .join(", ");
-        const message = selection.status === "ambiguous"
-          ? `I found more than one possible match${candidateText ? `: ${candidateText}` : ""}. Mention me again with the exact title, year, and whether it is a movie or show.`
-          : `I could not find an exact Seerr match for ${requestedTitle}. Check the title and include the release year if available.`;
         this.diagnostic("info", "slack_media_request_needs_clarification", {
           threadId: metadata.threadId || null,
           reason: selection.status,
           candidateCount: selection.candidates.length
         });
-        return { completed: false, kind: "request_clarification", message };
-      }
-      const match = selection.match;
-      const label = `${match.title}${match.year ? ` (${match.year})` : ""}`;
-      if (match.available) {
-        return {
-          completed: true,
-          kind: "media_already_available",
-          message: `${label} is already available in the media library.`
-        };
-      }
-      if (match.mediaType === "tv"
-        && !request.seasons?.length
-        && request.allSeasons !== true) {
-        return {
+        outcomes.push({
           completed: false,
           kind: "request_clarification",
-          message: `Tell me which season of ${label} to request, or explicitly ask for all seasons.`
+          message: slackMediaRequestClarification(spec, selection, metadata)
+        });
+        continue;
+      }
+
+      for (const match of selection.matches || [selection.match]) {
+        const seasonScope = match.mediaType === "tv"
+          ? spec.allSeasons === true
+            ? "all"
+            : [...(spec.seasons || [])].sort((left, right) => left - right).join(",")
+          : "";
+        const mediaKey = `${match.mediaType}:${match.mediaId}:${seasonScope}`;
+        if (handledMedia.has(mediaKey)) {
+          continue;
+        }
+        handledMedia.add(mediaKey);
+        const label = `${match.title}${match.year ? ` (${match.year})` : ""}`;
+        if (match.available) {
+          outcomes.push({
+            completed: true,
+            kind: "media_already_available",
+            message: `${label} is already available in the media library.`
+          });
+          continue;
+        }
+        if (match.mediaType === "tv"
+          && !spec.seasons?.length
+          && spec.allSeasons !== true) {
+          outcomes.push({
+            completed: false,
+            kind: "request_clarification",
+            message: `For ${label}, reply with a season such as "season 1" or say "all seasons".`
+          });
+          continue;
+        }
+        const args = {
+          mediaId: match.mediaId,
+          mediaType: match.mediaType
         };
+        if (match.mediaType === "tv") {
+          args.seasons = spec.seasons?.length ? spec.seasons : "all";
+        }
+        try {
+          await this.client.callTool("seerr_request_media", args);
+          const target = match.mediaType === "tv"
+            ? spec.seasons?.length
+              ? `season${spec.seasons.length === 1 ? "" : "s"} ${spec.seasons.join(", ")} of ${label}`
+              : `all available seasons of ${label}`
+            : label;
+          outcomes.push({
+            completed: true,
+            kind: "media_request_submitted",
+            message: `I submitted a Seerr request for ${target}.`
+          });
+          this.diagnostic("info", "slack_media_request_completed", {
+            threadId: metadata.threadId || null,
+            mediaType: match.mediaType,
+            year: match.year,
+            seasonCount: spec.seasons?.length || 0
+          });
+        } catch (error) {
+          const duplicate = /already (?:been )?requested|duplicate|no seasons available/i.test(String(error?.message || ""));
+          this.diagnostic("warn", "slack_media_request_failed", {
+            threadId: metadata.threadId || null,
+            duplicate,
+            mediaType: match.mediaType,
+            error: error.message
+          });
+          outcomes.push({
+            completed: duplicate,
+            kind: duplicate ? "media_request_exists" : "media_request_failed",
+            message: duplicate
+              ? `${label} is already available or already has an active request.`
+              : `I found ${label}, but Seerr could not accept the request right now. Please try again later.`
+          });
+        }
       }
-      const args = {
-        mediaId: match.mediaId,
-        mediaType: match.mediaType
-      };
-      if (match.mediaType === "tv") {
-        args.seasons = request.seasons?.length ? request.seasons : "all";
-      }
-      await this.client.callTool("seerr_request_media", args);
-      const target = match.mediaType === "tv"
-        ? request.seasons?.length
-          ? `season${request.seasons.length === 1 ? "" : "s"} ${request.seasons.join(", ")} of ${label}`
-          : `all available seasons of ${label}`
-        : label;
-      this.diagnostic("info", "slack_media_request_completed", {
-        threadId: metadata.threadId || null,
-        mediaType: match.mediaType,
-        year: match.year,
-        seasonCount: request.seasons?.length || 0
-      });
-      return {
-        completed: true,
-        kind: "media_request_submitted",
-        message: `I submitted a Seerr request for ${target}.`
-      };
-    } catch (error) {
-      const duplicate = /already (?:been )?requested|duplicate|no seasons available/i.test(String(error?.message || ""));
-      this.diagnostic("warn", "slack_media_request_failed", {
-        threadId: metadata.threadId || null,
-        duplicate,
-        error: error.message
-      });
-      return {
-        completed: duplicate,
-        kind: duplicate ? "media_request_exists" : "media_request_failed",
-        message: duplicate
-          ? `${requestedTitle} is already available or already has an active request.`
-          : `I found ${requestedTitle}, but Seerr could not accept the request right now. Please try again later.`
-      };
     }
+
+    const completed = outcomes.length > 0 && outcomes.every(outcome => outcome.completed);
+    const message = outcomes.length === 1
+      ? outcomes[0].message
+      : outcomes
+        .map(outcome => `- ${outcome.message.replace(/\n/g, "\n  ")}`)
+        .join("\n");
+    return {
+      completed,
+      kind: outcomes.length === 1
+        ? outcomes[0].kind
+        : completed
+          ? "media_requests_completed"
+          : "media_requests_partial",
+      message
+    };
   }
 
   latestSnapshotLocationFor(source, issueId) {

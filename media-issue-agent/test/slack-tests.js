@@ -5,7 +5,7 @@ import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MediaIssueAgent } from "../src/agent.js";
-import { runCodexSlackIntent } from "../src/codex.js";
+import { runCodexSlackIntent, slackIntentPrompt } from "../src/codex.js";
 import { validateDraftComment } from "../src/comments.js";
 import { loadConfig } from "../src/config.js";
 import {
@@ -28,6 +28,8 @@ import {
   slackRateCounts
 } from "../src/db.js";
 import {
+  inferSlackMediaRequestChoice,
+  inferSlackMediaRequests,
   obviousSlackPromptInjection,
   parseSlackIntentResult,
   selectSeerrMediaMatch,
@@ -213,6 +215,15 @@ async function testConfigAndClassifierContract() {
     ISSUE_AGENT_OPENAI_MODERATION_API_KEY: "sk-fixture-moderation"
   }, { requireCodexAuth: false });
   assert.equal(configured.slackModerationApiKey, "sk-fixture-moderation");
+  const intentPrompt = slackIntentPrompt({
+    newestMessage: "fixture",
+    recentMessages: []
+  });
+  assert.match(intentPrompt, /one or more movies or TV shows/);
+  assert.match(intentPrompt, /why do you have Dune 2 but not Dune 1/);
+  assert.match(intentPrompt, /get the two latest Dune movies/);
+  assert.match(intentPrompt, /numbered\/title\/year option previously listed/);
+  assert.match(intentPrompt, /"mediaRequests":\[/);
   const longReply = parseSlackIntentResult({
     intent: "conversation",
     confidence: 0.99,
@@ -276,12 +287,112 @@ async function testConfigAndClassifierContract() {
     year: 2024,
     seasons: [1, 3],
     allSeasons: false,
+    mediaRequests: [{
+      mediaTitle: "Fixture Show",
+      mediaType: "tv",
+      year: 2024,
+      seasons: [1, 3],
+      allSeasons: false,
+      selection: "best",
+      count: 1
+    }],
     queryType: "",
     service: "",
     socialTone: "neutral",
     responseTopic: "media_discovery",
     response: "I can submit that show request."
   });
+  const multipleRequests = parseSlackIntentResult({
+    intent: "media_request",
+    confidence: 0.96,
+    mediaTitle: "Fixture One",
+    mediaRequests: [
+      {
+        mediaTitle: "Fixture One",
+        mediaType: "movie",
+        selection: "latest",
+        count: 3
+      },
+      {
+        mediaTitle: "<@U123> Fixture Two",
+        mediaType: "movie",
+        selection: "oldest",
+        count: 4
+      },
+      {
+        mediaTitle: "Ignored Sixth Item",
+        mediaType: "movie"
+      }
+    ]
+  });
+  assert.deepEqual(multipleRequests.mediaRequests, [
+    {
+      mediaTitle: "Fixture One",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "latest",
+      count: 3
+    },
+    {
+      mediaTitle: "Fixture Two",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "oldest",
+      count: 2
+    }
+  ]);
+  assert.deepEqual(inferSlackMediaRequests(
+    "<@B-BOT> why do you have Dune 2 but not Dune 1"
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: null,
+    seasons: [],
+    allSeasons: false,
+    selection: "latest",
+    count: 1
+  }]);
+  assert.deepEqual(inferSlackMediaRequests(
+    "<@B-BOT> get the two latest Dune movies"
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: null,
+    seasons: [],
+    allSeasons: false,
+    selection: "latest",
+    count: 2
+  }]);
+  const candidateHistory = [{
+    direction: "outbound",
+    user: "bot",
+    text: [
+      "I found a few possible matches for Dune.",
+      "1. Dune (2021) [movie]",
+      "2. Dune (1984) [movie]",
+      "Mention me with the option number, title, or year you want."
+    ].join("\n")
+  }];
+  assert.deepEqual(inferSlackMediaRequestChoice(
+    "<@B-BOT> option 1 please",
+    candidateHistory
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: 2021,
+    seasons: [],
+    allSeasons: false,
+    selection: "best",
+    count: 1
+  }]);
+  assert.equal(inferSlackMediaRequestChoice(
+    "<@B-BOT> the Dune one",
+    candidateHistory
+  ).length, 0);
   assert.deepEqual(parseSlackIntentResult({
     intent: "media_info",
     confidence: 0.98,
@@ -530,6 +641,7 @@ async function testSlackMessageWorkflow() {
     const transport = new FakeSlackTransport();
     const callbacks = [];
     const classifiedContexts = [];
+    const mediaRequestInputs = [];
     const fakeAgent = {
       fetch: globalThis.fetch,
       diagnostic() {},
@@ -595,7 +707,7 @@ async function testSlackMessageWorkflow() {
         if (/request Fixture Show/i.test(context.newestMessage)) {
           return {
             intent: "media_request",
-            confidence: 0.99,
+            confidence: 0.82,
             mediaTitle: "Fixture Show",
             description: "",
             clarification: "",
@@ -657,6 +769,7 @@ async function testSlackMessageWorkflow() {
         };
       },
       async slackRequestMedia(result) {
+        mediaRequestInputs.push(result);
         return {
           completed: true,
           kind: "media_request_submitted",
@@ -834,7 +947,17 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
       ts: "3.800",
       text: "<@B-BOT> What can you do?"
     }));
-    assert.equal(await service.processPendingForTest(), 7);
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-COMPARATIVE-REQUEST",
+      ts: "3.850",
+      text: "<@B-BOT> Why do you have Dune 2 but not Dune 1?"
+    }));
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-LATEST-REQUEST",
+      ts: "3.900",
+      text: "<@B-BOT> Get the two latest Dune movies."
+    }));
+    assert.equal(await service.processPendingForTest(), 9);
     await service.sendPendingForTest();
     const request = transport.posts.find(post => post.dedupeKey === "media-request:EV-REQUEST");
     const unsupported = transport.posts.find(post => post.dedupeKey === "unsupported:EV-UNSUPPORTED");
@@ -843,6 +966,8 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
     const exploit = transport.posts.find(post => post.dedupeKey === "moderation:block:EV-EXPLOIT");
     const generalHelp = transport.posts.find(post => post.dedupeKey === "conversation:EV-GENERAL-HELP");
     const capabilities = transport.posts.find(post => post.dedupeKey === "conversation:EV-CAPABILITIES");
+    const comparativeRequest = transport.posts.find(post => post.dedupeKey === "media-request:EV-COMPARATIVE-REQUEST");
+    const latestRequest = transport.posts.find(post => post.dedupeKey === "media-request:EV-LATEST-REQUEST");
     assert.equal(request.threadTs, "3.200");
     assert.match(request.message, /submitted a Seerr request for Fixture Show/);
     assert.equal(unsupported.threadTs, "3.300");
@@ -857,6 +982,19 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
     assert.match(capabilities.message, /discuss the media library.*file issues.*submit requests/i);
     assert.match(exploit.message, /prompt-injection attempt was discarded/i);
     assert.doesNotMatch(exploit.message, /system prompt|run my tool command/i);
+    assert.match(comparativeRequest.message, /submitted a Seerr request for Dune/i);
+    assert.match(latestRequest.message, /submitted a Seerr request for Dune/i);
+    assert.equal(mediaRequestInputs.length, 3);
+    assert.deepEqual(mediaRequestInputs[1].mediaRequests, [{
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "latest",
+      count: 1
+    }]);
+    assert.equal(mediaRequestInputs[2].mediaRequests[0].count, 2);
 
     assert.deepEqual(slackQueueStatus(config.dbPath).inbound, {
       pending: 0,
@@ -897,6 +1035,78 @@ async function testMediaRequestSelectionAndSubmission() {
     mediaType: "tv",
     year: 2024
   }).match.mediaId, 202);
+  const futureReleaseDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+  const duneSearch = {
+    results: [
+      {
+        id: 401,
+        mediaType: "movie",
+        title: "Dune: Part Two",
+        releaseDate: "2024-03-01",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 402,
+        mediaType: "movie",
+        title: "Dune",
+        releaseDate: "2021-10-22",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 403,
+        mediaType: "movie",
+        title: "Dune",
+        releaseDate: "1984-12-14",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 404,
+        mediaType: "movie",
+        title: "Jodorowsky's Dune",
+        releaseDate: "2013-08-30",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 405,
+        mediaType: "movie",
+        title: "Dune: Part Three",
+        releaseDate: futureReleaseDate,
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 406,
+        mediaType: "tv",
+        name: "Dune: Prophecy",
+        firstAirDate: "2024-11-17",
+        mediaInfo: { status: 2 }
+      }
+    ]
+  };
+  const modernFirst = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "latest",
+    count: 1
+  });
+  assert.equal(modernFirst.status, "matched");
+  assert.equal(modernFirst.match.mediaId, 402);
+  const latestTwo = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "latest",
+    count: 2
+  });
+  assert.deepEqual(latestTwo.matches.map(candidate => candidate.mediaId), [401, 402]);
+  const ambiguousDune = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "best",
+    count: 1
+  });
+  assert.equal(ambiguousDune.status, "ambiguous");
+  assert.deepEqual(ambiguousDune.candidates.map(candidate => candidate.mediaId), [402, 403]);
 
   const root = await tempDir();
   try {
@@ -947,6 +1157,118 @@ async function testMediaRequestSelectionAndSubmission() {
       name: "seerr_request_media",
       args: { mediaId: 202, mediaType: "tv", seasons: "all" }
     });
+    const separateSeasons = await agent.slackRequestMedia({
+      mediaRequests: [
+        {
+          mediaTitle: "Fixture Feature",
+          mediaType: "tv",
+          year: 2024,
+          seasons: [1],
+          allSeasons: false
+        },
+        {
+          mediaTitle: "Fixture Feature",
+          mediaType: "tv",
+          year: 2024,
+          seasons: [2],
+          allSeasons: false
+        }
+      ]
+    });
+    assert.equal(separateSeasons.completed, true);
+    assert.deepEqual(
+      calls
+        .filter(call => call.name === "seerr_request_media")
+        .slice(-2)
+        .map(call => call.args.seasons),
+      [[1], [2]]
+    );
+
+    const duneCalls = [];
+    const duneAgent = new MediaIssueAgent(baseConfig(root), {
+      async callTool(name, args) {
+        duneCalls.push({ name, args });
+        if (name === "seerr_search_media") {
+          if (args.query === "Arrival") {
+            return {
+              results: [{
+                id: 407,
+                mediaType: "movie",
+                title: "Arrival",
+                releaseDate: "2016-11-11",
+                mediaInfo: { status: 2 }
+              }]
+            };
+          }
+          return duneSearch;
+        }
+        if (name === "seerr_request_media") {
+          return { id: args.mediaId, status: 1 };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    });
+    const needsChoice = await duneAgent.slackRequestMedia({
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      mediaRequests: [{
+        mediaTitle: "Dune",
+        mediaType: "movie",
+        selection: "best",
+        count: 1
+      }]
+    }, { channelKind: "channel" });
+    assert.equal(needsChoice.completed, false);
+    assert.match(needsChoice.message, /1\. Dune \(2021\) \[movie\]/);
+    assert.match(needsChoice.message, /2\. Dune \(1984\) \[movie\]/);
+    assert.match(needsChoice.message, /Mention me with the option number/);
+    assert.equal(duneCalls.filter(call => call.name === "seerr_request_media").length, 0);
+
+    const latestDune = await duneAgent.slackRequestMedia({
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      mediaRequests: [{
+        mediaTitle: "Dune",
+        mediaType: "movie",
+        selection: "latest",
+        count: 2
+      }]
+    });
+    assert.equal(latestDune.completed, true);
+    assert.match(latestDune.message, /Dune: Part Two \(2024\)/);
+    assert.match(latestDune.message, /Dune \(2021\)/);
+    assert.deepEqual(
+      duneCalls
+        .filter(call => call.name === "seerr_request_media")
+        .map(call => call.args.mediaId),
+      [401, 402]
+    );
+    const explicitMultiple = await duneAgent.slackRequestMedia({
+      mediaRequests: [
+        {
+          mediaTitle: "Dune",
+          mediaType: "movie",
+          selection: "latest",
+          count: 1
+        },
+        {
+          mediaTitle: "Arrival",
+          mediaType: "movie",
+          selection: "best",
+          count: 1
+        }
+      ]
+    });
+    assert.equal(explicitMultiple.completed, true);
+    assert.match(explicitMultiple.message, /Dune \(2021\)/);
+    assert.match(explicitMultiple.message, /Arrival \(2016\)/);
+    assert.deepEqual(
+      duneCalls
+        .filter(call => call.name === "seerr_request_media")
+        .slice(-2)
+        .map(call => call.args.mediaId),
+      [402, 407]
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
