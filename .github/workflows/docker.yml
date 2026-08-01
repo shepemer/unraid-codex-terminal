@@ -50,6 +50,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Validate deployment configuration
+        run: python3 scripts/validate-deployment.py
+
       - name: Run media MCP checks
         run: |
           npm --prefix media-mcp ci

@@ -180,6 +180,30 @@ function formatPublicCount(value) {
     : "0";
 }
 
+function formatPublicDuration(value) {
+  let seconds = Math.max(0, Math.floor(Number(value) || 0));
+  if (seconds < 60) {
+    return seconds ? "less than 1 minute" : "0 minutes";
+  }
+  const units = [
+    ["day", 24 * 60 * 60],
+    ["hour", 60 * 60],
+    ["minute", 60]
+  ];
+  const parts = [];
+  for (const [label, size] of units) {
+    const amount = Math.floor(seconds / size);
+    if (amount) {
+      parts.push(`${formatPublicCount(amount)} ${label}${amount === 1 ? "" : "s"}`);
+      seconds -= amount * size;
+    }
+    if (parts.length === 2) {
+      break;
+    }
+  }
+  return parts.join(" ");
+}
+
 function mediaTitleLabel(value) {
   const title = safeSlackPublicLabel(value?.title);
   return `${title}${value?.year ? ` (${value.year})` : ""}`;
@@ -238,6 +262,33 @@ function mediaInfoBandwidthMessage(result) {
   });
   return `Plex has used ${formatPublicBytes(result.totalBytes)} in ${month}: `
     + `${formatPublicBytes(result.wanBytes)} WAN and ${formatPublicBytes(result.lanBytes)} LAN.`;
+}
+
+function mediaInfoWatchtimeMessage(result, request) {
+  if (!result?.available) {
+    return "I could not read aggregate Plex watch-time statistics right now.";
+  }
+  const days = Number.isInteger(Number(result.periodDays)) ? Number(result.periodDays) : 30;
+  const playCount = Math.max(0, Math.floor(Number(result.playCount) || 0));
+  const duration = formatPublicDuration(result.totalWatchSeconds);
+  const range = `the last ${formatPublicCount(days)} day${days === 1 ? "" : "s"}`;
+  if (result.scope === "title") {
+    const label = mediaTitleLabel({
+      title: request?.mediaTitle,
+      year: request?.year
+    });
+    if (result.complete === false && !result.matched) {
+      return `I could not finish scanning aggregate watch history for ${label} over ${range}.`;
+    }
+    if (!result.matched) {
+      return `Tautulli did not find any plays for ${label} over ${range}.`;
+    }
+    const qualifier = result.complete === false ? "at least " : "";
+    return `Over ${range}, ${label} was played ${qualifier}${formatPublicCount(playCount)} time${playCount === 1 ? "" : "s"} `
+      + `for ${qualifier}${duration} in aggregate.`;
+  }
+  return `Over ${range}, Plex recorded ${formatPublicCount(playCount)} play${playCount === 1 ? "" : "s"} `
+    + `for ${duration} in aggregate.`;
 }
 
 function mediaInfoHealthMessage(result) {
@@ -328,12 +379,14 @@ function mediaInfoRequestStatusMessage(result) {
     : "I could not read Seerr request status right now.";
 }
 
-function mediaInfoMessage(queryType, result) {
+function mediaInfoMessage(queryType, result, request = {}) {
   switch (queryType) {
     case "library_summary":
       return mediaInfoLibraryMessage(result);
     case "title_summary":
       return mediaInfoTitleMessage(result);
+    case "watchtime_summary":
+      return mediaInfoWatchtimeMessage(result, request);
     case "plex_bandwidth":
       return mediaInfoBandwidthMessage(result);
     case "service_health":
@@ -349,6 +402,49 @@ function mediaInfoMessage(queryType, result) {
     default:
       return "I need a more specific media question before I can look that up.";
   }
+}
+
+function slackMediaRequestSpecs(request) {
+  const supplied = Array.isArray(request?.mediaRequests) && request.mediaRequests.length
+    ? request.mediaRequests
+    : [request];
+  const requests = [];
+  let remaining = 5;
+  for (const entry of supplied) {
+    const mediaTitle = String(entry?.mediaTitle || "").trim();
+    if (!mediaTitle || remaining <= 0) {
+      continue;
+    }
+    const count = Math.min(
+      remaining,
+      Number.isInteger(Number(entry?.count)) ? Math.max(1, Number(entry.count)) : 1
+    );
+    requests.push({ ...entry, mediaTitle, count });
+    remaining -= count;
+  }
+  return requests;
+}
+
+function slackMediaCandidateLabel(candidate) {
+  return `${candidate.title}${candidate.year ? ` (${candidate.year})` : ""} `
+    + `[${candidate.mediaType === "tv" ? "TV" : "movie"}]`;
+}
+
+function slackMediaRequestClarification(spec, selection, metadata) {
+  const candidates = Array.isArray(selection?.candidates)
+    ? selection.candidates.slice(0, 5)
+    : [];
+  if (!candidates.length) {
+    return `I could not find a likely match for ${spec.mediaTitle}. Try a shorter title or another name it is known by.`;
+  }
+  const choices = candidates
+    .map((candidate, index) => `${index + 1}. ${slackMediaCandidateLabel(candidate)}`)
+    .join("\n");
+  const reply = metadata.channelKind === "channel" ? "Mention me with" : "Reply with";
+  const quantity = Number(spec.count) > 1
+    ? `I found fewer than ${spec.count} confident matches for ${spec.mediaTitle}.`
+    : `I found a few possible matches for ${spec.mediaTitle}.`;
+  return `${quantity}\n${choices}\n${reply} the option number, title, or year you want.`;
 }
 
 function cleanActionStep(value) {
@@ -2772,6 +2868,20 @@ export class MediaIssueAgent {
           ...(request.year ? { year: request.year } : {})
         };
         break;
+      case "watchtime_summary": {
+        const requestedDays = Number(request.periodDays);
+        const periodDays = Number.isInteger(requestedDays) && requestedDays >= 1 && requestedDays <= 366
+          ? requestedDays
+          : 30;
+        toolName = "media_public_watchtime_summary";
+        args = {
+          periodDays,
+          ...(title ? { title } : {}),
+          ...(request.mediaType ? { mediaType: request.mediaType } : {}),
+          ...(request.year ? { year: request.year } : {})
+        };
+        break;
+      }
       case "plex_bandwidth":
         toolName = "plex_public_bandwidth_summary";
         args = {};
@@ -2814,7 +2924,7 @@ export class MediaIssueAgent {
         return {
           completed: false,
           kind: "media_info_clarification",
-          message: "Ask me about library counts, one title, bandwidth, service health, queues, subtitles, recent additions, or request status."
+          message: "Ask me about library counts, one title, aggregate watch time, bandwidth, service health, queues, subtitles, recent additions, or request status."
         };
     }
     try {
@@ -2827,7 +2937,7 @@ export class MediaIssueAgent {
       return {
         completed: true,
         kind: "media_info",
-        message: mediaInfoMessage(queryType, result)
+        message: mediaInfoMessage(queryType, result, request)
       };
     } catch (error) {
       this.diagnostic("warn", "slack_media_info_failed", {
@@ -2845,92 +2955,147 @@ export class MediaIssueAgent {
   }
 
   async slackRequestMedia(request, metadata = {}) {
-    const requestedTitle = String(request?.mediaTitle || "").trim();
+    const specs = slackMediaRequestSpecs(request);
     this.diagnostic("info", "slack_media_request_started", {
       threadId: metadata.threadId || null,
-      mediaType: request?.mediaType || null,
-      titleLength: requestedTitle.length,
-      yearProvided: Boolean(request?.year),
-      seasonCount: Array.isArray(request?.seasons) ? request.seasons.length : 0,
-      allSeasons: request?.allSeasons === true
+      requestSpecCount: specs.length,
+      requestedItemCount: specs.reduce((total, spec) => total + spec.count, 0)
     });
-    try {
-      const search = await this.client.callTool("seerr_search_media", {
-        query: requestedTitle,
-        page: 1
-      });
-      const selection = selectSeerrMediaMatch(search, request);
+    if (!specs.length) {
+      return {
+        completed: false,
+        kind: "request_clarification",
+        message: "Tell me roughly which movie or show you want, and I will look for likely matches."
+      };
+    }
+
+    const outcomes = [];
+    const handledMedia = new Set();
+    for (const spec of specs) {
+      let selection;
+      try {
+        const search = await this.client.callTool("seerr_search_media", {
+          query: spec.mediaTitle,
+          page: 1
+        });
+        selection = selectSeerrMediaMatch(search, spec);
+      } catch (error) {
+        this.diagnostic("warn", "slack_media_request_search_failed", {
+          threadId: metadata.threadId || null,
+          titleLength: spec.mediaTitle.length,
+          error: error.message
+        });
+        outcomes.push({
+          completed: false,
+          kind: "media_request_failed",
+          message: `I could not search for ${spec.mediaTitle} right now. Please try again later.`
+        });
+        continue;
+      }
+
       if (selection.status !== "matched") {
-        const candidateText = selection.candidates
-          .map(candidate => `${candidate.title}${candidate.year ? ` (${candidate.year})` : ""} [${candidate.mediaType === "tv" ? "TV" : "movie"}]`)
-          .join(", ");
-        const message = selection.status === "ambiguous"
-          ? `I found more than one possible match${candidateText ? `: ${candidateText}` : ""}. Mention me again with the exact title, year, and whether it is a movie or show.`
-          : `I could not find an exact Seerr match for ${requestedTitle}. Check the title and include the release year if available.`;
         this.diagnostic("info", "slack_media_request_needs_clarification", {
           threadId: metadata.threadId || null,
           reason: selection.status,
           candidateCount: selection.candidates.length
         });
-        return { completed: false, kind: "request_clarification", message };
-      }
-      const match = selection.match;
-      const label = `${match.title}${match.year ? ` (${match.year})` : ""}`;
-      if (match.available) {
-        return {
-          completed: true,
-          kind: "media_already_available",
-          message: `${label} is already available in the media library.`
-        };
-      }
-      if (match.mediaType === "tv"
-        && !request.seasons?.length
-        && request.allSeasons !== true) {
-        return {
+        outcomes.push({
           completed: false,
           kind: "request_clarification",
-          message: `Tell me which season of ${label} to request, or explicitly ask for all seasons.`
+          message: slackMediaRequestClarification(spec, selection, metadata)
+        });
+        continue;
+      }
+
+      for (const match of selection.matches || [selection.match]) {
+        const seasonScope = match.mediaType === "tv"
+          ? spec.allSeasons === true
+            ? "all"
+            : [...(spec.seasons || [])].sort((left, right) => left - right).join(",")
+          : "";
+        const mediaKey = `${match.mediaType}:${match.mediaId}:${seasonScope}`;
+        if (handledMedia.has(mediaKey)) {
+          continue;
+        }
+        handledMedia.add(mediaKey);
+        const label = `${match.title}${match.year ? ` (${match.year})` : ""}`;
+        if (match.available) {
+          outcomes.push({
+            completed: true,
+            kind: "media_already_available",
+            message: `${label} is already available in the media library.`
+          });
+          continue;
+        }
+        if (match.mediaType === "tv"
+          && !spec.seasons?.length
+          && spec.allSeasons !== true) {
+          outcomes.push({
+            completed: false,
+            kind: "request_clarification",
+            message: `For ${label}, reply with a season such as "season 1" or say "all seasons".`
+          });
+          continue;
+        }
+        const args = {
+          mediaId: match.mediaId,
+          mediaType: match.mediaType
         };
+        if (match.mediaType === "tv") {
+          args.seasons = spec.seasons?.length ? spec.seasons : "all";
+        }
+        try {
+          await this.client.callTool("seerr_request_media", args);
+          const target = match.mediaType === "tv"
+            ? spec.seasons?.length
+              ? `season${spec.seasons.length === 1 ? "" : "s"} ${spec.seasons.join(", ")} of ${label}`
+              : `all available seasons of ${label}`
+            : label;
+          outcomes.push({
+            completed: true,
+            kind: "media_request_submitted",
+            message: `I submitted a Seerr request for ${target}.`
+          });
+          this.diagnostic("info", "slack_media_request_completed", {
+            threadId: metadata.threadId || null,
+            mediaType: match.mediaType,
+            year: match.year,
+            seasonCount: spec.seasons?.length || 0
+          });
+        } catch (error) {
+          const duplicate = /already (?:been )?requested|duplicate|no seasons available/i.test(String(error?.message || ""));
+          this.diagnostic("warn", "slack_media_request_failed", {
+            threadId: metadata.threadId || null,
+            duplicate,
+            mediaType: match.mediaType,
+            error: error.message
+          });
+          outcomes.push({
+            completed: duplicate,
+            kind: duplicate ? "media_request_exists" : "media_request_failed",
+            message: duplicate
+              ? `${label} is already available or already has an active request.`
+              : `I found ${label}, but Seerr could not accept the request right now. Please try again later.`
+          });
+        }
       }
-      const args = {
-        mediaId: match.mediaId,
-        mediaType: match.mediaType
-      };
-      if (match.mediaType === "tv") {
-        args.seasons = request.seasons?.length ? request.seasons : "all";
-      }
-      await this.client.callTool("seerr_request_media", args);
-      const target = match.mediaType === "tv"
-        ? request.seasons?.length
-          ? `season${request.seasons.length === 1 ? "" : "s"} ${request.seasons.join(", ")} of ${label}`
-          : `all available seasons of ${label}`
-        : label;
-      this.diagnostic("info", "slack_media_request_completed", {
-        threadId: metadata.threadId || null,
-        mediaType: match.mediaType,
-        year: match.year,
-        seasonCount: request.seasons?.length || 0
-      });
-      return {
-        completed: true,
-        kind: "media_request_submitted",
-        message: `I submitted a Seerr request for ${target}.`
-      };
-    } catch (error) {
-      const duplicate = /already (?:been )?requested|duplicate|no seasons available/i.test(String(error?.message || ""));
-      this.diagnostic("warn", "slack_media_request_failed", {
-        threadId: metadata.threadId || null,
-        duplicate,
-        error: error.message
-      });
-      return {
-        completed: duplicate,
-        kind: duplicate ? "media_request_exists" : "media_request_failed",
-        message: duplicate
-          ? `${requestedTitle} is already available or already has an active request.`
-          : `I found ${requestedTitle}, but Seerr could not accept the request right now. Please try again later.`
-      };
     }
+
+    const completed = outcomes.length > 0 && outcomes.every(outcome => outcome.completed);
+    const message = outcomes.length === 1
+      ? outcomes[0].message
+      : outcomes
+        .map(outcome => `- ${outcome.message.replace(/\n/g, "\n  ")}`)
+        .join("\n");
+    return {
+      completed,
+      kind: outcomes.length === 1
+        ? outcomes[0].kind
+        : completed
+          ? "media_requests_completed"
+          : "media_requests_partial",
+      message
+    };
   }
 
   latestSnapshotLocationFor(source, issueId) {

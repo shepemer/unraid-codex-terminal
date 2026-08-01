@@ -1,0 +1,15 @@
+services:
+  media-mcp:
+    volumes:
+      - type: bind
+        source: "${MEDIA_MCP_DOWNLOADS_DIR:?Set MEDIA_MCP_DOWNLOADS_DIR to an existing exact-case host path}"
+        target: /mnt/unraid/downloads
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${MEDIA_MCP_MEDIA_DIR:?Set MEDIA_MCP_MEDIA_DIR to an existing exact-case host path}"
+        target: /mnt/unraid/media
+        read_only: false
+        bind:
+          create_host_path: false

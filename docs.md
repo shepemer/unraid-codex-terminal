@@ -65,9 +65,9 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
 
-   Optional media/download path diagnostics belong on `codex-terminal` unless you intentionally need write access for archive extraction. If you want agents to compare media-service paths with host files, configure narrow mounts such as `/mnt/user/media` and `/mnt/user/downloads`, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`. Keep downloads read-only unless you are deliberately doing shell-side extraction.
+   Optional media/download path diagnostics belong on `codex-terminal` unless you intentionally need write access for archive extraction. If you want agents to compare media-service paths with host files, select narrow existing shares using their exact capitalization, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`. Keep downloads read-only unless you are deliberately doing shell-side extraction.
 
-6. Optional: install `media-mcp` on `codex-mgmt`. For guarded archive extraction, mount the downloads share read/write at `/mnt/unraid/downloads` and keep `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports a different container path. For scoped raw media-file deletion, mount the narrowest media library root at `/mnt/unraid/media`, set `MEDIA_MCP_MEDIA_ROOTS=/mnt/unraid/media`, and add any Plex/Radarr service-path mappings to `MEDIA_MCP_PATH_MAPS`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
+6. Optional: install `media-mcp` on `codex-mgmt`. For guarded archive extraction, select the existing downloads share with its exact capitalization, mount it read/write at `/mnt/unraid/downloads`, and set `MEDIA_MCP_PATH_MAPS=/downloads=/mnt/unraid/downloads` unless your download client reports a different container path. For scoped raw media-file deletion, select the narrowest existing media library root with its exact capitalization, mount it at `/mnt/unraid/media`, set `MEDIA_MCP_MEDIA_ROOTS=/mnt/unraid/media`, and add any Plex/Radarr service-path mappings to `MEDIA_MCP_PATH_MAPS`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
 
    - Sonarr: `SONARR_URL` and `SONARR_API_KEY`
    - Radarr: `RADARR_URL` and `RADARR_API_KEY`
@@ -139,6 +139,36 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 Do not add a port mapping for `unraid-mcp`, `media-mcp`, or `utilities-mcp`. The media issue agent publishes only its password-protected Web UI port; expose it only on LAN, VPN, or Tailscale.
 
 `UNRAID_API_URL` must include `/graphql` and must match the scheme your Unraid WebUI/API actually serves. If `https://<unraid-ip>` refuses port `443` but `http://<unraid-ip>` works on port `80`, use `http://<unraid-ip>/graphql`.
+
+## Unraid Share Path Casing
+
+The optional media and downloads mounts have no host-path defaults. Before configuring either mount, use the Unraid terminal to list the existing share names:
+
+```sh
+ls -1 /mnt/user
+```
+
+Copy the path exactly as shown. Linux paths are case-sensitive, and Docker volume syntax can create a missing source directory. For example, entering `/mnt/user/media` when the existing share is `/mnt/user/Media` can create a second share and trigger Fix Common Problems warnings.
+
+For Compose, direct file access is disabled in the base file. Set `MEDIA_MCP_DOWNLOADS_DIR` and `MEDIA_MCP_MEDIA_DIR` to existing exact-case paths, then include the guarded override:
+
+```sh
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.media-paths.yml.example \
+  --profile media up -d media-mcp
+```
+
+The override uses `create_host_path: false`, so startup fails instead of creating a misspelled share. Leave the mounts and their corresponding `MEDIA_MCP_MEDIA_ROOTS` or `MEDIA_MCP_PATH_MAPS` settings blank when direct filesystem tools are not needed.
+
+If Fix Common Problems already reports two differently cased shares, stop every container that mounts either path. Compare both shares and their per-disk directories before moving or deleting anything:
+
+```sh
+du -sh /mnt/user/Media /mnt/user/media 2>/dev/null
+find /mnt/disk* /mnt/cache -maxdepth 1 -type d -iname media -print 2>/dev/null
+```
+
+Update container mappings to the intended existing share. If both shares contain data, merge them with the Unraid file manager or another trusted file tool. Remove the unwanted share only after it is empty, then restart the containers and rescan Fix Common Problems. Do not delete either path merely based on capitalization.
 
 ## WebUI
 
@@ -301,15 +331,15 @@ Create the moderation key in a separate OpenAI Platform project when possible an
 
 The manifest requests `app_mention`, `message.channels`, and `message.im` events. The configured channel must be public and must not be a Slack Connect or organization-shared channel. The process ignores ordinary channel traffic: every accepted channel message must explicitly mention the bot, including follow-up messages inside bot-owned issue threads. Direct messages from the authenticated workspace do not require a mention. It ignores bot messages, message subtypes, external-workspace users, other channels, and untracked channel threads. The bot joins the configured public channel at startup when needed.
 
-Every accepted message first passes deterministic normalization, prompt-injection and exposed-secret checks, then OpenAI `omni-moderation-latest`. Only allowed normalized text is released to the local Codex classifier. Moderation failures fail closed without stopping the rest of media-issue-agent. The classifier uses ChatGPT auth, treats all Slack text as untrusted data, and runs tool-free in a fresh empty read-only workspace with Codex user configuration, rules, and MCP servers disabled. The workspace is deleted after each classification. Application code, not the model, chooses from a fixed set of privacy-safe read-only `media-mcp` summaries; the classifier cannot select arbitrary tools, arguments, IDs, or paths. The Slack path can report aggregate library/storage/missing-item counts, exact-title availability and episode status, current-month Plex bandwidth, configured service health, queue problem counts, wanted subtitle counts, recent public media additions, Seerr request status, and active Plex stream count. These summaries discard playback users, requesters, account/device IDs, raw downloads, internal IDs, paths, service URLs, credentials, and raw records before returning data to Slack.
+Every accepted message first passes deterministic normalization, prompt-injection and exposed-secret checks, then OpenAI `omni-moderation-latest`. Only allowed normalized text is released to the local Codex classifier. Moderation failures fail closed without stopping the rest of media-issue-agent. The classifier uses ChatGPT auth, treats all Slack text as untrusted data, and runs tool-free in a fresh empty read-only workspace with Codex user configuration, rules, and MCP servers disabled. The workspace is deleted after each classification. Application code, not the model, chooses from a fixed set of privacy-safe read-only `media-mcp` summaries; the classifier cannot select arbitrary tools, arguments, IDs, or paths. The Slack path can report aggregate library/storage/missing-item counts, exact-title availability and episode status, aggregate watch time and play counts for a bounded period or exact title, current-month Plex bandwidth, configured service health, queue problem counts, wanted subtitle counts, recent public media additions, Seerr request status, and active Plex stream count. User-specific playback history is not available. These summaries discard playback users, requesters, account/device IDs, raw downloads, internal IDs, paths, service URLs, credentials, and raw records before returning data to Slack.
 
 The `media-issue-agent` container must not be given media or download mounts. The supplied Docker Compose service and Unraid template mount only `/state` and `/codex-home`; direct media/download access belongs exclusively to `media-mcp`. Conversation classification has no media MCP access. Safe messages that do not map to a server action are handled as ordinary, message-specific conversation. Requests for actions the bot cannot execute are answered conversationally around the underlying goal rather than with limitation notices, while capability lists are reserved for explicit capability questions. Legitimate media questions receive concise conversational answers, while detected prompt injection receives a deterministic rejection without executing a lookup or incorporating the attacker's wording.
 
-Slack messages never inherit `ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME` trust, even when a Slack display name matches that configured reporter. A confident, concrete report creates a normal `slack` issue in the triage queue; a mentioned follow-up in its thread is archived verbatim and included as current issue evidence. Media requests use exact title matching against Seerr results before submitting the selected movie or TV request, and ambiguous requests receive a clarification instead of guessing. Plex availability requests return only online/offline state and active stream count. A top-level channel status request receives a top-level response that mentions the requester; a status request made inside an existing thread stays in that thread. All issue, media-information, media-request, clarification, conversational, and lifecycle responses stay in the originating thread.
+Slack messages never inherit `ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME` trust, even when a Slack display name matches that configured reporter. A confident, concrete report creates a normal `slack` issue in the triage queue; a mentioned follow-up in its thread is archived verbatim and included as current issue evidence. Media requests accept conversational wording, multiple explicit titles, and bounded relative groups such as the two latest movies in a franchise. Ranked Seerr matching can resolve unique or explicitly latest/oldest results without requiring a year. Ambiguous matches produce a numbered list, and a later option number, title, or year selects from that list deterministically. Plex availability requests return only online/offline state and active stream count. A top-level channel status request receives a top-level response that mentions the requester; a status request made inside an existing thread stays in that thread. All issue, media-information, media-request, clarification, conversational, and lifecycle responses stay in the originating thread.
 
 Allowed inbound and safely moderated outbound Slack text is archived in SQLite so old issue history survives Slack retention or deletion. Before moderation, inbound text exists only as AES-GCM ciphertext protected by a process-local key. Blocked or failed messages are scrubbed and retain only a placeholder, category metadata, policy version, timestamp, and keyed digest; they are excluded from issue evidence and Codex context. Pending ciphertext left by a restart cannot be decrypted and is scrubbed with a neutral retry response. General issue-list and snapshot APIs do not include the verbatim allowed archive; authenticated issue detail and investigation evidence can use it. If Slack reports that an old thread is missing, archived history remains available and delivery is marked unavailable without creating a replacement thread or DM.
 
-Hardcoded abuse guards limit each user independently to 36 accepted interactions per 10 minutes, 15 Codex classifications per hour, and 60 queued messages. One user cannot consume another user's quota. At most six classifiers run concurrently across the service, and repeated rate-limit notices are suppressed for five minutes. These limits intentionally cannot be relaxed through untrusted chat input.
+Hardcoded abuse guards limit each user independently to 180 accepted interactions per 10 minutes, 75 Codex classifications per hour, and 300 queued messages. One user cannot consume another user's quota. At most six classifiers run concurrently across the service. Every message received while a user is limited gets its own response with the remaining sliding-window wait; a full queue reports that it clears when an earlier message finishes. These limits intentionally cannot be relaxed through untrusted chat input.
 
 When Pushover is configured, allowed inbound Slack messages and successfully sent bot messages generate redacted, truncated previews after moderation. Blocked messages generate category-only notifications with no raw text. New Slack issues do not generate a second generic new-issue notification. Codex usage reported by Slack classification calls is recorded in the same daily token counter shown in the Web UI as investigation and repair usage. Slack tokens and `ISSUE_AGENT_OPENAI_MODERATION_API_KEY` are secrets: never commit, log, paste, or place them in issue reports. The moderation key is never passed to Codex or `media-mcp`.
 

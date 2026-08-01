@@ -5,7 +5,7 @@ import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MediaIssueAgent } from "../src/agent.js";
-import { runCodexSlackIntent } from "../src/codex.js";
+import { runCodexSlackIntent, slackIntentPrompt } from "../src/codex.js";
 import { validateDraftComment } from "../src/comments.js";
 import { loadConfig } from "../src/config.js";
 import {
@@ -28,6 +28,8 @@ import {
   slackRateCounts
 } from "../src/db.js";
 import {
+  inferSlackMediaRequestChoice,
+  inferSlackMediaRequests,
   obviousSlackPromptInjection,
   parseSlackIntentResult,
   selectSeerrMediaMatch,
@@ -213,6 +215,15 @@ async function testConfigAndClassifierContract() {
     ISSUE_AGENT_OPENAI_MODERATION_API_KEY: "sk-fixture-moderation"
   }, { requireCodexAuth: false });
   assert.equal(configured.slackModerationApiKey, "sk-fixture-moderation");
+  const intentPrompt = slackIntentPrompt({
+    newestMessage: "fixture",
+    recentMessages: []
+  });
+  assert.match(intentPrompt, /one or more movies or TV shows/);
+  assert.match(intentPrompt, /why do you have Dune 2 but not Dune 1/);
+  assert.match(intentPrompt, /get the two latest Dune movies/);
+  assert.match(intentPrompt, /numbered\/title\/year option previously listed/);
+  assert.match(intentPrompt, /"mediaRequests":\[/);
   const longReply = parseSlackIntentResult({
     intent: "conversation",
     confidence: 0.99,
@@ -276,12 +287,112 @@ async function testConfigAndClassifierContract() {
     year: 2024,
     seasons: [1, 3],
     allSeasons: false,
+    mediaRequests: [{
+      mediaTitle: "Fixture Show",
+      mediaType: "tv",
+      year: 2024,
+      seasons: [1, 3],
+      allSeasons: false,
+      selection: "best",
+      count: 1
+    }],
     queryType: "",
     service: "",
     socialTone: "neutral",
     responseTopic: "media_discovery",
     response: "I can submit that show request."
   });
+  const multipleRequests = parseSlackIntentResult({
+    intent: "media_request",
+    confidence: 0.96,
+    mediaTitle: "Fixture One",
+    mediaRequests: [
+      {
+        mediaTitle: "Fixture One",
+        mediaType: "movie",
+        selection: "latest",
+        count: 3
+      },
+      {
+        mediaTitle: "<@U123> Fixture Two",
+        mediaType: "movie",
+        selection: "oldest",
+        count: 4
+      },
+      {
+        mediaTitle: "Ignored Sixth Item",
+        mediaType: "movie"
+      }
+    ]
+  });
+  assert.deepEqual(multipleRequests.mediaRequests, [
+    {
+      mediaTitle: "Fixture One",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "latest",
+      count: 3
+    },
+    {
+      mediaTitle: "Fixture Two",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "oldest",
+      count: 2
+    }
+  ]);
+  assert.deepEqual(inferSlackMediaRequests(
+    "<@B-BOT> why do you have Dune 2 but not Dune 1"
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: null,
+    seasons: [],
+    allSeasons: false,
+    selection: "latest",
+    count: 1
+  }]);
+  assert.deepEqual(inferSlackMediaRequests(
+    "<@B-BOT> get the two latest Dune movies"
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: null,
+    seasons: [],
+    allSeasons: false,
+    selection: "latest",
+    count: 2
+  }]);
+  const candidateHistory = [{
+    direction: "outbound",
+    user: "bot",
+    text: [
+      "I found a few possible matches for Dune.",
+      "1. Dune (2021) [movie]",
+      "2. Dune (1984) [movie]",
+      "Mention me with the option number, title, or year you want."
+    ].join("\n")
+  }];
+  assert.deepEqual(inferSlackMediaRequestChoice(
+    "<@B-BOT> option 1 please",
+    candidateHistory
+  ), [{
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    year: 2021,
+    seasons: [],
+    allSeasons: false,
+    selection: "best",
+    count: 1
+  }]);
+  assert.equal(inferSlackMediaRequestChoice(
+    "<@B-BOT> the Dune one",
+    candidateHistory
+  ).length, 0);
   assert.deepEqual(parseSlackIntentResult({
     intent: "media_info",
     confidence: 0.98,
@@ -309,6 +420,28 @@ async function testConfigAndClassifierContract() {
     responseTopic: "server_admin",
     response: ""
   });
+  const watchtime = parseSlackIntentResult({
+    intent: "media_info",
+    confidence: 0.98,
+    mediaTitle: "Fixture Series",
+    mediaType: "tv",
+    queryType: "watchtime_summary",
+    periodDays: 90
+  });
+  assert.equal(watchtime.queryType, "watchtime_summary");
+  assert.equal(watchtime.periodDays, 90);
+  assert.equal(parseSlackIntentResult({
+    intent: "media_info",
+    confidence: 0.98,
+    queryType: "watchtime_summary",
+    periodDays: 9000
+  }).periodDays, 30);
+  assert.equal(Object.hasOwn(parseSlackIntentResult({
+    intent: "media_info",
+    confidence: 0.98,
+    queryType: "library_summary",
+    periodDays: 7
+  }), "periodDays"), false);
   assert.equal(parseSlackIntentResult({
     intent: "unsupported",
     confidence: 0.99,
@@ -393,6 +526,8 @@ async function testSlackClassifierFilesystemIsolation() {
     assert.deepEqual(result.fixture.entries, []);
     assert.ok(result.fixture.args.includes("--ignore-user-config"));
     assert.ok(result.fixture.args.includes("--ignore-rules"));
+    assert.match(result.fixture.prompt, /aggregate play count and total watch time/i);
+    assert.match(result.fixture.prompt, /specific user's playback or viewing history.*unsupported/i);
     assert.equal(result.fixture.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
     assert.equal(result.fixture.args.some(value => value.includes("mcp_servers.")), false);
     assert.equal(result.fixture.args[result.fixture.args.indexOf("--sandbox") + 1], "read-only");
@@ -506,6 +641,7 @@ async function testSlackMessageWorkflow() {
     const transport = new FakeSlackTransport();
     const callbacks = [];
     const classifiedContexts = [];
+    const mediaRequestInputs = [];
     const fakeAgent = {
       fetch: globalThis.fetch,
       diagnostic() {},
@@ -571,7 +707,7 @@ async function testSlackMessageWorkflow() {
         if (/request Fixture Show/i.test(context.newestMessage)) {
           return {
             intent: "media_request",
-            confidence: 0.99,
+            confidence: 0.82,
             mediaTitle: "Fixture Show",
             description: "",
             clarification: "",
@@ -633,6 +769,7 @@ async function testSlackMessageWorkflow() {
         };
       },
       async slackRequestMedia(result) {
+        mediaRequestInputs.push(result);
         return {
           completed: true,
           kind: "media_request_submitted",
@@ -810,7 +947,17 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
       ts: "3.800",
       text: "<@B-BOT> What can you do?"
     }));
-    assert.equal(await service.processPendingForTest(), 7);
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-COMPARATIVE-REQUEST",
+      ts: "3.850",
+      text: "<@B-BOT> Why do you have Dune 2 but not Dune 1?"
+    }));
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-LATEST-REQUEST",
+      ts: "3.900",
+      text: "<@B-BOT> Get the two latest Dune movies."
+    }));
+    assert.equal(await service.processPendingForTest(), 9);
     await service.sendPendingForTest();
     const request = transport.posts.find(post => post.dedupeKey === "media-request:EV-REQUEST");
     const unsupported = transport.posts.find(post => post.dedupeKey === "unsupported:EV-UNSUPPORTED");
@@ -819,6 +966,8 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
     const exploit = transport.posts.find(post => post.dedupeKey === "moderation:block:EV-EXPLOIT");
     const generalHelp = transport.posts.find(post => post.dedupeKey === "conversation:EV-GENERAL-HELP");
     const capabilities = transport.posts.find(post => post.dedupeKey === "conversation:EV-CAPABILITIES");
+    const comparativeRequest = transport.posts.find(post => post.dedupeKey === "media-request:EV-COMPARATIVE-REQUEST");
+    const latestRequest = transport.posts.find(post => post.dedupeKey === "media-request:EV-LATEST-REQUEST");
     assert.equal(request.threadTs, "3.200");
     assert.match(request.message, /submitted a Seerr request for Fixture Show/);
     assert.equal(unsupported.threadTs, "3.300");
@@ -833,6 +982,19 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
     assert.match(capabilities.message, /discuss the media library.*file issues.*submit requests/i);
     assert.match(exploit.message, /prompt-injection attempt was discarded/i);
     assert.doesNotMatch(exploit.message, /system prompt|run my tool command/i);
+    assert.match(comparativeRequest.message, /submitted a Seerr request for Dune/i);
+    assert.match(latestRequest.message, /submitted a Seerr request for Dune/i);
+    assert.equal(mediaRequestInputs.length, 3);
+    assert.deepEqual(mediaRequestInputs[1].mediaRequests, [{
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      year: null,
+      seasons: [],
+      allSeasons: false,
+      selection: "latest",
+      count: 1
+    }]);
+    assert.equal(mediaRequestInputs[2].mediaRequests[0].count, 2);
 
     assert.deepEqual(slackQueueStatus(config.dbPath).inbound, {
       pending: 0,
@@ -873,6 +1035,78 @@ async function testMediaRequestSelectionAndSubmission() {
     mediaType: "tv",
     year: 2024
   }).match.mediaId, 202);
+  const futureReleaseDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+  const duneSearch = {
+    results: [
+      {
+        id: 401,
+        mediaType: "movie",
+        title: "Dune: Part Two",
+        releaseDate: "2024-03-01",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 402,
+        mediaType: "movie",
+        title: "Dune",
+        releaseDate: "2021-10-22",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 403,
+        mediaType: "movie",
+        title: "Dune",
+        releaseDate: "1984-12-14",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 404,
+        mediaType: "movie",
+        title: "Jodorowsky's Dune",
+        releaseDate: "2013-08-30",
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 405,
+        mediaType: "movie",
+        title: "Dune: Part Three",
+        releaseDate: futureReleaseDate,
+        mediaInfo: { status: 2 }
+      },
+      {
+        id: 406,
+        mediaType: "tv",
+        name: "Dune: Prophecy",
+        firstAirDate: "2024-11-17",
+        mediaInfo: { status: 2 }
+      }
+    ]
+  };
+  const modernFirst = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "latest",
+    count: 1
+  });
+  assert.equal(modernFirst.status, "matched");
+  assert.equal(modernFirst.match.mediaId, 402);
+  const latestTwo = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "latest",
+    count: 2
+  });
+  assert.deepEqual(latestTwo.matches.map(candidate => candidate.mediaId), [401, 402]);
+  const ambiguousDune = selectSeerrMediaMatch(duneSearch, {
+    mediaTitle: "Dune",
+    mediaType: "movie",
+    selection: "best",
+    count: 1
+  });
+  assert.equal(ambiguousDune.status, "ambiguous");
+  assert.deepEqual(ambiguousDune.candidates.map(candidate => candidate.mediaId), [402, 403]);
 
   const root = await tempDir();
   try {
@@ -923,6 +1157,118 @@ async function testMediaRequestSelectionAndSubmission() {
       name: "seerr_request_media",
       args: { mediaId: 202, mediaType: "tv", seasons: "all" }
     });
+    const separateSeasons = await agent.slackRequestMedia({
+      mediaRequests: [
+        {
+          mediaTitle: "Fixture Feature",
+          mediaType: "tv",
+          year: 2024,
+          seasons: [1],
+          allSeasons: false
+        },
+        {
+          mediaTitle: "Fixture Feature",
+          mediaType: "tv",
+          year: 2024,
+          seasons: [2],
+          allSeasons: false
+        }
+      ]
+    });
+    assert.equal(separateSeasons.completed, true);
+    assert.deepEqual(
+      calls
+        .filter(call => call.name === "seerr_request_media")
+        .slice(-2)
+        .map(call => call.args.seasons),
+      [[1], [2]]
+    );
+
+    const duneCalls = [];
+    const duneAgent = new MediaIssueAgent(baseConfig(root), {
+      async callTool(name, args) {
+        duneCalls.push({ name, args });
+        if (name === "seerr_search_media") {
+          if (args.query === "Arrival") {
+            return {
+              results: [{
+                id: 407,
+                mediaType: "movie",
+                title: "Arrival",
+                releaseDate: "2016-11-11",
+                mediaInfo: { status: 2 }
+              }]
+            };
+          }
+          return duneSearch;
+        }
+        if (name === "seerr_request_media") {
+          return { id: args.mediaId, status: 1 };
+        }
+        throw new Error(`Unexpected tool ${name}`);
+      }
+    });
+    const needsChoice = await duneAgent.slackRequestMedia({
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      mediaRequests: [{
+        mediaTitle: "Dune",
+        mediaType: "movie",
+        selection: "best",
+        count: 1
+      }]
+    }, { channelKind: "channel" });
+    assert.equal(needsChoice.completed, false);
+    assert.match(needsChoice.message, /1\. Dune \(2021\) \[movie\]/);
+    assert.match(needsChoice.message, /2\. Dune \(1984\) \[movie\]/);
+    assert.match(needsChoice.message, /Mention me with the option number/);
+    assert.equal(duneCalls.filter(call => call.name === "seerr_request_media").length, 0);
+
+    const latestDune = await duneAgent.slackRequestMedia({
+      mediaTitle: "Dune",
+      mediaType: "movie",
+      mediaRequests: [{
+        mediaTitle: "Dune",
+        mediaType: "movie",
+        selection: "latest",
+        count: 2
+      }]
+    });
+    assert.equal(latestDune.completed, true);
+    assert.match(latestDune.message, /Dune: Part Two \(2024\)/);
+    assert.match(latestDune.message, /Dune \(2021\)/);
+    assert.deepEqual(
+      duneCalls
+        .filter(call => call.name === "seerr_request_media")
+        .map(call => call.args.mediaId),
+      [401, 402]
+    );
+    const explicitMultiple = await duneAgent.slackRequestMedia({
+      mediaRequests: [
+        {
+          mediaTitle: "Dune",
+          mediaType: "movie",
+          selection: "latest",
+          count: 1
+        },
+        {
+          mediaTitle: "Arrival",
+          mediaType: "movie",
+          selection: "best",
+          count: 1
+        }
+      ]
+    });
+    assert.equal(explicitMultiple.completed, true);
+    assert.match(explicitMultiple.message, /Dune \(2021\)/);
+    assert.match(explicitMultiple.message, /Arrival \(2016\)/);
+    assert.deepEqual(
+      duneCalls
+        .filter(call => call.name === "seerr_request_media")
+        .slice(-2)
+        .map(call => call.args.mediaId),
+      [402, 407]
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -966,6 +1312,16 @@ async function testReadOnlyMediaInfoQueries() {
           sizeOnDiskBytes: 2_000_000_000
         }
       },
+      media_public_watchtime_summary: {
+        configured: true,
+        available: true,
+        periodDays: 30,
+        scope: "title",
+        matched: true,
+        playCount: 12,
+        totalWatchSeconds: 30_600,
+        complete: true
+      },
       plex_public_bandwidth_summary: {
         configured: true,
         available: true,
@@ -1004,12 +1360,31 @@ async function testReadOnlyMediaInfoQueries() {
         if (!Object.hasOwn(responses, name)) {
           throw new Error(`Unexpected tool ${name}`);
         }
+        if (name === "media_public_watchtime_summary" && !args.title) {
+          return {
+            ...responses[name],
+            periodDays: args.periodDays,
+            scope: "library",
+            matched: undefined,
+            playCount: 24,
+            totalWatchSeconds: 90_000
+          };
+        }
         return responses[name];
       }
     });
     const scenarios = [
       [{ queryType: "library_summary" }, "media_public_library_summary", /42 TV shows/],
       [{ queryType: "title_summary", mediaTitle: "Fixture Series", mediaType: "tv", year: 2024 }, "media_public_title_summary", /2 are missing/],
+      [{
+        queryType: "watchtime_summary",
+        mediaTitle: "Fixture Series",
+        mediaType: "tv",
+        year: 2024,
+        periodDays: 30,
+        userId: "must-not-cross-the-boundary"
+      }, "media_public_watchtime_summary", /12 times for 8 hours 30 minutes in aggregate/],
+      [{ queryType: "watchtime_summary", periodDays: 7 }, "media_public_watchtime_summary", /24 plays for 1 day 1 hour in aggregate/],
       [{ queryType: "plex_bandwidth" }, "plex_public_bandwidth_summary", /WAN/],
       [{ queryType: "service_health", service: "bazarr" }, "media_public_health_summary", /reachable/],
       [{ queryType: "queue_summary" }, "media_public_queue_summary", /1 looks stalled/],
@@ -1031,6 +1406,17 @@ async function testReadOnlyMediaInfoQueries() {
       mediaType: "movie",
       limit: 5
     });
+    assert.deepEqual(calls.find(call =>
+      call.name === "media_public_watchtime_summary" && call.args.title
+    ).args, {
+      periodDays: 30,
+      title: "Fixture Series",
+      mediaType: "tv",
+      year: 2024
+    });
+    assert.deepEqual(calls.find(call =>
+      call.name === "media_public_watchtime_summary" && !call.args.title
+    ).args, { periodDays: 7 });
     const beforeUnsupported = calls.length;
     const unsupported = await agent.slackMediaInfo({ queryType: "plex_active_sessions" });
     assert.equal(calls.length, beforeUnsupported);
@@ -1147,15 +1533,29 @@ async function testRateAccounting() {
       recordSlackRateEvent(dbPath, "T-RATE", "U-RATE", "classifier");
     }
     const counts = slackRateCounts(dbPath, "T-RATE", "U-RATE");
-    assert.equal(counts.userInteractions, 36);
-    assert.equal(counts.workspaceInteractions, 36);
-    assert.equal(counts.userClassifiers, 15);
-    assert.equal(counts.workspaceClassifiers, 15);
+    assert.equal(counts.userInteractions, SLACK_LIMITS.userInteractionsPerTenMinutes);
+    assert.equal(counts.workspaceInteractions, SLACK_LIMITS.userInteractionsPerTenMinutes);
+    assert.equal(counts.userClassifiers, SLACK_LIMITS.userClassifiersPerHour);
+    assert.equal(counts.workspaceClassifiers, SLACK_LIMITS.userClassifiersPerHour);
     const blocked = consumeSlackRateLimit(dbPath, "T-RATE", "U-RATE", SLACK_LIMITS);
     assert.equal(blocked.allowed, false);
     assert.equal(blocked.reason, "user_interaction_limit");
+    assert.ok(blocked.retryAfterSeconds > 0 && blocked.retryAfterSeconds <= 10 * 60);
     const otherUser = consumeSlackRateLimit(dbPath, "T-RATE", "U-OTHER", SLACK_LIMITS);
     assert.equal(otherUser.allowed, true);
+    for (let index = 0; index < SLACK_LIMITS.userClassifiersPerHour; index += 1) {
+      recordSlackRateEvent(dbPath, "T-CLASSIFIER", "U-CLASSIFIER", "classifier");
+    }
+    const classifierBlocked = consumeSlackRateLimit(
+      dbPath,
+      "T-CLASSIFIER",
+      "U-CLASSIFIER",
+      SLACK_LIMITS,
+      Date.now(),
+      { countInteraction: false }
+    );
+    assert.equal(classifierBlocked.reason, "user_classifier_limit");
+    assert.ok(classifierBlocked.retryAfterSeconds > 0 && classifierBlocked.retryAfterSeconds <= 60 * 60);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1372,12 +1772,19 @@ async function testModerationGateStorageAndOutboundFiltering() {
       user: "U-MOD-RATE",
       text: "<@B-BOT> rate limited private fixture"
     }));
-    assert.equal(await service.processPendingForTest(), 6);
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-MOD-RATE-AGAIN",
+      ts: "20.600",
+      user: "U-MOD-RATE",
+      text: "<@B-BOT> another rate limited private fixture"
+    }));
+    assert.equal(await service.processPendingForTest(), 7);
     await new Promise(resolve => setImmediate(resolve));
 
     assert.deepEqual(classifierInputs, ["<@B-BOT> safe fixture question"]);
     assert.equal(moderationClient.calls.some(call => call.includes("previous instructions")), false);
     assert.equal(moderationClient.calls.some(call => call.includes("rate limited private fixture")), false);
+    assert.equal(moderationClient.calls.some(call => call.includes("another rate limited private fixture")), false);
     assert.equal(moderationClient.calls.some(call => call.length > SLACK_MODERATION_MAX_CHARACTERS), false);
     const rows = sqliteExec(config.dbPath, `
 SELECT event_id AS eventId, text, delivery_status AS status
@@ -1406,6 +1813,24 @@ ORDER BY message_ts;
       rows.find(row => row.eventId === "EV-MOD-RATE").text,
       "[BLOCKED_BY_MODERATION:rate_limit]"
     );
+    assert.equal(
+      rows.find(row => row.eventId === "EV-MOD-RATE-AGAIN").text,
+      "[BLOCKED_BY_MODERATION:rate_limit]"
+    );
+    const rateNotices = sqliteExec(config.dbPath, `
+SELECT dedupe_key AS dedupeKey, message
+FROM slack_outbox
+WHERE kind = 'rate_limited'
+ORDER BY id;
+`, { json: true });
+    assert.equal(rateNotices.length, 2);
+    assert.deepEqual(
+      rateNotices.map(notice => notice.dedupeKey),
+      ["rate-limit:EV-MOD-RATE", "rate-limit:EV-MOD-RATE-AGAIN"]
+    );
+    assert.ok(rateNotices.every(notice =>
+      /per-user message limit.*try again in \d+ (?:minute|second)/i.test(notice.message)
+    ));
     assert.equal(sqliteExec(config.dbPath, "SELECT COUNT(*) AS count FROM slack_moderation_pending;", {
       json: true
     })[0].count, 0);
@@ -1463,7 +1888,7 @@ ORDER BY message_ts;
 
     await service.ingestEnvelope(envelope({
       eventId: "EV-MOD-RESTART",
-      ts: "20.600",
+      ts: "20.700",
       text: "<@B-BOT> pending restart private fixture"
     }));
     const recovered = recoverSlackModerationPending(

@@ -5,7 +5,9 @@ FROM ghcr.io/astral-sh/uv@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594
 FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732
 
 ARG CODEX_NPM_VERSION=latest
-ARG NPM_VERSION=12.0.1
+ARG NPM_VERSION=12.0.2
+ARG NPM_BRACE_EXPANSION_VERSION=5.0.9
+ARG NPM_BRACE_EXPANSION_SHA256=5d06001fddd25cbee90c96db4dc5b7b57711b984c3141e28d10f143deb52dbaf
 ARG NPM_UNDICI_VERSION=6.27.0
 ARG NPM_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
 ARG TTYD_VERSION=1.7.7
@@ -66,6 +68,14 @@ RUN set -euo pipefail; \
 RUN set -euo pipefail; \
     npm install -g "npm@${NPM_VERSION}" "@openai/codex@${CODEX_NPM_VERSION}"; \
     npm_root="$(npm root -g)"; \
+    npm pack "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}" --pack-destination /tmp; \
+    echo "${NPM_BRACE_EXPANSION_SHA256}  /tmp/brace-expansion-${NPM_BRACE_EXPANSION_VERSION}.tgz" | sha256sum -c -; \
+    rm -rf "${npm_root}/npm/node_modules/brace-expansion"; \
+    mkdir -p "${npm_root}/npm/node_modules/brace-expansion"; \
+    tar -xzf "/tmp/brace-expansion-${NPM_BRACE_EXPANSION_VERSION}.tgz" -C "${npm_root}/npm/node_modules/brace-expansion" --strip-components=1; \
+    actual_brace_expansion_version="$(node -p "require('${npm_root}/npm/node_modules/brace-expansion/package.json').version")"; \
+    test "${actual_brace_expansion_version}" = "${NPM_BRACE_EXPANSION_VERSION}"; \
+    rm -f "/tmp/brace-expansion-${NPM_BRACE_EXPANSION_VERSION}.tgz"; \
     npm pack "undici@${NPM_UNDICI_VERSION}" --pack-destination /tmp; \
     echo "${NPM_UNDICI_SHA256}  /tmp/undici-${NPM_UNDICI_VERSION}.tgz" | sha256sum -c -; \
     rm -rf "${npm_root}/npm/node_modules/undici"; \
