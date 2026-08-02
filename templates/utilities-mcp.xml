@@ -18,9 +18,5 @@
   <CPUset/>
   <Requires>Create the Docker network first: docker network create codex-mgmt. Do not add a host port mapping for 6972 unless you intentionally expose MCP.</Requires>
   <Config Name="Utilities MCP Bearer Token" Target="UTILITIES_MCP_BEARER_TOKEN" Default="" Mode="" Description="Bearer token clients must use to call this MCP server. Must match codex-terminal if utilities MCP is enabled there." Type="Variable" Display="always" Required="true" Mask="true"/>
-  <Config Name="MCP Host" Target="UTILITIES_MCP_HOST" Default="0.0.0.0" Mode="" Description="Bind inside the container/network only. Do not publish the port to the host." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0</Config>
-  <Config Name="MCP Port" Target="UTILITIES_MCP_PORT" Default="6972" Mode="" Description="Internal MCP port on codex-mgmt." Type="Variable" Display="advanced" Required="true" Mask="false">6972</Config>
-  <Config Name="Request Timeout Ms" Target="UTILITIES_MCP_REQUEST_TIMEOUT_MS" Default="30000" Mode="" Description="Maximum time for one upstream utility API call." Type="Variable" Display="advanced" Required="false" Mask="false">30000</Config>
-  <Config Name="Scrutiny URL" Target="SCRUTINY_URL" Default="" Mode="" Description="Scrutiny base URL, such as http://scrutiny:8080. Leave blank to disable Scrutiny tools." Type="Variable" Display="always" Required="false" Mask="false"/>
-  <Config Name="Scrutiny Base Path" Target="SCRUTINY_BASE_PATH" Default="" Mode="" Description="Optional reverse-proxy base path before /api, such as scrutiny. Leave blank for normal Scrutiny installs." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Scrutiny URL" Target="SCRUTINY_URL" Default="" Mode="" Description="Full Scrutiny URL, including any reverse-proxy path, such as http://scrutiny:8080 or https://example.test/scrutiny." Type="Variable" Display="always" Required="true" Mask="false"/>
 </Container>

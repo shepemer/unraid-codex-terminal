@@ -61,8 +61,11 @@ async function run() {
   let commandId = 1000;
   const commandRecords = new Map();
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "media-mcp-archives-"));
+  const listedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST");
   const mappedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Archive.Bundle.S01.1080p-GRP");
+  await mkdir(listedArchiveDir, { recursive: true });
   await mkdir(mappedArchiveDir, { recursive: true });
+  await writeFile(path.join(listedArchiveDir, "Example.Archive.Series.S01E01.part01.rar"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.rar"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.r00"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e02.part01.rar"), "placeholder\n");
@@ -1761,6 +1764,10 @@ async function run() {
     assert.equal(archiveEnvironment.visiblePath, tempRoot);
     assert.equal(archiveEnvironment.writeCheck.skipped, true);
     assert.ok(Array.isArray(archiveEnvironment.blockers));
+    assert.deepEqual(
+      archiveEnvironment.mediaPathMaps.filter(mapping => mapping.source === "/downloads"),
+      [{ source: "/downloads", target: tempRoot }]
+    );
 
     const queue = await tool("sonarr_queue", { limit: 5 });
     const escapedQueueItem = queue.records.find(record => record.id === 1003);

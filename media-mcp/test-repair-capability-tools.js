@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -30,6 +30,30 @@ function parseSse(text) {
   return JSON.parse(data);
 }
 
+async function assertPathConfigurationRejected(overrides, expectedMessage) {
+  const child = spawn(process.execPath, ["server.js"], {
+    cwd: new URL(".", import.meta.url).pathname,
+    env: {
+      ...process.env,
+      MEDIA_MCP_BEARER_TOKEN: "test-token",
+      MEDIA_MCP_MEDIA_PATH: "",
+      MEDIA_MCP_DOWNLOADS_PATH: "",
+      MEDIA_MCP_MEDIA_ROOTS: "",
+      MEDIA_MCP_PATH_MAPS: "",
+      CODEX_MEDIA_PATH_MAPS: "",
+      ...overrides
+    },
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.on("data", chunk => {
+    stderr += chunk;
+  });
+  const [code] = await once(child, "close");
+  assert.notEqual(code, 0);
+  assert.match(stderr, expectedMessage);
+}
+
 async function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -42,8 +66,36 @@ async function readBody(req) {
 }
 
 async function run() {
+  await assertPathConfigurationRejected(
+    { MEDIA_MCP_MEDIA_PATH: "relative/media" },
+    /MEDIA_MCP_MEDIA_PATH must be a non-root absolute path/
+  );
+  await assertPathConfigurationRejected(
+    { MEDIA_MCP_MEDIA_PATH: "/shared/.", MEDIA_MCP_DOWNLOADS_PATH: "/shared" },
+    /must not use the same source path/
+  );
+  await assertPathConfigurationRejected(
+    { MEDIA_MCP_MEDIA_PATH: "/." },
+    /MEDIA_MCP_MEDIA_PATH must be a non-root absolute path/
+  );
+  for (const invalidPath of ["/media,other", "/media=other", "/media/../config", "/media\nother"]) {
+    await assertPathConfigurationRejected(
+      { MEDIA_MCP_MEDIA_PATH: invalidPath },
+      /MEDIA_MCP_MEDIA_PATH must be a non-root absolute path/
+    );
+  }
+  for (const invalidRoot of [".", "/", "/media/../config", "/media\nother"]) {
+    await assertPathConfigurationRejected(
+      { MEDIA_MCP_MEDIA_ROOTS: invalidRoot },
+      /MEDIA_MCP_MEDIA_ROOTS must contain only non-root absolute paths/
+    );
+  }
+
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "media-mcp-repair-capabilities-"));
   const mediaRoot = path.join(tempRoot, "media");
+  const downloadsRoot = path.join(tempRoot, "downloads");
+  const outsideRoot = path.join(tempRoot, "outside");
+  const outsideFile = path.join(outsideRoot, "must-not-delete.mkv");
   const movieDir = path.join(mediaRoot, "Fixture Movie (2026)");
   const movieFile = path.join(movieDir, "Fixture Movie.mkv");
   const deleteDir = path.join(mediaRoot, "Delete Fixture (2026)");
@@ -57,16 +109,21 @@ async function run() {
   const plexMappedEpisodeFile = path.join(plexTvDir, "Fixture Series - S13E03.mkv");
   const fakeBinDir = path.join(tempRoot, "bin");
   await mkdir(movieDir, { recursive: true });
+  await mkdir(downloadsRoot, { recursive: true });
+  await mkdir(outsideRoot, { recursive: true });
   await mkdir(deleteDir, { recursive: true });
   await mkdir(tvDir, { recursive: true });
   await mkdir(plexTvDir, { recursive: true });
   await mkdir(fakeBinDir, { recursive: true });
   await writeFile(movieFile, "movie fixture\n");
+  await writeFile(outsideFile, "outside fixture\n");
   await writeFile(deleteFile, "delete fixture\n");
   await writeFile(episodeFile, "episode fixture\n");
   await writeFile(compareEpisodeFile, "compare fixture\n");
   await writeFile(hangingProbeFile, "hanging fixture\n");
   await writeFile(plexMappedEpisodeFile, "episode fixture\n");
+  await symlink(outsideRoot, path.join(mediaRoot, "escape-link"), "dir");
+  await symlink(outsideRoot, path.join(downloadsRoot, "escape-link"), "dir");
   const fakeFfprobe = path.join(fakeBinDir, "ffprobe");
   await writeFile(fakeFfprobe, [
     "#!/usr/bin/env node",
@@ -282,7 +339,9 @@ async function run() {
       MEDIA_MCP_BEARER_TOKEN: "test-token",
       MEDIA_MCP_HOST: "127.0.0.1",
       MEDIA_MCP_PORT: String(mediaPort),
-      MEDIA_MCP_PATH_MAPS: `/movies=${mediaRoot},/tv=${mediaRoot}`,
+      MEDIA_MCP_PATH_MAPS: `/movies=${mediaRoot},/tv=${mediaRoot},/library=${plexRoot},/library/downloads=${plexRoot},/legacy-downloads=${downloadsRoot}`,
+      MEDIA_MCP_MEDIA_PATH: "/library",
+      MEDIA_MCP_DOWNLOADS_PATH: "/library/downloads",
       MEDIA_MCP_MEDIA_ROOTS: `${mediaRoot},${plexRoot}`,
       MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS: "1000",
       PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
@@ -355,6 +414,7 @@ async function run() {
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     const toolsByName = new Map(tools.result.tools.map(toolInfo => [toolInfo.name, toolInfo]));
     assert.ok(toolNames.has("media_file_delete"));
+    assert.ok(toolNames.has("media_archive_environment_check"));
     assert.ok(toolNames.has("media_probe_video_content"));
     assert.ok(toolNames.has("plex_delete_metadata"));
     assert.ok(toolNames.has("plex_list_show_seasons"));
@@ -371,6 +431,43 @@ async function run() {
     assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /delete\/remove bad-content workflows/);
     assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /content-probe-confirmed bad files/);
 
+    const pathMapEnvironment = await tool("media_archive_environment_check", {
+      downloadsPath: "/library/downloads/example.mkv",
+      writeTest: false
+    });
+    assert.deepEqual(
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/library/downloads"),
+      { source: "/library/downloads", target: "/mnt/unraid/downloads" }
+    );
+    assert.deepEqual(
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/library"),
+      { source: "/library", target: "/mnt/unraid/media" }
+    );
+    assert.deepEqual(
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/movies"),
+      { source: "/movies", target: mediaRoot }
+    );
+    assert.deepEqual(
+      pathMapEnvironment.pathCandidates,
+      ["/mnt/unraid/downloads/example.mkv"],
+      "only the longest matching source root may produce a mapped candidate"
+    );
+
+    const traversalEnvironment = await tool("media_archive_environment_check", {
+      downloadsPath: "/legacy-downloads/../../../config",
+      writeTest: false
+    });
+    assert.equal(Object.hasOwn(traversalEnvironment, "visiblePath"), false);
+    assert.deepEqual(traversalEnvironment.pathCandidates, []);
+    assert.ok(traversalEnvironment.blockers.some(blocker => blocker.type === "path_not_visible"));
+
+    const symlinkEscapeEnvironment = await tool("media_archive_environment_check", {
+      downloadsPath: "/legacy-downloads/escape-link",
+      writeTest: false
+    });
+    assert.equal(Object.hasOwn(symlinkEscapeEnvironment, "visiblePath"), false);
+    assert.ok(symlinkEscapeEnvironment.blockers.some(blocker => blocker.type === "path_not_visible"));
+
     const dryFileDelete = await tool("media_file_delete", {
       path: "/movies/Delete Fixture (2026)/Delete Fixture.mkv",
       dryRun: true
@@ -386,6 +483,14 @@ async function run() {
     });
     assert.equal(outside.deleted, false);
     assert.equal(outside.blockers[0].type, "path_outside_allowed_roots");
+
+    const symlinkEscape = await tool("media_file_delete", {
+      path: "/movies/escape-link/must-not-delete.mkv",
+      dryRun: false
+    });
+    assert.equal(symlinkEscape.deleted, false);
+    assert.ok(symlinkEscape.blockers.some(blocker => blocker.type === "path_outside_allowed_roots"));
+    await access(outsideFile);
 
     const deleted = await tool("media_file_delete", {
       path: "/movies/Delete Fixture (2026)/Delete Fixture.mkv",

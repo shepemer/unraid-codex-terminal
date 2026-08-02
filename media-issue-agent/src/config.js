@@ -2,6 +2,46 @@ import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { defaultDiagnosticLogPath } from "./diagnostic-log.js";
 
+export const CODEX_SETTING_DEFAULTS = Object.freeze({
+  model: "gpt-5.5",
+  reasoningEffort: "xhigh",
+  fastMode: true,
+  serviceTier: "fast",
+  repairContext: ""
+});
+
+export const OPERATIONS_SETTING_DEFAULTS = Object.freeze({
+  pollIntervalSeconds: 300,
+  snapshotRetention: 200,
+  serverOwnerReporterUsername: ""
+});
+
+export function normalizeReporterUsernames(value) {
+  const raw = String(value || "");
+  if (/[\r\n\0]/.test(raw)) {
+    throw new Error("Trusted server-owner reporters must be a comma-separated single line.");
+  }
+  const seen = new Set();
+  const reporters = [];
+  for (const candidate of raw.split(",")) {
+    const reporter = candidate.trim();
+    if (!reporter) {
+      continue;
+    }
+    const identity = reporter.toLowerCase();
+    if (seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    reporters.push(reporter);
+  }
+  const normalized = reporters.join(", ");
+  if (normalized.length > 200) {
+    throw new Error("Trusted server-owner reporters must be at most 200 characters after normalization.");
+  }
+  return normalized;
+}
+
 function truthy(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -22,6 +62,13 @@ function list(value) {
     .split(",")
     .map(entry => entry.trim())
     .filter(Boolean);
+}
+
+function hasEnvValue(env, key) {
+  return Object.prototype.hasOwnProperty.call(env, key)
+    && env[key] !== undefined
+    && env[key] !== null
+    && String(env[key]) !== "";
 }
 
 function containsApiKey(value) {
@@ -139,10 +186,12 @@ export async function loadConfig(env = process.env, options = {}) {
     dbPath: env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite",
     logPath: env.ISSUE_AGENT_LOG_PATH || defaultDiagnosticLogPath(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"),
     repairWorkspaceRoot: env.ISSUE_AGENT_REPAIR_WORKSPACE_ROOT || path.join(path.dirname(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"), "repair-workspaces"),
-    repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || "",
-    serverOwnerReporterUsername: String(env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || "").trim(),
-    pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
-    issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, 200, 1),
+    repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || CODEX_SETTING_DEFAULTS.repairContext,
+    serverOwnerReporterUsername: normalizeReporterUsernames(
+      env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername
+    ),
+    pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, OPERATIONS_SETTING_DEFAULTS.pollIntervalSeconds, 30),
+    issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, OPERATIONS_SETTING_DEFAULTS.snapshotRetention, 1),
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",
     pushoverUserKey: env.ISSUE_AGENT_PUSHOVER_USER_KEY || "",
     slackEnabled: truthy(env.ISSUE_AGENT_SLACK_ENABLED, false),
@@ -156,10 +205,10 @@ export async function loadConfig(env = process.env, options = {}) {
     codexTimeoutMs: integer(env.ISSUE_AGENT_CODEX_TIMEOUT_MS, 120000, 10000),
     codexRepairTimeoutMs: integer(env.ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS, 14400000, 10000),
     recoverStaleRunSeconds: integer(env.ISSUE_AGENT_RECOVER_STALE_RUN_SECONDS, 120, 30),
-    codexModel: env.ISSUE_AGENT_CODEX_MODEL || "gpt-5.5",
-    codexReasoningEffort: env.ISSUE_AGENT_CODEX_REASONING_EFFORT || "xhigh",
-    codexFastMode: truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, true),
-    codexServiceTier: env.ISSUE_AGENT_CODEX_SERVICE_TIER || (truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, true) ? "fast" : ""),
+    codexModel: env.ISSUE_AGENT_CODEX_MODEL || CODEX_SETTING_DEFAULTS.model,
+    codexReasoningEffort: env.ISSUE_AGENT_CODEX_REASONING_EFFORT || CODEX_SETTING_DEFAULTS.reasoningEffort,
+    codexFastMode: truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, CODEX_SETTING_DEFAULTS.fastMode),
+    codexServiceTier: env.ISSUE_AGENT_CODEX_SERVICE_TIER || (truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, CODEX_SETTING_DEFAULTS.fastMode) ? CODEX_SETTING_DEFAULTS.serviceTier : ""),
     codexEnvAllowlist: list(env.ISSUE_AGENT_CODEX_ENV_ALLOWLIST),
     mcpRequestTimeoutMs: integer(env.ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS, 300000, 1000),
     webEnabled: truthy(env.ISSUE_AGENT_WEB_ENABLED, true),
@@ -167,6 +216,26 @@ export async function loadConfig(env = process.env, options = {}) {
     webPort: integer(env.ISSUE_AGENT_WEB_PORT, 6983, 1),
     webUsername: env.ISSUE_AGENT_WEB_USERNAME || "operator",
     webPassword: env.ISSUE_AGENT_WEB_PASSWORD || ""
+  };
+
+  const codexEnvironment = {};
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_MODEL")) codexEnvironment.model = config.codexModel;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_REASONING_EFFORT")) codexEnvironment.reasoningEffort = config.codexReasoningEffort;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_FAST_MODE")) codexEnvironment.fastMode = config.codexFastMode;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_SERVICE_TIER") || hasEnvValue(env, "ISSUE_AGENT_CODEX_FAST_MODE")) {
+    codexEnvironment.serviceTier = config.codexServiceTier;
+  }
+  if (hasEnvValue(env, "ISSUE_AGENT_REPAIR_CONTEXT")) codexEnvironment.repairContext = config.repairContext;
+
+  const operationsEnvironment = {};
+  if (hasEnvValue(env, "ISSUE_AGENT_POLL_INTERVAL_SECONDS")) operationsEnvironment.pollIntervalSeconds = config.pollIntervalSeconds;
+  if (hasEnvValue(env, "ISSUE_AGENT_SNAPSHOT_RETENTION")) operationsEnvironment.snapshotRetention = config.issueSnapshotRetention;
+  if (hasEnvValue(env, "ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME")) {
+    operationsEnvironment.serverOwnerReporterUsername = config.serverOwnerReporterUsername;
+  }
+  config.legacySettingsEnvironment = {
+    codex: codexEnvironment,
+    operations: operationsEnvironment
   };
 
   if (!config.mediaMcpBearerToken) {

@@ -22,6 +22,30 @@ truthy() {
   esac
 }
 
+configure_ssh_password() {
+  local chpasswd_bin="${CHPASSWD_BIN:-chpasswd}"
+
+  if [ -n "${SSH_PASSWORD:-}" ] && [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    die "SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one"
+  fi
+
+  if [ -n "${SSH_PASSWORD:-}" ]; then
+    case "${SSH_PASSWORD}" in
+      *$'\n'*|*$'\r'*) die "SSH_PASSWORD must not contain newlines" ;;
+    esac
+    printf 'codex:%s\n' "${SSH_PASSWORD}" | "${chpasswd_bin}" \
+      || die "failed to apply SSH_PASSWORD; password mode requires a writable root filesystem"
+  elif [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    case "${SSH_PASSWORD_HASH}" in
+      *$'\n'*|*$'\r'*) die "SSH_PASSWORD_HASH must not contain newlines" ;;
+    esac
+    printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | "${chpasswd_bin}" -e \
+      || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
+  else
+    die "SSH_PASSWORD_LOGIN is enabled, but neither SSH_PASSWORD nor SSH_PASSWORD_HASH is set"
+  fi
+}
+
 shell_quote() {
   local value="$1"
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
@@ -73,24 +97,18 @@ sync_optional_mcp_server_block() {
 }
 
 update_codex_cli() {
-  truthy "${CODEX_UPDATE_ON_START:-true}" || return 0
+  local update_prefix="/opt/codex-startup-update"
 
-  local version="${CODEX_NPM_VERSION:-latest}"
-  local timeout_seconds="${CODEX_UPDATE_ON_START_TIMEOUT:-180}"
-
-  case "${version}" in
-    ""|*[[:space:]]*) die "CODEX_NPM_VERSION must not be empty or contain whitespace" ;;
-  esac
-  case "${timeout_seconds}" in
-    ""|*[!0-9]*) die "CODEX_UPDATE_ON_START_TIMEOUT must be a positive integer number of seconds" ;;
-    0) die "CODEX_UPDATE_ON_START_TIMEOUT must be greater than zero" ;;
-  esac
-
-  echo "codex-terminal: updating Codex CLI via npm install -g @openai/codex@${version}" >&2
-  if timeout "${timeout_seconds}" npm install -g "@openai/codex@${version}"; then
+  ln -sfn /usr/local/bin/codex-bundled /usr/local/bin/codex
+  rm -rf "${update_prefix}"
+  echo "codex-terminal: updating Codex CLI via npm install -g @openai/codex@latest" >&2
+  if timeout 180 npm install -g --prefix "${update_prefix}" "@openai/codex@latest" \
+      && run_as_codex "${update_prefix}/bin/codex" --version >/dev/null 2>&1; then
+    ln -sfn "${update_prefix}/bin/codex" /usr/local/bin/codex
     npm cache clean --force >/dev/null 2>&1 || true
     verify_codex_cli
   else
+    rm -rf "${update_prefix}"
     echo "codex-terminal: warning: Codex CLI update failed; continuing with bundled version" >&2
   fi
 }
@@ -203,22 +221,7 @@ update_codex_cli
 
 password_authentication="no"
 if truthy "${SSH_PASSWORD_LOGIN:-false}"; then
-  if [ -n "${SSH_PASSWORD:-}" ] && [ -n "${SSH_PASSWORD_HASH:-}" ]; then
-    die "SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one"
-  fi
-
-  if [ -n "${SSH_PASSWORD:-}" ]; then
-    case "${SSH_PASSWORD}" in
-      *$'\n'*|*$'\r'*) die "SSH_PASSWORD must not contain newlines" ;;
-    esac
-    printf 'codex:%s\n' "${SSH_PASSWORD}" | chpasswd \
-      || die "failed to apply SSH_PASSWORD; password mode requires a writable root filesystem"
-  elif [ -n "${SSH_PASSWORD_HASH:-}" ]; then
-    printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | chpasswd -e \
-      || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
-  else
-    die "SSH_PASSWORD_LOGIN is enabled, but SSH_PASSWORD is empty"
-  fi
+  configure_ssh_password
   password_authentication="yes"
 fi
 
@@ -277,7 +280,8 @@ if [ ! -s "${CONFIG_DIR}/workspace/AGENTS.md" ]; then
 - Use the configured utilities MCP server for Scrutiny monitoring when present.
 - Ask for explicit user confirmation before array start or stop, correcting parity checks, VM force stop or reset, container deletes, plugin changes, API key changes, flash backup, network settings changes, and destructive notification archive or delete actions.
 - Summarize logs. Do not print secrets, bearer tokens, API keys, cookies, passwords, or session values.
-- Treat `/mnt/unraid/*` diagnostic mounts as read-only inspection surfaces.
+- Treat `/mnt/unraid/media` as a read-only inspection surface.
+- `/mnt/unraid/downloads` may be mounted read/write for an explicitly requested archive check or extraction; otherwise inspect it without changing files.
 - Use `media-path-check --json <path...>` for read-only media and download path diagnosis when optional path maps or `/mnt/unraid` mounts are configured.
 EOF
   chown codex:codex "${CONFIG_DIR}/workspace/AGENTS.md"

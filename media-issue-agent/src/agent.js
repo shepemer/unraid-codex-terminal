@@ -6,6 +6,8 @@ import {
   completeAgentRun,
   createAgentRun,
   createPlannedAction,
+  deleteSetting,
+  deleteSettingWithAuditEvents,
   ensureJob,
   getSetting,
   initDb,
@@ -34,6 +36,7 @@ import {
   reconcileJobLifecycle,
   recoverInterruptedAgentRuns,
   setSetting,
+  setSettingWithAuditEvents,
   setSlackIssueStatus,
   slackIssueDetails,
   slackIssueForId,
@@ -66,7 +69,13 @@ import {
   runCodexWorkflowImprovementAnalysis,
   steeredInvestigationPrompt
 } from "./codex.js";
-import { inspectCodexAuth, validateCodexHome } from "./config.js";
+import {
+  CODEX_SETTING_DEFAULTS,
+  OPERATIONS_SETTING_DEFAULTS,
+  inspectCodexAuth,
+  normalizeReporterUsernames,
+  validateCodexHome
+} from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
 import { createDiagnosticLogger } from "./diagnostic-log.js";
@@ -518,30 +527,65 @@ function reporterIdentityValues(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return [];
   }
-  return [
+  const usernames = [
     value.username,
     value.userName
   ].filter(entry => typeof entry === "string" && entry.trim()).map(entry => entry.trim());
-}
-
-function reporterMatches(value, configuredUsername) {
-  const expected = String(configuredUsername || "").trim().toLowerCase();
-  return Boolean(expected) && reporterIdentityValues(value).some(identity => identity.toLowerCase() === expected);
-}
-
-function commentAuthorMatches(comment, configuredUsername) {
+  if (usernames.length) {
+    return usernames;
+  }
   return [
+    value.displayName,
+    value.name
+  ].filter(entry => typeof entry === "string" && entry.trim()).map(entry => entry.trim());
+}
+
+function reporterNameList(value) {
+  const normalized = normalizeReporterUsernames(value);
+  return normalized ? normalized.split(", ") : [];
+}
+
+function reporterNameSet(value) {
+  return new Set(reporterNameList(value).map(reporter => reporter.toLowerCase()));
+}
+
+function reporterValuesMatch(values, configuredReporters, explicitUsernames = []) {
+  const expected = configuredReporters instanceof Set
+    ? configuredReporters
+    : reporterNameSet(configuredReporters);
+  const stableUsernames = [
+    ...explicitUsernames,
+    ...values.flatMap(value => value && typeof value === "object" && !Array.isArray(value)
+      ? [value.username, value.userName]
+      : [])
+  ].filter(value => typeof value === "string" && value.trim()).map(value => value.trim());
+  const stableUsernameSet = new Set(stableUsernames.map(value => value.toLowerCase()));
+  if (stableUsernameSet.size > 1) {
+    return false;
+  }
+  const identities = stableUsernames.length
+    ? stableUsernames
+    : values.flatMap(reporterIdentityValues);
+  return expected.size > 0
+    && identities.some(identity => expected.has(identity.toLowerCase()));
+}
+
+function commentAuthorMatches(comment, configuredReporters) {
+  const values = [
     comment?.reporter,
     comment?.user,
     comment?.author,
-    comment?.createdBy,
+    comment?.createdBy
+  ];
+  return reporterValuesMatch(values, configuredReporters, [
     comment?.username,
     comment?.userName
-  ].some(value => reporterMatches(value, configuredUsername));
+  ]);
 }
 
-function trustedServerOwnerGuidance(entry, details, configuredUsername) {
-  if (!String(configuredUsername || "").trim()) {
+function trustedServerOwnerGuidance(entry, details, configuredUsernames) {
+  const configuredReporters = reporterNameSet(configuredUsernames);
+  if (!configuredReporters.size) {
     return "";
   }
   const issue = details?.issue || details || {};
@@ -556,8 +600,7 @@ function trustedServerOwnerGuidance(entry, details, configuredUsername) {
   if (!sourceReporterIdentities.length) {
     sourceReporterIdentities.push(entry?.reporter);
   }
-  const reportAuthoredByOwner = sourceReporterIdentities
-    .some(value => reporterMatches(value, configuredUsername));
+  const reportAuthoredByOwner = reporterValuesMatch(sourceReporterIdentities, configuredReporters);
   const guidance = [];
   if (reportAuthoredByOwner) {
     guidance.push(
@@ -575,7 +618,7 @@ function trustedServerOwnerGuidance(entry, details, configuredUsername) {
     ...(Array.isArray(issue.comments) ? issue.comments : [])
   ];
   for (const comment of comments) {
-    if (commentAuthorMatches(comment, configuredUsername)) {
+    if (commentAuthorMatches(comment, configuredReporters)) {
       guidance.push(comment.message || comment.text || comment.body);
     }
   }
@@ -1675,6 +1718,34 @@ function publicImprovementItem(item) {
 }
 
 const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const CODEX_SETTING_FIELDS = Object.freeze(["model", "reasoningEffort", "fastMode", "serviceTier", "repairContext"]);
+const OPERATIONS_SETTING_FIELDS = Object.freeze(["pollIntervalSeconds", "snapshotRetention", "serverOwnerReporterUsername"]);
+const UI_SETTINGS_MIGRATION_KEY = "settings_ui_migration_v1";
+
+function hasOwn(value, key) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+    && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function knownSettingValues(values, fields) {
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    return {};
+  }
+  return Object.fromEntries(fields
+    .filter(field => hasOwn(values, field))
+    .map(field => [field, values[field]]));
+}
+
+function changedSettingFields(before, after, fields) {
+  return fields.filter(field => before?.[field] !== after?.[field]);
+}
+
+function settingsSources(saved, environment, fields) {
+  return Object.fromEntries(fields.map(field => [
+    field,
+    hasOwn(saved, field) ? "saved" : hasOwn(environment, field) ? "environment" : "default"
+  ]));
+}
 
 function normalizeCodexSettings(values = {}, defaults = {}) {
   const model = String(values.model ?? defaults.model ?? "gpt-5.5").trim();
@@ -1685,7 +1756,11 @@ function normalizeCodexSettings(values = {}, defaults = {}) {
   if (!REASONING_EFFORTS.has(reasoningEffort)) {
     throw new Error(`Unsupported Codex reasoning effort ${reasoningEffort}`);
   }
-  const fastMode = Boolean(values.fastMode ?? defaults.fastMode ?? true);
+  const rawFastMode = values.fastMode ?? defaults.fastMode ?? true;
+  if (typeof rawFastMode !== "boolean") {
+    throw new Error("Codex fast mode must be a boolean.");
+  }
+  const fastMode = rawFastMode;
   const serviceTier = String(values.serviceTier ?? defaults.serviceTier ?? (fastMode ? "fast" : "")).trim();
   if (serviceTier.length > 80) {
     throw new Error("Codex service tier is too long.");
@@ -1695,6 +1770,110 @@ function normalizeCodexSettings(values = {}, defaults = {}) {
     throw new Error("Repair context is too long.");
   }
   return { model, reasoningEffort, fastMode, serviceTier, repairContext };
+}
+
+function normalizeOperationsSettings(values = {}, defaults = {}) {
+  const pollIntervalSeconds = Number(values.pollIntervalSeconds ?? defaults.pollIntervalSeconds ?? OPERATIONS_SETTING_DEFAULTS.pollIntervalSeconds);
+  if (!Number.isInteger(pollIntervalSeconds) || pollIntervalSeconds < 30) {
+    throw new Error("Poll interval must be an integer greater than or equal to 30 seconds.");
+  }
+  const snapshotRetention = Number(values.snapshotRetention ?? defaults.snapshotRetention ?? OPERATIONS_SETTING_DEFAULTS.snapshotRetention);
+  if (!Number.isInteger(snapshotRetention) || snapshotRetention < 1) {
+    throw new Error("Snapshot retention must be an integer greater than or equal to 1.");
+  }
+  const serverOwnerReporterUsername = normalizeReporterUsernames(
+    values.serverOwnerReporterUsername
+      ?? defaults.serverOwnerReporterUsername
+      ?? OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername
+  );
+  return { pollIntervalSeconds, snapshotRetention, serverOwnerReporterUsername };
+}
+
+function normalizedSettingSubset(values, fields, normalize, defaults) {
+  const known = knownSettingValues(values, fields);
+  const normalized = normalize(known, defaults);
+  return Object.fromEntries(Object.keys(known).map(field => [field, normalized[field]]));
+}
+
+function inferredCodexEnvironment(config = {}) {
+  if (hasOwn(config, "legacySettingsEnvironment")) {
+    return normalizedSettingSubset(
+      config.legacySettingsEnvironment?.codex,
+      CODEX_SETTING_FIELDS,
+      normalizeCodexSettings,
+      CODEX_SETTING_DEFAULTS
+    );
+  }
+  const fastMode = config.codexFastMode ?? CODEX_SETTING_DEFAULTS.fastMode;
+  const candidates = {
+    model: config.codexModel,
+    reasoningEffort: config.codexReasoningEffort,
+    fastMode: config.codexFastMode,
+    serviceTier: config.codexServiceTier ?? (fastMode === false ? "" : undefined),
+    repairContext: config.repairContext
+  };
+  const known = Object.fromEntries(Object.entries(candidates)
+    .filter(([field, value]) => value !== undefined && value !== CODEX_SETTING_DEFAULTS[field]));
+  return normalizedSettingSubset(known, CODEX_SETTING_FIELDS, normalizeCodexSettings, CODEX_SETTING_DEFAULTS);
+}
+
+function inferredOperationsEnvironment(config = {}) {
+  if (hasOwn(config, "legacySettingsEnvironment")) {
+    return normalizedSettingSubset(
+      config.legacySettingsEnvironment?.operations,
+      OPERATIONS_SETTING_FIELDS,
+      normalizeOperationsSettings,
+      OPERATIONS_SETTING_DEFAULTS
+    );
+  }
+  const candidates = {
+    pollIntervalSeconds: config.pollIntervalSeconds,
+    snapshotRetention: config.issueSnapshotRetention,
+    serverOwnerReporterUsername: config.serverOwnerReporterUsername
+  };
+  const known = Object.fromEntries(Object.entries(candidates)
+    .filter(([field, value]) => value !== undefined && value !== OPERATIONS_SETTING_DEFAULTS[field]));
+  return normalizedSettingSubset(known, OPERATIONS_SETTING_FIELDS, normalizeOperationsSettings, OPERATIONS_SETTING_DEFAULTS);
+}
+
+function nonDefaultSettingValues(values, defaults, fields) {
+  return Object.fromEntries(fields
+    .filter(field => hasOwn(values, field) && values[field] !== defaults[field])
+    .map(field => [field, values[field]]));
+}
+
+function reporterTrustTransition(previousUsername, nextUsername) {
+  const previous = normalizeReporterUsernames(previousUsername);
+  const next = normalizeReporterUsernames(nextUsername);
+  const previousReporterNames = reporterNameList(previous);
+  const nextReporterNames = reporterNameList(next);
+  const previousSet = new Set(previousReporterNames.map(name => name.toLowerCase()));
+  const nextSet = new Set(nextReporterNames.map(name => name.toLowerCase()));
+  const addedReporterNames = nextReporterNames.filter(name => !previousSet.has(name.toLowerCase()));
+  const removedReporterNames = previousReporterNames.filter(name => !nextSet.has(name.toLowerCase()));
+  if (!addedReporterNames.length && !removedReporterNames.length) {
+    return null;
+  }
+  if (!next) {
+    return {
+      eventType: "server_owner_reporter_trust_cleared",
+      previousUsername: previous,
+      nextUsername: "",
+      previousReporterNames,
+      nextReporterNames,
+      addedReporterNames,
+      removedReporterNames
+    };
+  }
+  return {
+    eventType: previous ? "server_owner_reporter_trust_changed" : "server_owner_reporter_trust_granted",
+    previousUsername: previous,
+    nextUsername: next,
+    previousReporterNames,
+    nextReporterNames,
+    addedReporterNames,
+    removedReporterNames
+  };
 }
 
 function closeActionsFor(source, issueId, message) {
@@ -2090,6 +2269,7 @@ export class MediaIssueAgent {
         if (this.config.webEnabled) {
           await this.diagnosticLogger.loadHistory();
         }
+        this.migrateLegacySettings();
         const recovered = recoverInterruptedAgentRuns(this.config.dbPath, {
           staleSeconds: this.config.recoverStaleRunSeconds
         });
@@ -2200,7 +2380,7 @@ export class MediaIssueAgent {
     }
     const markdown = issueTableMarkdown(issues);
     const snapshot = insertSnapshot(this.config.dbPath, markdown, issues);
-    pruneSnapshots(this.config.dbPath, this.config.issueSnapshotRetention);
+    pruneSnapshots(this.config.dbPath, this.operationsSettings().effective.snapshotRetention);
     const deferredLifecycleReconciliations = [];
     for (const issue of issues) {
       const job = ensureJob(this.config.dbPath, issue.source, issue.issueId);
@@ -2748,27 +2928,181 @@ export class MediaIssueAgent {
     };
   }
 
-  codexSettings() {
-    const defaults = {
-      model: this.config.codexModel || "gpt-5.5",
-      reasoningEffort: this.config.codexReasoningEffort || "xhigh",
-      fastMode: this.config.codexFastMode !== false,
-      serviceTier: this.config.codexServiceTier || (this.config.codexFastMode === false ? "" : "fast"),
-      repairContext: this.config.repairContext || ""
+  migrateLegacySettings() {
+    const existingMarker = getSetting(this.config.dbPath, UI_SETTINGS_MIGRATION_KEY, null);
+    if (existingMarker) {
+      return existingMarker;
+    }
+
+    const imported = { codex: [], operations: [] };
+    const skippedExisting = [];
+    if (getSetting(this.config.dbPath, "codex", null) === null) {
+      const legacyCodex = nonDefaultSettingValues(
+        inferredCodexEnvironment(this.config),
+        CODEX_SETTING_DEFAULTS,
+        CODEX_SETTING_FIELDS
+      );
+      if (Object.keys(legacyCodex).length) {
+        setSetting(this.config.dbPath, "codex", legacyCodex);
+        imported.codex = Object.keys(legacyCodex);
+      }
+    } else {
+      skippedExisting.push("codex");
+    }
+    if (getSetting(this.config.dbPath, "operations", null) === null) {
+      const legacyOperations = nonDefaultSettingValues(
+        inferredOperationsEnvironment(this.config),
+        OPERATIONS_SETTING_DEFAULTS,
+        OPERATIONS_SETTING_FIELDS
+      );
+      if (Object.keys(legacyOperations).length) {
+        setSetting(this.config.dbPath, "operations", legacyOperations);
+        imported.operations = Object.keys(legacyOperations);
+      }
+    } else {
+      skippedExisting.push("operations");
+    }
+
+    const marker = {
+      version: 1,
+      completedAt: new Date().toISOString(),
+      imported,
+      skippedExisting
     };
-    const saved = getSetting(this.config.dbPath, "codex", null);
+    setSetting(this.config.dbPath, UI_SETTINGS_MIGRATION_KEY, marker);
+    recordAudit(this.config.dbPath, "legacy_settings_import_completed", sanitizeValue({
+      version: marker.version,
+      imported,
+      skippedExisting
+    }));
+    return marker;
+  }
+
+  codexSettings() {
+    const defaults = { ...CODEX_SETTING_DEFAULTS };
+    const environment = inferredCodexEnvironment(this.config);
+    const rawSaved = getSetting(this.config.dbPath, "codex", null);
+    const saved = rawSaved === null
+      ? null
+      : normalizedSettingSubset(rawSaved, CODEX_SETTING_FIELDS, normalizeCodexSettings, defaults);
     return {
       defaults,
-      effective: normalizeCodexSettings(saved || {}, defaults),
-      saved: saved || null
+      effective: normalizeCodexSettings({ ...environment, ...(saved || {}) }, defaults),
+      saved,
+      sources: settingsSources(saved, environment, CODEX_SETTING_FIELDS)
     };
   }
 
-  updateCodexSettings(values) {
+  updateCodexSettings(values, actor = "web") {
     const current = this.codexSettings();
-    const saved = normalizeCodexSettings({ ...current.effective, ...(values || {}) }, current.defaults);
+    const saved = normalizeCodexSettings({
+      ...current.effective,
+      ...knownSettingValues(values, CODEX_SETTING_FIELDS)
+    }, current.defaults);
     setSetting(this.config.dbPath, "codex", saved);
+    recordAudit(this.config.dbPath, "codex_settings_updated", sanitizeValue({
+      actor,
+      changedFields: changedSettingFields(current.effective, saved, CODEX_SETTING_FIELDS)
+    }));
     return this.codexSettings();
+  }
+
+  resetCodexSettings(actor = "web") {
+    const current = this.codexSettings();
+    deleteSetting(this.config.dbPath, "codex");
+    const reset = this.codexSettings();
+    recordAudit(this.config.dbPath, "codex_settings_reset", sanitizeValue({
+      actor,
+      changedFields: changedSettingFields(current.effective, reset.effective, CODEX_SETTING_FIELDS)
+    }));
+    return reset;
+  }
+
+  operationsSettings() {
+    const defaults = { ...OPERATIONS_SETTING_DEFAULTS };
+    const environment = inferredOperationsEnvironment(this.config);
+    const rawSaved = getSetting(this.config.dbPath, "operations", null);
+    const saved = rawSaved === null
+      ? null
+      : normalizedSettingSubset(rawSaved, OPERATIONS_SETTING_FIELDS, normalizeOperationsSettings, defaults);
+    return {
+      defaults,
+      effective: normalizeOperationsSettings({ ...environment, ...(saved || {}) }, defaults),
+      saved,
+      sources: settingsSources(saved, environment, OPERATIONS_SETTING_FIELDS)
+    };
+  }
+
+  reporterTrustAuditEvent(transition, actor) {
+    if (!transition) {
+      return null;
+    }
+    return {
+      eventType: transition.eventType,
+      payload: sanitizeValue({
+        actor,
+        previousUsername: transition.previousUsername,
+        nextUsername: transition.nextUsername,
+        previousReporterNames: transition.previousReporterNames,
+        nextReporterNames: transition.nextReporterNames,
+        addedReporterNames: transition.addedReporterNames,
+        removedReporterNames: transition.removedReporterNames
+      })
+    };
+  }
+
+  assertReporterTrustConfirmed(transition, values = {}) {
+    if (transition?.nextReporterNames?.length && values.confirmServerOwnerReporterTrust !== true) {
+      throw new Error("Explicit confirmation is required before granting or changing trusted server-owner reporter guidance.");
+    }
+  }
+
+  updateOperationsSettings(values, actor = "web") {
+    const current = this.operationsSettings();
+    const saved = normalizeOperationsSettings({
+      ...current.effective,
+      ...knownSettingValues(values, OPERATIONS_SETTING_FIELDS)
+    }, current.defaults);
+    const trustTransition = reporterTrustTransition(
+      current.effective.serverOwnerReporterUsername,
+      saved.serverOwnerReporterUsername
+    );
+    this.assertReporterTrustConfirmed(trustTransition, values);
+    const changedFields = changedSettingFields(current.effective, saved, OPERATIONS_SETTING_FIELDS);
+    const auditEvents = [{
+      eventType: "operations_settings_updated",
+      payload: sanitizeValue({ actor, changedFields })
+    }];
+    const trustAuditEvent = this.reporterTrustAuditEvent(trustTransition, actor);
+    if (trustAuditEvent) {
+      auditEvents.push(trustAuditEvent);
+    }
+    setSettingWithAuditEvents(this.config.dbPath, "operations", saved, auditEvents);
+    return this.operationsSettings();
+  }
+
+  resetOperationsSettings(values = {}, actor = "web") {
+    const current = this.operationsSettings();
+    const environment = inferredOperationsEnvironment(this.config);
+    const fallback = normalizeOperationsSettings(environment, OPERATIONS_SETTING_DEFAULTS);
+    const trustTransition = reporterTrustTransition(
+      current.effective.serverOwnerReporterUsername,
+      fallback.serverOwnerReporterUsername
+    );
+    this.assertReporterTrustConfirmed(trustTransition, values);
+    const auditEvents = [{
+      eventType: "operations_settings_reset",
+      payload: sanitizeValue({
+        actor,
+        changedFields: changedSettingFields(current.effective, fallback, OPERATIONS_SETTING_FIELDS)
+      })
+    }];
+    const trustAuditEvent = this.reporterTrustAuditEvent(trustTransition, actor);
+    if (trustAuditEvent) {
+      auditEvents.push(trustAuditEvent);
+    }
+    deleteSettingWithAuditEvents(this.config.dbPath, "operations", auditEvents);
+    return this.operationsSettings();
   }
 
   async codexAuthStatus() {
@@ -3671,7 +4005,7 @@ export class MediaIssueAgent {
       : trustedServerOwnerGuidance(
         entry,
         details,
-        this.config.serverOwnerReporterUsername
+        this.operationsSettings().effective.serverOwnerReporterUsername
       );
     const evidence = sanitizeValue({
       entry,
@@ -4831,10 +5165,11 @@ export class MediaIssueAgent {
 
   async pollLoop(log = console.error) {
     await this.init();
+    const initialPollIntervalSeconds = this.operationsSettings().effective.pollIntervalSeconds;
     this.diagnostic("info", "poll_loop_started", {
-      pollIntervalSeconds: this.config.pollIntervalSeconds,
+      pollIntervalSeconds: initialPollIntervalSeconds,
       startupFollowUpPollSeconds: Math.min(
-        Math.max(1, Number(this.config.pollIntervalSeconds || 1)),
+        Math.max(1, Number(initialPollIntervalSeconds || 1)),
         STARTUP_FOLLOW_UP_POLL_SECONDS
       )
     });
@@ -4845,12 +5180,13 @@ export class MediaIssueAgent {
         const result = await this.pollOnce();
         log(`${new Date().toISOString()} media-issue-agent: snapshot ${result.snapshotId} recorded with ${result.openIssueCount} open and ${result.closedIssueCount} closed issues`);
       } catch (error) {
+        const pollIntervalSeconds = this.operationsSettings().effective.pollIntervalSeconds;
         if (isInterruptedPollError(error)) {
           this.diagnostic("warn", "poll_interrupted", {
             error: error.message,
             name: error.name,
             code: error.code,
-            pollIntervalSeconds: this.config.pollIntervalSeconds
+            pollIntervalSeconds
           });
           log(`${new Date().toISOString()} media-issue-agent: poll interrupted; retrying next interval: ${redactText(error.message)}`);
         } else {
@@ -4859,7 +5195,8 @@ export class MediaIssueAgent {
         }
       }
       attemptNumber += 1;
-      await sleep(pollLoopDelaySecondsAfterAttempt(attemptNumber, this.config.pollIntervalSeconds) * 1000);
+      const pollIntervalSeconds = this.operationsSettings().effective.pollIntervalSeconds;
+      await sleep(pollLoopDelaySecondsAfterAttempt(attemptNumber, pollIntervalSeconds) * 1000);
     }
   }
 
