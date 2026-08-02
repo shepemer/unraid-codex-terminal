@@ -863,16 +863,13 @@ function mediaPathCandidateRecords(pathValue) {
     return [];
   }
   const candidates = [{ path: clean, scope: "direct" }];
-  for (const map of mediaPathMaps) {
-    if (!pathInside(map.source, clean)) {
-      continue;
-    }
+  const map = mediaPathMaps.find(candidate => pathInside(candidate.source, clean));
+  if (map) {
     const suffix = clean === map.source ? "" : clean.slice(map.source.length + 1);
     const mappedPath = nodePath.resolve(map.target, suffix);
-    if (!resolvedPathInside(map.target, mappedPath)) {
-      continue;
+    if (resolvedPathInside(map.target, mappedPath)) {
+      candidates.push({ path: mappedPath, allowedRoot: map.target, scope: map.scope });
     }
-    candidates.push({ path: mappedPath, allowedRoot: map.target, scope: map.scope });
   }
   const unique = new Map();
   for (const candidate of candidates) {

@@ -339,9 +339,9 @@ async function run() {
       MEDIA_MCP_BEARER_TOKEN: "test-token",
       MEDIA_MCP_HOST: "127.0.0.1",
       MEDIA_MCP_PORT: String(mediaPort),
-      MEDIA_MCP_PATH_MAPS: `/movies=${mediaRoot},/tv=${mediaRoot},/library=${plexRoot},/downloads=${plexRoot},/legacy-downloads=${downloadsRoot}`,
+      MEDIA_MCP_PATH_MAPS: `/movies=${mediaRoot},/tv=${mediaRoot},/library=${plexRoot},/library/downloads=${plexRoot},/legacy-downloads=${downloadsRoot}`,
       MEDIA_MCP_MEDIA_PATH: "/library",
-      MEDIA_MCP_DOWNLOADS_PATH: "/downloads",
+      MEDIA_MCP_DOWNLOADS_PATH: "/library/downloads",
       MEDIA_MCP_MEDIA_ROOTS: `${mediaRoot},${plexRoot}`,
       MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS: "1000",
       PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH || ""}`,
@@ -432,12 +432,12 @@ async function run() {
     assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /content-probe-confirmed bad files/);
 
     const pathMapEnvironment = await tool("media_archive_environment_check", {
-      downloadsPath: "/downloads",
+      downloadsPath: "/library/downloads/example.mkv",
       writeTest: false
     });
     assert.deepEqual(
-      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/downloads"),
-      { source: "/downloads", target: "/mnt/unraid/downloads" }
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/library/downloads"),
+      { source: "/library/downloads", target: "/mnt/unraid/downloads" }
     );
     assert.deepEqual(
       pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/library"),
@@ -446,6 +446,11 @@ async function run() {
     assert.deepEqual(
       pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/movies"),
       { source: "/movies", target: mediaRoot }
+    );
+    assert.deepEqual(
+      pathMapEnvironment.pathCandidates,
+      ["/mnt/unraid/downloads/example.mkv"],
+      "only the longest matching source root may produce a mapped candidate"
     );
 
     const traversalEnvironment = await tool("media_archive_environment_check", {
