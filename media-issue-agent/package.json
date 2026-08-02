@@ -1,5 +1,5 @@
 {
-  "name": "unraid-codex-media-issue-agent",
+  "name": "unraid-addons-media-issue-agent",
   "version": "0.1.0",
   "private": true,
   "type": "module",

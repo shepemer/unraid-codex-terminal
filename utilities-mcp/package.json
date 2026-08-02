@@ -1,9 +1,9 @@
 {
-  "name": "unraid-codex-utilities-mcp",
+  "name": "unraid-addons-utilities-mcp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Optional utility monitoring MCP sidecar for Unraid Codex Terminal.",
+  "description": "Optional utility monitoring MCP sidecar for Unraid Addons.",
   "scripts": {
     "check": "node --check server.js"
   },
