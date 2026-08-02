@@ -30,11 +30,11 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  TERMINAL_IMAGE: unraid-codex-terminal
-  MCP_IMAGE: unraid-codex-terminal-unraid-mcp
-  MEDIA_MCP_IMAGE: unraid-codex-terminal-media-mcp
-  ISSUE_AGENT_IMAGE: unraid-codex-terminal-media-issue-agent
-  UTILITIES_MCP_IMAGE: unraid-codex-terminal-utilities-mcp
+  TERMINAL_IMAGE: unraid-addons-codex-terminal
+  MCP_IMAGE: unraid-addons-unraid-mcp
+  MEDIA_MCP_IMAGE: unraid-addons-media-mcp
+  ISSUE_AGENT_IMAGE: unraid-addons-media-issue-agent
+  UTILITIES_MCP_IMAGE: unraid-addons-utilities-mcp
 
 jobs:
   media-issue-agent-sil:
@@ -107,23 +107,33 @@ jobs:
         include:
           - name: codex-terminal
             image_env: TERMINAL_IMAGE
+            image_title: Codex Terminal
+            image_description: SSH and browser-accessible Codex CLI environment for Unraid
             dockerfile: Dockerfile
             build_args: ""
           - name: unraid-mcp
             image_env: MCP_IMAGE
+            image_title: Unraid MCP
+            image_description: GraphQL-backed Unraid MCP sidecar
             dockerfile: Dockerfile.unraid-mcp
             build_args: |
               UNRAID_MCP_VERSION=1.2.4
           - name: media-mcp
             image_env: MEDIA_MCP_IMAGE
+            image_title: Media MCP
+            image_description: Media automation MCP sidecar for Unraid Addons
             dockerfile: Dockerfile.media-mcp
             build_args: ""
           - name: media-issue-agent
             image_env: ISSUE_AGENT_IMAGE
+            image_title: Media Issue Agent
+            image_description: Human-in-the-loop media issue triage agent for Unraid Addons
             dockerfile: Dockerfile.media-issue-agent
             build_args: ""
           - name: utilities-mcp
             image_env: UTILITIES_MCP_IMAGE
+            image_title: Utilities MCP
+            image_description: Utility monitoring MCP sidecar for Unraid Addons
             dockerfile: Dockerfile.utilities-mcp
             build_args: ""
     steps:
@@ -177,6 +187,11 @@ jobs:
           load: true
           build-args: ${{ matrix.build_args }}
           tags: ${{ steps.image-tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.image-tags.outputs.image_sha }}
+            org.opencontainers.image.title=${{ matrix.image_title }}
+            org.opencontainers.image.description=${{ matrix.image_description }}
 
       - name: Scan ${{ matrix.name }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
