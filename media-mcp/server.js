@@ -292,7 +292,7 @@ async function plexApi(path = "", options = {}) {
   const headers = {
     "X-Plex-Token": service.token,
     "X-Plex-Client-Identifier": "unraid-codex-media-mcp",
-    "X-Plex-Product": "Unraid Codex Terminal Media MCP",
+    "X-Plex-Product": "Unraid Addons Media MCP",
     "X-Plex-Version": "0.1.0",
     "X-Plex-Device": "MCP",
     "X-Plex-Device-Name": "media-mcp",
@@ -314,7 +314,7 @@ async function plexCommunityGraphql(query, variables = {}, operationName) {
     headers: {
       "X-Plex-Token": service.token,
       "X-Plex-Client-Identifier": "unraid-codex-media-mcp",
-      "X-Plex-Product": "Unraid Codex Terminal Media MCP",
+      "X-Plex-Product": "Unraid Addons Media MCP",
       "X-Plex-Version": "0.1.0",
       "X-Plex-Device": "MCP",
       "X-Plex-Device-Name": "media-mcp",

@@ -1,6 +1,6 @@
-# Unraid Codex Terminal
+# Unraid Addons
 
-Unraid Docker templates for running Codex in a container that is reachable by SSH and a browser terminal, with Unraid management isolated behind an internal MCP sidecar.
+A five-component suite of Unraid Docker templates for Codex access, isolated Unraid management, media automation, human-approved issue repair, and utility monitoring.
 
 Codex connects to the `codex-terminal` container, not to the Unraid host shell. Unraid control goes through `unraid-mcp` and the Unraid GraphQL API, not the Docker socket or broad host mounts.
 
@@ -13,6 +13,10 @@ The code and documentation in this repository were generated with AI assistance.
 If Codex Desktop reports a Codex version mismatch when connecting over SSH, manually restart the `codex-terminal` container from Unraid. The container updates `@openai/codex` on startup by default, so a restart is the expected fix.
 
 For full configuration, validation, local development, and security notes, see [docs.md](docs.md).
+
+## Upgrading From unraid-codex-terminal
+
+The project and its five GHCR images have moved to the `unraid-addons` namespace. Existing installations must update their image Repository values; runtime names and persistent paths remain unchanged. See [Upgrade From unraid-codex-terminal](docs.md#upgrade-from-unraid-codex-terminal) for the exact mappings and steps.
 
 ## What Runs
 

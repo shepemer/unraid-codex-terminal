@@ -1,18 +1,18 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>unraid-mcp</Name>
-  <Repository>ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest</Repository>
-  <Registry>https://github.com/shepemer/unraid-codex-terminal/pkgs/container/unraid-codex-terminal-unraid-mcp</Registry>
+  <Repository>ghcr.io/shepemer/unraid-addons-unraid-mcp:latest</Repository>
+  <Registry>https://github.com/shepemer/unraid-addons/pkgs/container/unraid-addons-unraid-mcp</Registry>
   <Network>codex-mgmt</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/shepemer/unraid-codex-terminal/issues</Support>
-  <Project>https://github.com/shepemer/unraid-codex-terminal</Project>
+  <Support>https://github.com/shepemer/unraid-addons/issues</Support>
+  <Project>https://github.com/shepemer/unraid-addons</Project>
   <Overview>Internal GraphQL-backed Unraid MCP sidecar for codex-terminal. This container should not publish its MCP port to the LAN.</Overview>
   <Category>Tools:</Category>
   <WebUI/>
-  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/templates/unraid-mcp.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/shepemer/unraid-codex-terminal/main/assets/icons/unraid-mcp.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/shepemer/unraid-addons/main/templates/unraid-mcp.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/shepemer/unraid-addons/main/assets/icons/unraid-mcp.png</Icon>
   <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --tmpfs /run:rw,nosuid,size=32m --security-opt=no-new-privileges:true --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER --cap-add=SETGID --cap-add=SETUID</ExtraParams>
   <PostArgs/>
   <CPUset/>

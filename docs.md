@@ -1,6 +1,6 @@
-# Unraid Codex Terminal Docs
+# Unraid Addons Docs
 
-This file holds the detailed reference material. The short install and connection path lives in [README.md](README.md).
+This file holds the detailed reference material for the five-component Unraid Addons suite. The short install and connection path lives in [README.md](README.md).
 
 ## Version Mismatch And Codex Updates
 
@@ -25,6 +25,26 @@ Advanced settings:
 - `CODEX_UPDATE_ON_START_TIMEOUT=180` controls the maximum update time in seconds.
 
 Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and only want Codex to change when the container image is updated.
+
+## Upgrade From unraid-codex-terminal
+
+The legacy GHCR packages remain available at their last published versions, but they are frozen and do not redirect to the new packages. Update every installed image Repository explicitly:
+
+| Component | Frozen legacy Repository | New Repository |
+| --- | --- | --- |
+| `codex-terminal` | `ghcr.io/shepemer/unraid-codex-terminal:latest` | `ghcr.io/shepemer/unraid-addons-codex-terminal:latest` |
+| `unraid-mcp` | `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest` | `ghcr.io/shepemer/unraid-addons-unraid-mcp:latest` |
+| `media-mcp` | `ghcr.io/shepemer/unraid-codex-terminal-media-mcp:latest` | `ghcr.io/shepemer/unraid-addons-media-mcp:latest` |
+| `media-issue-agent` | `ghcr.io/shepemer/unraid-codex-terminal-media-issue-agent:latest` | `ghcr.io/shepemer/unraid-addons-media-issue-agent:latest` |
+| `utilities-mcp` | `ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest` | `ghcr.io/shepemer/unraid-addons-utilities-mcp:latest` |
+
+On Unraid, edit the Repository field on each installed container and select Apply to recreate it from the new image. Replacing the XML template file alone does not update an installed container. Keep every existing appdata mount and setting unchanged.
+
+For Compose deployments, first fetch this renamed repository or replace your existing `docker-compose.yml` with the current file so its default image paths point at `unraid-addons`. If you override the image variables to published `main`, `beta`, or `latest` tags, update those `.env` values, then rerun `docker compose pull` and `docker compose up -d` with the same profile and file flags you already use. If you use the repository's default local `:dev` names, run `docker compose build` and then `docker compose up -d` instead; `:dev` is a local-build tag and is not published. Do not run `down`, rename the Compose project, or move `./data`; the legacy Compose project name is retained specifically so upgrades reuse the existing containers and state.
+
+If you follow `:beta`, use `:beta` on the corresponding new package. Historical SHA tags were not copied: keep an old SHA pinned to its frozen legacy package, or move to `main`, `beta`, `latest`, or a SHA published after the new packages were created.
+
+The unchanged persistent paths preserve terminal Codex auth and config, SSH keys, workspace files, Unraid MCP state/logs/backups, and the issue agent database, logs, repair workspaces, and Codex auth. Media and utilities credentials remain attached to the same environment and template settings.
 
 ## Architecture
 
@@ -51,11 +71,11 @@ Set `CODEX_UPDATE_ON_START=false` if you want deterministic image contents and o
 
 3. Confirm the templates reference the published images:
 
-   - `ghcr.io/shepemer/unraid-codex-terminal:latest`
-   - `ghcr.io/shepemer/unraid-codex-terminal-unraid-mcp:latest`
-   - `ghcr.io/shepemer/unraid-codex-terminal-media-mcp:latest`
-   - `ghcr.io/shepemer/unraid-codex-terminal-media-issue-agent:latest`
-   - `ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest`
+   - `ghcr.io/shepemer/unraid-addons-codex-terminal:latest`
+   - `ghcr.io/shepemer/unraid-addons-unraid-mcp:latest`
+   - `ghcr.io/shepemer/unraid-addons-media-mcp:latest`
+   - `ghcr.io/shepemer/unraid-addons-media-issue-agent:latest`
+   - `ghcr.io/shepemer/unraid-addons-utilities-mcp:latest`
 
 4. Install `unraid-mcp` first. Set:
 
@@ -624,7 +644,7 @@ Container checks:
 
 ```sh
 mkdir -p /tmp/codex-terminal-smoke
-docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --tmpfs /run:rw,nosuid,size=64m --tmpfs /var/run:rw,nosuid,size=32m -v /tmp/codex-terminal-smoke:/config:rw ghcr.io/shepemer/unraid-codex-terminal:latest /usr/sbin/sshd -t -f /run/codex-terminal/sshd_config
+docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --tmpfs /run:rw,nosuid,size=64m --tmpfs /var/run:rw,nosuid,size=32m -v /tmp/codex-terminal-smoke:/config:rw ghcr.io/shepemer/unraid-addons-codex-terminal:latest /usr/sbin/sshd -t -f /run/codex-terminal/sshd_config
 ssh unraid-codex codex --version
 ssh unraid-codex test ! -S /var/run/docker.sock
 ssh unraid-codex test ! -w /mnt/user
