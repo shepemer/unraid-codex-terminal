@@ -65,6 +65,12 @@ jobs:
           npm --prefix media-mcp run test:repair-capabilities
           npm --prefix media-mcp run test:threadfin
 
+      - name: Run utilities MCP checks
+        run: |
+          npm --prefix utilities-mcp ci
+          npm --prefix utilities-mcp run check
+          npm --prefix utilities-mcp run test:scrutiny-url
+
       - name: Run media issue agent checks
         run: |
           npm --prefix media-issue-agent ci

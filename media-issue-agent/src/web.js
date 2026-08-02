@@ -33,7 +33,7 @@ const HTML = `<!doctype html>
         </div>
       </div>
       <nav class="toolbar" aria-label="Primary actions">
-        <div id="codex-settings-panel" class="runner-strip" aria-label="Codex model settings">
+        <div id="codex-settings-panel" class="runner-strip" aria-label="Codex and operations settings">
           <div class="runner-panel-header">
             <span class="runner-label">Codex Runner</span>
             <button id="runner-settings-close-button" type="button" class="secondary">Close</button>
@@ -60,9 +60,31 @@ const HTML = `<!doctype html>
             <span>Tier</span>
             <input id="codex-service-tier" type="text" autocomplete="off">
           </label>
-          <div class="runner-button-row">
+          <div class="runner-button-row codex-runner-buttons">
             <button id="repair-context-button" type="button" class="secondary">Context</button>
+            <button id="codex-settings-reset" type="button" class="secondary">Reset Codex</button>
             <button id="codex-settings-save" type="button">Save</button>
+          </div>
+          <div class="runner-section-header">
+            <span class="runner-label">Operations</span>
+            <span id="operations-settings-source" class="settings-source"></span>
+          </div>
+          <label class="compact-field">
+            <span>Poll interval (seconds)</span>
+            <input id="operations-poll-interval" type="number" min="30" step="1" inputmode="numeric">
+          </label>
+          <label class="compact-field">
+            <span>Snapshots retained</span>
+            <input id="operations-snapshot-retention" type="number" min="1" step="1" inputmode="numeric">
+          </label>
+          <label class="compact-field">
+            <span>Trusted server-owner reporter</span>
+            <input id="operations-server-owner-reporter" type="text" maxlength="200" autocomplete="off" placeholder="Optional exact username">
+          </label>
+          <p class="runner-help">Matching reports and comments are treated as trusted server-owner guidance for new or re-run investigations.</p>
+          <div class="runner-button-row">
+            <button id="operations-settings-reset" type="button" class="secondary">Reset Operations</button>
+            <button id="operations-settings-save" type="button">Save Operations</button>
           </div>
         </div>
         <span id="runner-settings-summary" class="runner-summary">GPT-5.5 Very High</span>
@@ -591,6 +613,27 @@ p { color: var(--muted); margin-top: 2px; }
   gap: 10px;
 }
 
+.runner-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-source,
+.runner-help {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.runner-help {
+  margin: -2px 0 0;
+  line-height: 1.45;
+}
+
 .runner-label {
   color: var(--subtle);
   font-size: 11px;
@@ -642,6 +685,7 @@ p { color: var(--muted); margin-top: 2px; }
 .compact-tier { width: 100%; }
 
 .runner-strip input[type="text"],
+.runner-strip input[type="number"],
 .runner-strip select {
   width: 100%;
   min-width: 0;
@@ -655,6 +699,7 @@ p { color: var(--muted); margin-top: 2px; }
 }
 
 .runner-strip input[type="text"]:focus-visible,
+.runner-strip input[type="number"]:focus-visible,
 .runner-strip select:focus-visible {
   outline: none;
   box-shadow: var(--focus);
@@ -683,6 +728,10 @@ p { color: var(--muted); margin-top: 2px; }
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
+}
+
+.codex-runner-buttons {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .token-usage {
@@ -2294,6 +2343,7 @@ pre {
   }
 
   .runner-strip input[type="text"],
+  .runner-strip input[type="number"],
   .runner-strip select {
     min-height: 44px;
   }
@@ -2638,6 +2688,7 @@ const JS = `const state = {
   authOk: false,
   loginRunning: false,
   codexSettings: null,
+  operationsSettings: null,
   mcpGapItems: [],
   mcpGapDetections: {},
   improvementFilter: "all",
@@ -2669,6 +2720,13 @@ const el = {
   codexServiceTier: document.getElementById("codex-service-tier"),
   codexRepairContext: document.getElementById("codex-repair-context"),
   codexSettingsSave: document.getElementById("codex-settings-save"),
+  codexSettingsReset: document.getElementById("codex-settings-reset"),
+  operationsPollInterval: document.getElementById("operations-poll-interval"),
+  operationsSnapshotRetention: document.getElementById("operations-snapshot-retention"),
+  operationsServerOwnerReporter: document.getElementById("operations-server-owner-reporter"),
+  operationsSettingsSource: document.getElementById("operations-settings-source"),
+  operationsSettingsSave: document.getElementById("operations-settings-save"),
+  operationsSettingsReset: document.getElementById("operations-settings-reset"),
   runnerSettingsSummary: document.getElementById("runner-settings-summary"),
   repairContextButton: document.getElementById("repair-context-button"),
   repairContextDialog: document.getElementById("repair-context-dialog"),
@@ -3671,6 +3729,30 @@ function renderCodexSettings(settings) {
   el.repairContextButton.title = effective.repairContext
     ? "Edit non-secret repair context"
     : "Add non-secret repair context";
+}
+
+function settingSourceLabel(value) {
+  return {
+    saved: "saved",
+    environment: "legacy env",
+    default: "default"
+  }[value] || String(value || "default");
+}
+
+function renderOperationsSettings(settings) {
+  state.operationsSettings = settings || null;
+  const effective = settings?.effective || settings?.defaults || {};
+  const sources = settings?.sources || {};
+  el.operationsPollInterval.value = effective.pollIntervalSeconds ?? 300;
+  el.operationsSnapshotRetention.value = effective.snapshotRetention ?? 200;
+  el.operationsServerOwnerReporter.value = effective.serverOwnerReporterUsername || "";
+  const uniqueSources = [...new Set(Object.values(sources).map(settingSourceLabel))];
+  el.operationsSettingsSource.textContent = uniqueSources.length ? uniqueSources.join(" · ") : "default";
+  el.operationsSettingsSource.title = [
+    "Poll interval: " + settingSourceLabel(sources.pollIntervalSeconds),
+    "Snapshot retention: " + settingSourceLabel(sources.snapshotRetention),
+    "Trusted reporter: " + settingSourceLabel(sources.serverOwnerReporterUsername)
+  ].join(" · ");
 }
 
 function currentSavedRepairContext() {
@@ -5368,16 +5450,18 @@ async function showJob(jobId, options = {}) {
 }
 
 async function refresh() {
-  const [status, snapshot, jobs, auth, codexSettings] = await Promise.all([
+  const [status, snapshot, jobs, auth, codexSettings, operationsSettings] = await Promise.all([
     api("/api/status"),
     api("/api/snapshot/latest"),
     api("/api/jobs"),
     api("/api/auth"),
-    api("/api/settings/codex")
+    api("/api/settings/codex"),
+    api("/api/settings/operations")
   ]);
   renderStats(status.status);
   renderAuth(auth.auth, auth.login);
   renderCodexSettings(codexSettings.settings);
+  renderOperationsSettings(operationsSettings.settings);
   renderSnapshot(snapshot.snapshot);
   renderJobs(jobs.jobs);
   scheduleAuthRefresh();
@@ -5422,6 +5506,93 @@ async function saveCodexSettings(options = {}) {
       closeRepairContextDialog({ revert: false });
     }
     toast("Codex settings saved");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function resetCodexSettings() {
+  if (!window.confirm("Reset Codex runner settings to their legacy environment or image defaults?")) {
+    return;
+  }
+  setBusy(true);
+  try {
+    const result = await runActivity({
+      id: "settings:codex-reset",
+      title: "Resetting runner settings",
+      detail: "Removing saved Codex runner overrides.",
+      successDetail: "Runner settings reset."
+    }, () => api("/api/settings/codex", { method: "DELETE", body: "{}" }));
+    renderCodexSettings(result.settings);
+    toast("Codex settings reset");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveOperationsSettings() {
+  if (!el.operationsPollInterval.reportValidity() || !el.operationsSnapshotRetention.reportValidity()) {
+    return;
+  }
+  const previousUsername = String(state.operationsSettings?.effective?.serverOwnerReporterUsername || "").trim();
+  const nextUsername = el.operationsServerOwnerReporter.value.trim();
+  const trustChanged = Boolean(nextUsername)
+    && previousUsername.toLowerCase() !== nextUsername.toLowerCase();
+  let confirmServerOwnerReporterTrust = false;
+  if (trustChanged) {
+    confirmServerOwnerReporterTrust = window.confirm(
+      'Trust reports and comments from "' + nextUsername + '" as server-owner guidance for new or re-run investigations?'
+    );
+    if (!confirmServerOwnerReporterTrust) {
+      return;
+    }
+  }
+  setBusy(true);
+  try {
+    const result = await runActivity({
+      id: "settings:operations",
+      title: "Saving operations settings",
+      detail: "Updating polling, snapshot retention, and reporter trust.",
+      successDetail: "Operations settings saved."
+    }, () => api("/api/settings/operations", {
+      method: "POST",
+      body: JSON.stringify({
+        pollIntervalSeconds: Number(el.operationsPollInterval.value),
+        snapshotRetention: Number(el.operationsSnapshotRetention.value),
+        serverOwnerReporterUsername: nextUsername,
+        confirmServerOwnerReporterTrust
+      })
+    }));
+    renderOperationsSettings(result.settings);
+    toast("Operations settings saved");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function resetOperationsSettings() {
+  if (!window.confirm("Reset operations settings? Legacy environment values may become effective again.")) {
+    return;
+  }
+  setBusy(true);
+  try {
+    const result = await runActivity({
+      id: "settings:operations-reset",
+      title: "Resetting operations settings",
+      detail: "Removing saved polling, retention, and reporter-trust overrides.",
+      successDetail: "Operations settings reset."
+    }, () => api("/api/settings/operations", {
+      method: "DELETE",
+      body: JSON.stringify({ confirmServerOwnerReporterTrust: true })
+    }));
+    renderOperationsSettings(result.settings);
+    toast("Operations settings reset");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -5889,6 +6060,9 @@ el.pollButton.addEventListener("click", poll);
 el.reloadButton.addEventListener("click", reloadDashboard);
 el.loginButton.addEventListener("click", startLogin);
 el.codexSettingsSave.addEventListener("click", saveCodexSettings);
+el.codexSettingsReset.addEventListener("click", resetCodexSettings);
+el.operationsSettingsSave.addEventListener("click", saveOperationsSettings);
+el.operationsSettingsReset.addEventListener("click", resetOperationsSettings);
 el.runnerSettingsButton.addEventListener("click", () => setRunnerSettingsOpen(!state.runnerSettingsOpen));
 el.runnerSettingsCloseButton.addEventListener("click", () => setRunnerSettingsOpen(false));
 el.runnerSettingsBackdrop.addEventListener("click", () => setRunnerSettingsOpen(false));
@@ -6300,6 +6474,10 @@ export function createWebHandler(agent, config) {
         sendJson(res, 200, { ok: true, settings: agent.codexSettings() });
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/settings/operations") {
+        sendJson(res, 200, { ok: true, settings: agent.operationsSettings() });
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/api/logs/download") {
         const from = url.searchParams.get("from") || "";
         const to = url.searchParams.get("to") || "";
@@ -6357,7 +6535,22 @@ export function createWebHandler(agent, config) {
       }
       if (req.method === "POST" && url.pathname === "/api/settings/codex") {
         const body = await readJson(req);
-        sendJson(res, 200, { ok: true, settings: agent.updateCodexSettings(body) });
+        sendJson(res, 200, { ok: true, settings: agent.updateCodexSettings(body, "web") });
+        return;
+      }
+      if (req.method === "DELETE" && url.pathname === "/api/settings/codex") {
+        await readJson(req);
+        sendJson(res, 200, { ok: true, settings: agent.resetCodexSettings("web") });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/settings/operations") {
+        const body = await readJson(req);
+        sendJson(res, 200, { ok: true, settings: agent.updateOperationsSettings(body, "web") });
+        return;
+      }
+      if (req.method === "DELETE" && url.pathname === "/api/settings/operations") {
+        const body = await readJson(req);
+        sendJson(res, 200, { ok: true, settings: agent.resetOperationsSettings(body, "web") });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/status") {

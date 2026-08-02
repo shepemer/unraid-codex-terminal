@@ -6,8 +6,7 @@ Use this before deploying or publishing the templates.
 
 - [ ] `codex-terminal` SSH is exposed only on LAN, VPN, or Tailscale.
 - [ ] `codex-terminal` WebUI is exposed only on LAN, VPN, or Tailscale.
-- [ ] `WEBUI_AUTH=true` and `WEBUI_PASSWORD` is strong, unless another authenticated proxy is in front of the WebUI.
-- [ ] `WEBUI_LOG_LEVEL=1` unless temporarily troubleshooting, because higher `ttyd` startup logs can include the basic-auth credential.
+- [ ] `WEBUI_PASSWORD` is strong; the supported deployment keeps WebUI authentication enabled and the internal `ttyd` log level fixed at its safe value.
 - [ ] `unraid-mcp` has no host port mapping.
 - [ ] Optional `media-mcp` has no host port mapping.
 - [ ] Optional `media-issue-agent` WebUI is exposed only on LAN, VPN, or Tailscale.
@@ -19,8 +18,10 @@ Use this before deploying or publishing the templates.
 - [ ] Media app API keys and passwords are configured only on `media-mcp`.
 - [ ] `MEDIA_MCP_BEARER_TOKEN` is long, random, and matches `media-mcp` and `codex-terminal` when media MCP is enabled.
 - [ ] `media-issue-agent` has `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN` configured and no media app credentials of its own.
-- [ ] `media-issue-agent` has no `OPENAI_API_KEY` or `CODEX_API_KEY`; it uses Codex ChatGPT auth in its mounted `CODEX_HOME`.
-- [ ] `media-issue-agent` `CODEX_HOME/auth.json` is treated as secret and is never committed, pasted, or logged.
+- [ ] `media-issue-agent` has no `OPENAI_API_KEY` or `CODEX_API_KEY`; it uses Codex ChatGPT auth under `/config/codex`.
+- [ ] `media-issue-agent` `/config/codex/auth.json` and `/config/state` are treated as sensitive and are never committed, pasted, or logged.
+- [ ] Pushover, Slack, moderation, API-key, password, and bearer-token template fields are masked and have empty defaults.
+- [ ] Integration secrets remain in Unraid environment fields; they are not saved in the issue agent's plaintext SQLite settings table.
 - [ ] Scrutiny endpoints are configured only on `utilities-mcp`.
 - [ ] `UTILITIES_MCP_BEARER_TOKEN` is long, random, and matches `utilities-mcp` and `codex-terminal` when utilities MCP is enabled.
 - [ ] Root SSH login is disabled.
@@ -30,9 +31,10 @@ Use this before deploying or publishing the templates.
 - [ ] No container uses host networking, host PID, host IPC, or host devices.
 - [ ] No container mounts `/var/run/docker.sock`.
 - [ ] No container mounts `/`, `/boot`, broad `/mnt`, or all appdata.
-- [ ] Any diagnostic mount is narrow and read-only.
-- [ ] Optional media/download path diagnostics mounts are on `codex-terminal` only, not MCP sidecars.
-- [ ] `CODEX_MEDIA_PATH_MAPS` maps only service paths to narrow read-only mounts such as `/mnt/unraid/media` or `/mnt/unraid/downloads`.
+- [ ] The optional terminal media diagnostic mount is narrow and read-only.
+- [ ] The optional terminal downloads diagnostic mount is present only when intentional shell-side archive work requires read/write access.
+- [ ] Optional automation mounts on `media-mcp` are narrow; media roots are explicitly allowlisted before deletion and downloads are read/write only when archive extraction is intended.
+- [ ] `CODEX_MEDIA_PATH_MAPS` maps only service paths to the two narrow terminal diagnostic mounts.
 - [ ] MCP sidecars require bearer-token auth.
 
 ## API Key Scope
@@ -51,11 +53,13 @@ Use this before deploying or publishing the templates.
 - [ ] qBittorrent delete-with-files is treated as destructive and requires explicit confirmation.
 - [ ] Seerr request approval, decline, and delete actions require explicit confirmation.
 - [ ] Sonarr/Radarr add actions use known root folders and quality profiles.
+- [ ] `MEDIA_MCP_PATH_MAPS` contains only additional nonstandard mappings; the standard `/downloads=/mnt/unraid/downloads` mapping remains built in.
 
 ## Utility App Scope
 
 - [ ] Only the utility services Codex should inspect are configured on `utilities-mcp`.
 - [ ] Scrutiny tools are read-only health, summary, temperature, and detail calls.
+- [ ] Any Scrutiny reverse-proxy path is part of `SCRUTINY_URL`; no separate base-path variable is used.
 
 ## Validation
 
@@ -75,10 +79,10 @@ Use this before deploying or publishing the templates.
 - [ ] `docker compose --profile media --profile utilities config` passes.
 - [ ] CI vulnerability scans pass before images are pushed.
 - [ ] `sshd -t` passes inside the built `codex-terminal` image.
-- [ ] Codex CLI startup update succeeds when `CODEX_UPDATE_ON_START=true`, or logs a warning and continues with the bundled version.
+- [ ] The fixed Codex CLI startup update succeeds, or logs a warning and continues with the bundled version after the 180-second limit.
 - [ ] `unraid-mcp` starts with root-owned appdata directories and rewrites them to UID/GID 1000.
-- [ ] `media-mcp` starts with a read-only root filesystem and no host mounts.
-- [ ] `media-issue-agent` starts with a read-only root filesystem, a state mount, a Codex auth mount, and only its WebUI port published.
+- [ ] `media-mcp` starts with a read-only root filesystem and no host mounts unless narrow automation paths were explicitly enabled.
+- [ ] `media-issue-agent` starts with a read-only root filesystem, one `/config` appdata mount, and only its WebUI port published.
 - [ ] `utilities-mcp` starts with a read-only root filesystem and no host mounts.
 - [ ] `media-path-check --json` reports mapped alternatives without creating, deleting, or editing files.
 - [ ] `ssh unraid-codex codex --version` works.
@@ -86,7 +90,7 @@ Use this before deploying or publishing the templates.
 - [ ] If media MCP is enabled, `ssh unraid-codex codex mcp list --json` shows the `media` MCP server.
 - [ ] If utilities MCP is enabled, `ssh unraid-codex codex mcp list --json` shows the `utilities` MCP server.
 - [ ] WebUI login works and attaches to the persistent `tmux` session.
-- [ ] WebUI without credentials fails when `WEBUI_AUTH=true`.
+- [ ] WebUI without credentials fails.
 - [ ] Root SSH login fails.
 - [ ] Password SSH login fails by default.
 - [ ] Interactive SSH with a TTY stays connected.
@@ -94,3 +98,4 @@ Use this before deploying or publishing the templates.
 - [ ] The `codex` shell user cannot modify global npm packages directly.
 - [ ] The container cannot access `/var/run/docker.sock`.
 - [ ] Recreating `codex-terminal` preserves `/config/.codex`, SSH host keys, authorized keys, and workspace files.
+- [ ] Recreating `media-issue-agent` with its appdata parent at `/config` preserves database history, logs, repair workspaces, and Codex auth under the existing host `state/` and `codex/` directories.

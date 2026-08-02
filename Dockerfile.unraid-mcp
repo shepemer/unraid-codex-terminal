@@ -18,8 +18,8 @@ RUN groupadd --gid 1000 mcp \
     && apt-get install -y --no-install-recommends ca-certificates libgnutls30 util-linux wget \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir "unraid-mcp==${UNRAID_MCP_VERSION}" \
-    && mkdir -p /app/logs /app/backups /home/mcp/.unraid-mcp \
-    && chown -R mcp:mcp /app/logs /app/backups /home/mcp/.unraid-mcp \
+    && mkdir -p /app/logs /home/mcp/.unraid-mcp \
+    && chown -R mcp:mcp /app/logs /home/mcp/.unraid-mcp \
     && chmod 0700 /home/mcp/.unraid-mcp
 
 COPY unraid-mcp-entrypoint.sh /usr/local/bin/unraid-mcp-entrypoint

@@ -11,6 +11,7 @@ import {
   createAgentRun,
   ensureJob,
   extractTokenUsageFromCodexEvent,
+  getSetting,
   initDb,
   insertSnapshot,
   investigationForJob,
@@ -2710,6 +2711,218 @@ async function testCodexSettingsPersist() {
   await rm(dir, { recursive: true, force: true });
 }
 
+async function testLegacySettingsMigrationAndSources() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const config = await loadConfig({
+    ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "integration-secret-must-not-migrate",
+    ISSUE_AGENT_DB_PATH: dbPath,
+    ISSUE_AGENT_WEB_ENABLED: "false",
+    ISSUE_AGENT_CODEX_MODEL: "gpt-5.5",
+    ISSUE_AGENT_CODEX_FAST_MODE: "false",
+    ISSUE_AGENT_REPAIR_CONTEXT: "Legacy non-secret repair context.",
+    ISSUE_AGENT_POLL_INTERVAL_SECONDS: "45",
+    ISSUE_AGENT_SNAPSHOT_RETENTION: "2",
+    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: "LegacyOwner"
+  }, { requireCodexAuth: false });
+  config.suppressInitLog = true;
+  try {
+    const agent = new MediaIssueAgent(config, {});
+    await agent.init();
+
+    const codex = agent.codexSettings();
+    assert.deepEqual(codex.defaults, {
+      model: "gpt-5.5",
+      reasoningEffort: "xhigh",
+      fastMode: true,
+      serviceTier: "fast",
+      repairContext: ""
+    });
+    assert.deepEqual(codex.saved, {
+      fastMode: false,
+      serviceTier: "",
+      repairContext: "Legacy non-secret repair context."
+    });
+    assert.equal(codex.sources.model, "environment");
+    assert.equal(codex.sources.reasoningEffort, "default");
+    assert.equal(codex.sources.repairContext, "saved");
+
+    const operations = agent.operationsSettings();
+    assert.deepEqual(operations.effective, {
+      pollIntervalSeconds: 45,
+      snapshotRetention: 2,
+      serverOwnerReporterUsername: "LegacyOwner"
+    });
+    assert.deepEqual(operations.sources, {
+      pollIntervalSeconds: "saved",
+      snapshotRetention: "saved",
+      serverOwnerReporterUsername: "saved"
+    });
+
+    const marker = getSetting(dbPath, "settings_ui_migration_v1", null);
+    assert.equal(marker.version, 1);
+    assert.deepEqual(marker.imported.codex, ["fastMode", "serviceTier", "repairContext"]);
+    assert.deepEqual(marker.imported.operations, ["pollIntervalSeconds", "snapshotRetention", "serverOwnerReporterUsername"]);
+    assert.doesNotMatch(JSON.stringify(marker), /integration-secret-must-not-migrate/);
+    assert.doesNotMatch(JSON.stringify(sqliteExec(dbPath, "SELECT key, value_json AS valueJson FROM settings;", { json: true })), /integration-secret-must-not-migrate/);
+    const migrationAudits = sqliteExec(dbPath, `
+SELECT event_type AS eventType
+FROM audit_events
+WHERE event_type = 'legacy_settings_import_completed';
+`, { json: true });
+    assert.equal(migrationAudits.length, 1);
+
+    agent.resetCodexSettings("test");
+    assert.equal(agent.codexSettings().saved, null);
+    assert.equal(agent.codexSettings().effective.repairContext, "Legacy non-secret repair context.");
+    assert.equal(agent.codexSettings().sources.repairContext, "environment");
+
+    const restarted = new MediaIssueAgent(config, {});
+    await restarted.init();
+    assert.equal(restarted.codexSettings().saved, null);
+    assert.equal(getSetting(dbPath, "settings_ui_migration_v1", null).version, 1);
+    assert.equal(sqliteExec(dbPath, `
+SELECT COUNT(*) AS count
+FROM audit_events
+WHERE event_type = 'legacy_settings_import_completed';
+`, { json: true })[0].count, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testOperationsSettingsValidationTrustAuditAndDynamicRetention() {
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  const config = {
+    dbPath,
+    suppressInitLog: true,
+    recoverStaleRunSeconds: 120,
+    legacySettingsEnvironment: {
+      codex: {},
+      operations: {
+        pollIntervalSeconds: 45,
+        snapshotRetention: 3,
+        serverOwnerReporterUsername: "LegacyOwner"
+      }
+    }
+  };
+  const agent = new MediaIssueAgent(config, {
+    async callTool(name) {
+      if (name === "plex_reported_issues") {
+        return { records: [] };
+      }
+      throw new Error(`Unexpected tool ${name}`);
+    }
+  });
+  try {
+    await agent.init();
+    await assert.rejects(
+      async () => agent.updateOperationsSettings({ serverOwnerReporterUsername: "NewOwner" }, "test"),
+      /Explicit confirmation is required/
+    );
+    assert.equal(agent.operationsSettings().effective.serverOwnerReporterUsername, "LegacyOwner");
+
+    const changed = agent.updateOperationsSettings({
+      pollIntervalSeconds: 60,
+      snapshotRetention: 2,
+      serverOwnerReporterUsername: "NewOwner",
+      confirmServerOwnerReporterTrust: true,
+      slackBotToken: "xoxb-must-not-persist"
+    }, "test");
+    assert.equal(changed.effective.serverOwnerReporterUsername, "NewOwner");
+    assert.deepEqual(changed.sources, {
+      pollIntervalSeconds: "saved",
+      snapshotRetention: "saved",
+      serverOwnerReporterUsername: "saved"
+    });
+    assert.doesNotMatch(JSON.stringify(changed), /xoxb-must-not-persist|slackBotToken/);
+    assert.doesNotMatch(JSON.stringify(getSetting(dbPath, "operations", null)), /xoxb-must-not-persist|slackBotToken/);
+
+    await assert.rejects(
+      async () => agent.resetOperationsSettings({}, "test"),
+      /Explicit confirmation is required/
+    );
+    const reset = agent.resetOperationsSettings({ confirmServerOwnerReporterTrust: true }, "test");
+    assert.equal(reset.saved, null);
+    assert.equal(reset.effective.serverOwnerReporterUsername, "LegacyOwner");
+    assert.equal(reset.sources.serverOwnerReporterUsername, "environment");
+
+    const cleared = agent.updateOperationsSettings({ serverOwnerReporterUsername: "" }, "test");
+    assert.equal(cleared.effective.serverOwnerReporterUsername, "");
+    const granted = agent.updateOperationsSettings({
+      serverOwnerReporterUsername: "FinalOwner",
+      confirmServerOwnerReporterTrust: true
+    }, "test");
+    assert.equal(granted.effective.serverOwnerReporterUsername, "FinalOwner");
+
+    await assert.rejects(
+      async () => agent.updateOperationsSettings({ pollIntervalSeconds: 29 }, "test"),
+      /greater than or equal to 30/
+    );
+    await assert.rejects(
+      async () => agent.updateOperationsSettings({ snapshotRetention: 0 }, "test"),
+      /greater than or equal to 1/
+    );
+
+    agent.updateOperationsSettings({
+      pollIntervalSeconds: 30,
+      snapshotRetention: 1,
+      serverOwnerReporterUsername: ""
+    }, "test");
+    await agent.pollOnce();
+    await agent.pollOnce();
+    assert.equal(sqliteExec(dbPath, "SELECT COUNT(*) AS count FROM issue_snapshots;", { json: true })[0].count, 1);
+    assert.equal(agent.operationsSettings().effective.pollIntervalSeconds, 30);
+
+    const auditTypes = sqliteExec(dbPath, `
+SELECT event_type AS eventType
+FROM audit_events
+WHERE event_type LIKE 'server_owner_reporter_trust_%'
+ORDER BY id;
+`, { json: true }).map(row => row.eventType);
+    assert.equal(auditTypes.includes("server_owner_reporter_trust_changed"), true);
+    assert.equal(auditTypes.includes("server_owner_reporter_trust_cleared"), true);
+    assert.equal(auditTypes.includes("server_owner_reporter_trust_granted"), true);
+
+    const auditCountBeforeFailure = sqliteExec(dbPath, "SELECT COUNT(*) AS count FROM audit_events;", { json: true })[0].count;
+    sqliteExec(dbPath, `
+CREATE TRIGGER reject_trusted_reporter_grant
+BEFORE INSERT ON audit_events
+WHEN NEW.event_type = 'server_owner_reporter_trust_granted'
+BEGIN
+  SELECT RAISE(FAIL, 'forced trusted-reporter audit failure');
+END;
+`);
+    assert.throws(() => agent.updateOperationsSettings({
+      serverOwnerReporterUsername: "AtomicOwner",
+      confirmServerOwnerReporterTrust: true
+    }, "test"), /forced trusted-reporter audit failure/);
+    assert.equal(agent.operationsSettings().effective.serverOwnerReporterUsername, "");
+    assert.equal(sqliteExec(dbPath, "SELECT COUNT(*) AS count FROM audit_events;", { json: true })[0].count, auditCountBeforeFailure);
+    sqliteExec(dbPath, "DROP TRIGGER reject_trusted_reporter_grant;");
+
+    agent.updateOperationsSettings({
+      serverOwnerReporterUsername: "AtomicOwner",
+      confirmServerOwnerReporterTrust: true
+    }, "test");
+    sqliteExec(dbPath, `
+CREATE TRIGGER reject_operations_reset_audit
+BEFORE INSERT ON audit_events
+WHEN NEW.event_type = 'operations_settings_reset'
+BEGIN
+  SELECT RAISE(FAIL, 'forced operations-reset audit failure');
+END;
+`);
+    assert.throws(() => agent.resetOperationsSettings({
+      confirmServerOwnerReporterTrust: true
+    }, "test"), /forced operations-reset audit failure/);
+    assert.equal(agent.operationsSettings().saved.serverOwnerReporterUsername, "AtomicOwner");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function testJobListPrioritizesActiveWork() {
   const dir = await tempDir();
   const dbPath = path.join(dir, "state.sqlite");
@@ -3009,6 +3222,9 @@ async function testWebAuthAndApi() {
   let reopenRequest = null;
   let improvementRequest = null;
   let removedImprovementId = null;
+  let codexResetActor = null;
+  let operationsUpdateRequest = null;
+  let operationsResetRequest = null;
   const liveLogRecords = [];
   const issueLogRows = [{
     id: 1,
@@ -3107,6 +3323,41 @@ async function testWebAuthAndApi() {
       effective: values,
       saved: values
     }),
+    resetCodexSettings: actor => {
+      codexResetActor = actor;
+      return {
+        defaults: { model: "gpt-5.5", reasoningEffort: "xhigh", fastMode: true, serviceTier: "fast", repairContext: "" },
+        effective: { model: "gpt-5.5", reasoningEffort: "xhigh", fastMode: true, serviceTier: "fast", repairContext: "" },
+        saved: null,
+        sources: { model: "default", reasoningEffort: "default", fastMode: "default", serviceTier: "default", repairContext: "default" }
+      };
+    },
+    operationsSettings: () => ({
+      defaults: { pollIntervalSeconds: 300, snapshotRetention: 200, serverOwnerReporterUsername: "" },
+      effective: { pollIntervalSeconds: 300, snapshotRetention: 200, serverOwnerReporterUsername: "" },
+      saved: null,
+      sources: { pollIntervalSeconds: "default", snapshotRetention: "default", serverOwnerReporterUsername: "default" }
+    }),
+    updateOperationsSettings: (values, actor) => {
+      if (values.serverOwnerReporterUsername && values.confirmServerOwnerReporterTrust !== true) {
+        throw new Error("Explicit confirmation is required before granting trusted reporter guidance.");
+      }
+      operationsUpdateRequest = { values, actor };
+      return {
+        defaults: { pollIntervalSeconds: 300, snapshotRetention: 200, serverOwnerReporterUsername: "" },
+        effective: {
+          pollIntervalSeconds: values.pollIntervalSeconds,
+          snapshotRetention: values.snapshotRetention,
+          serverOwnerReporterUsername: values.serverOwnerReporterUsername
+        },
+        saved: values,
+        sources: { pollIntervalSeconds: "saved", snapshotRetention: "saved", serverOwnerReporterUsername: "saved" }
+      };
+    },
+    resetOperationsSettings: (values, actor) => {
+      operationsResetRequest = { values, actor };
+      return agent.operationsSettings();
+    },
     jobDetails: jobId => ({
       job: { id: jobId, source: "seerr", issueId: "fixture", state: "approved_for_execution", updatedAt: "2026-01-01T00:02:00Z" },
       investigation: { summary: "Cached fixture summary" },
@@ -3175,6 +3426,11 @@ async function testWebAuthAndApi() {
     const pageText = await page.text();
     assert.match(pageText, /Media Issue Agent/);
     assert.match(pageText, /<html lang="en" data-theme="dark">/);
+    assert.match(pageText, /id="operations-poll-interval"/);
+    assert.match(pageText, /id="operations-snapshot-retention"/);
+    assert.match(pageText, /id="operations-server-owner-reporter"/);
+    assert.match(pageText, /id="operations-settings-reset"/);
+    assert.match(pageText, /id="codex-settings-reset"/);
     assert.match(pageText, /data-theme-choice="dark"/);
     assert.match(pageText, /id="auth-panel"/);
     assert.match(pageText, /id="codex-settings-panel"/);
@@ -3325,6 +3581,10 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /Issue repair/);
     assert.match(jsText, /function renderCodexSettings/);
     assert.match(jsText, /function saveCodexSettings/);
+    assert.match(jsText, /function resetCodexSettings/);
+    assert.match(jsText, /function renderOperationsSettings/);
+    assert.match(jsText, /function saveOperationsSettings/);
+    assert.match(jsText, /function resetOperationsSettings/);
     assert.match(jsText, /function formatTokenCount/);
     assert.match(jsText, /function renderTokenUsage/);
     assert.match(jsText, /function setActivityDrawerOpen/);
@@ -3352,6 +3612,7 @@ async function testWebAuthAndApi() {
     assert.match(jsText, /PROCESSING_JOB_STATES/);
     assert.match(jsText, /function handleIssueListClick/);
     assert.match(jsText, /\/api\/settings\/codex/);
+    assert.match(jsText, /\/api\/settings\/operations/);
     assert.match(jsText, /function updateIssueRowHighlights/);
     assert.match(jsText, /function repairVerificationText/);
     assert.match(jsText, /reopening_issue/);
@@ -3379,6 +3640,56 @@ async function testWebAuthAndApi() {
       body: JSON.stringify({ model: "gpt-5", reasoningEffort: "high", fastMode: false, serviceTier: "" })
     });
     assert.equal((await savedSettings.json()).settings.effective.reasoningEffort, "high");
+    const resetCodex = await fetch(`${baseUrl}/api/settings/codex`, {
+      method: "DELETE",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal((await resetCodex.json()).settings.saved, null);
+    assert.equal(codexResetActor, "web");
+    const operations = await fetch(`${baseUrl}/api/settings/operations`, { headers: { authorization: auth } });
+    assert.equal((await operations.json()).settings.effective.pollIntervalSeconds, 300);
+    const rejectedTrust = await fetch(`${baseUrl}/api/settings/operations`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({
+        pollIntervalSeconds: 60,
+        snapshotRetention: 25,
+        serverOwnerReporterUsername: "FixtureOwner"
+      })
+    });
+    assert.equal(rejectedTrust.status, 500);
+    assert.match((await rejectedTrust.json()).error, /Explicit confirmation is required/);
+    const savedOperations = await fetch(`${baseUrl}/api/settings/operations`, {
+      method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({
+        pollIntervalSeconds: 60,
+        snapshotRetention: 25,
+        serverOwnerReporterUsername: "FixtureOwner",
+        confirmServerOwnerReporterTrust: true
+      })
+    });
+    assert.equal((await savedOperations.json()).settings.effective.serverOwnerReporterUsername, "FixtureOwner");
+    assert.deepEqual(operationsUpdateRequest, {
+      values: {
+        pollIntervalSeconds: 60,
+        snapshotRetention: 25,
+        serverOwnerReporterUsername: "FixtureOwner",
+        confirmServerOwnerReporterTrust: true
+      },
+      actor: "web"
+    });
+    const resetOperations = await fetch(`${baseUrl}/api/settings/operations`, {
+      method: "DELETE",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({ confirmServerOwnerReporterTrust: true })
+    });
+    assert.equal((await resetOperations.json()).settings.saved, null);
+    assert.deepEqual(operationsResetRequest, {
+      values: { confirmServerOwnerReporterTrust: true },
+      actor: "web"
+    });
     const improvements = await fetch(`${baseUrl}/api/improvements`, { headers: { authorization: auth } });
     const improvementItems = (await improvements.json()).items;
     assert.equal(improvementItems[0].itemType, "investigation_prompt");
@@ -3498,6 +3809,8 @@ async function run() {
   await testStartupDoesNotRecoverLiveOwnerStaleRepairRun();
   await testStartupRecoversStaleInterruptedRepairRun();
   await testCodexSettingsPersist();
+  await testLegacySettingsMigrationAndSources();
+  await testOperationsSettingsValidationTrustAuditAndDynamicRetention();
   await testJobListPrioritizesActiveWork();
   await testDiagnosticLogRedactionAndRangeFiltering();
   await testDiagnosticLogWriteFailureIsReported();

@@ -14,7 +14,8 @@ const bearerToken = env.MEDIA_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.MEDIA_MCP_REQUEST_TIMEOUT_MS || 30000);
 const mediaProbeCommandTimeoutMs = Number(env.MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS || 30000);
 const allowedHosts = allowedHostnames(env.MEDIA_MCP_ALLOWED_HOSTS, "media-mcp", host);
-const mediaPathMaps = parsePathMaps(env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "/downloads=/mnt/unraid/downloads");
+const additionalMediaPathMaps = env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "";
+const mediaPathMaps = parsePathMaps(`/downloads=/mnt/unraid/downloads,${additionalMediaPathMaps}`);
 const mediaDeleteRoots = parsePathList(env.MEDIA_MCP_MEDIA_ROOTS || env.MEDIA_MCP_ALLOWED_MEDIA_ROOTS || "");
 
 if (!bearerToken) {
@@ -741,7 +742,7 @@ function cleanPath(value) {
 }
 
 function parsePathMaps(value) {
-  return String(value || "")
+  const mappings = String(value || "")
     .split(",")
     .map(entry => entry.trim())
     .filter(Boolean)
@@ -757,7 +758,12 @@ function parsePathMaps(value) {
       }
       return { source, target };
     })
-    .filter(Boolean)
+    .filter(Boolean);
+  const mappingsBySource = new Map();
+  for (const mapping of mappings) {
+    mappingsBySource.set(mapping.source, mapping);
+  }
+  return [...mappingsBySource.values()]
     .sort((a, b) => b.source.length - a.source.length);
 }
 

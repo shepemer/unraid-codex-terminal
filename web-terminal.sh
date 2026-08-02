@@ -4,14 +4,12 @@ set -euo pipefail
 CONFIG_DIR="${CONFIG_DIR:-/config}"
 RUNTIME_DIR="/run/codex-terminal"
 SSHD_CONFIG="${RUNTIME_DIR}/sshd_config"
-SESSION_NAME="${WEBUI_TMUX_SESSION:-codex}"
-WEBUI_PORT="${WEBUI_PORT:-7681}"
-WEBUI_MAX_CLIENTS="${WEBUI_MAX_CLIENTS:-5}"
-WEBUI_ENABLED="${WEBUI_ENABLED:-true}"
-WEBUI_AUTH="${WEBUI_AUTH:-true}"
-WEBUI_USERNAME="${WEBUI_USERNAME:-codex}"
+SESSION_NAME="codex"
+WEBUI_PORT="7681"
+WEBUI_MAX_CLIENTS="5"
+WEBUI_USERNAME="codex"
 WEBUI_PASSWORD="${WEBUI_PASSWORD:-}"
-WEBUI_LOG_LEVEL="${WEBUI_LOG_LEVEL:-1}"
+WEBUI_LOG_LEVEL="1"
 AUTO_LAUNCH_CODEX="${AUTO_LAUNCH_CODEX:-true}"
 CODEX_WEBUI_BYPASS_APPROVALS="${CODEX_WEBUI_BYPASS_APPROVALS:-true}"
 MCP_URL="${UNRAID_MCP_URL:-http://unraid-mcp:6970/mcp}"
@@ -78,12 +76,8 @@ start_webui() {
     --max-clients "${WEBUI_MAX_CLIENTS}"
   )
 
-  if truthy "${WEBUI_AUTH}"; then
-    [ -n "${WEBUI_PASSWORD}" ] || die "WEBUI_AUTH is enabled, but WEBUI_PASSWORD is empty"
-    ttyd_args+=(--credential "${WEBUI_USERNAME}:${WEBUI_PASSWORD}")
-  else
-    echo "codex-web-terminal: warning: WEBUI_AUTH is disabled; the WebUI exposes a shell to anyone who can reach the port" >&2
-  fi
+  [ -n "${WEBUI_PASSWORD}" ] || die "WEBUI_PASSWORD is required"
+  ttyd_args+=(--credential "${WEBUI_USERNAME}:${WEBUI_PASSWORD}")
 
   run_as_codex ttyd "${ttyd_args[@]}" tmux attach-session -t "${SESSION_NAME}" &
   webui_pid="$!"
@@ -103,10 +97,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 [ -s "${SSHD_CONFIG}" ] || die "runtime sshd_config is missing; entrypoint did not finish setup"
-
-if ! truthy "${WEBUI_ENABLED}"; then
-  exec /usr/sbin/sshd -D -e -f "${SSHD_CONFIG}"
-fi
 
 start_sshd
 start_tmux_session

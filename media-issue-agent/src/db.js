@@ -444,6 +444,46 @@ ON CONFLICT(key) DO UPDATE SET
   return getSetting(dbPath, key);
 }
 
+function insertAuditEvents(database, auditEvents) {
+  for (const { eventType, payload, jobId = null } of auditEvents) {
+    database.exec(sql`
+INSERT INTO audit_events (job_id, event_type, redacted_payload_json)
+VALUES (${jobId}, ${eventType}, ${JSON.stringify(payload)});
+`);
+  }
+}
+
+export function setSettingWithAuditEvents(dbPath, key, value, auditEvents = []) {
+  return sqliteTransaction(dbPath, database => {
+    database.exec(sql`
+INSERT INTO settings (key, value_json)
+VALUES (${key}, ${JSON.stringify(value)})
+ON CONFLICT(key) DO UPDATE SET
+  value_json = excluded.value_json,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+`);
+    insertAuditEvents(database, auditEvents);
+    return value;
+  });
+}
+
+export function deleteSetting(dbPath, key) {
+  sqliteExec(dbPath, sql`
+DELETE FROM settings
+WHERE key = ${key};
+`);
+}
+
+export function deleteSettingWithAuditEvents(dbPath, key, auditEvents = []) {
+  sqliteTransaction(dbPath, database => {
+    database.exec(sql`
+DELETE FROM settings
+WHERE key = ${key};
+`);
+    insertAuditEvents(database, auditEvents);
+  });
+}
+
 export function insertSnapshot(dbPath, markdown, entries) {
   const sourceHash = stableHash(entries.map(entry => ({
     source: entry.source,

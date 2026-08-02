@@ -14,9 +14,6 @@ ARG TTYD_VERSION=1.7.7
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CODEX_NPM_VERSION=${CODEX_NPM_VERSION} \
-    CODEX_UPDATE_ON_START=true \
-    CODEX_UPDATE_ON_START_TIMEOUT=180 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -84,6 +81,7 @@ RUN set -euo pipefail; \
     actual_undici_version="$(node -p "require('${npm_root}/npm/node_modules/undici/package.json').version")"; \
     test "${actual_undici_version}" = "${NPM_UNDICI_VERSION}"; \
     rm -f "/tmp/undici-${NPM_UNDICI_VERSION}.tgz"; \
+    ln -sfn "$(readlink -f "$(command -v codex)")" /usr/local/bin/codex-bundled; \
     npm cache clean --force
 
 RUN groupmod -n codex node \

@@ -10,21 +10,13 @@ ARG NPM_UNDICI_VERSION=6.27.0
 ARG NPM_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
 
 ENV NODE_ENV=production \
-    CODEX_HOME=/codex-home \
-    ISSUE_AGENT_DB_PATH=/state/media-issue-agent.sqlite \
-    ISSUE_AGENT_REPAIR_WORKSPACE_ROOT=/state/repair-workspaces \
-    ISSUE_AGENT_REPAIR_CONTEXT= \
+    CODEX_HOME=/config/codex \
+    ISSUE_AGENT_DB_PATH=/config/state/media-issue-agent.sqlite \
     ISSUE_AGENT_MEDIA_MCP_URL=http://media-mcp:6971/mcp \
-    ISSUE_AGENT_POLL_INTERVAL_SECONDS=300 \
-    ISSUE_AGENT_SNAPSHOT_RETENTION=200 \
     ISSUE_AGENT_WEB_ENABLED=true \
     ISSUE_AGENT_WEB_HOST=0.0.0.0 \
     ISSUE_AGENT_WEB_PORT=6983 \
     ISSUE_AGENT_WEB_USERNAME=operator \
-    ISSUE_AGENT_CODEX_MODEL=gpt-5.5 \
-    ISSUE_AGENT_CODEX_REASONING_EFFORT=xhigh \
-    ISSUE_AGENT_CODEX_FAST_MODE=true \
-    ISSUE_AGENT_CODEX_SERVICE_TIER=fast \
     ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS=14400000 \
     ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS=300000 \
     ISSUE_AGENT_SLACK_ENABLED=false \
@@ -69,8 +61,8 @@ RUN set -e; \
 
 COPY media-issue-agent/src ./src
 
-RUN mkdir -p /state /codex-home /tmp/media-issue-agent-workspace \
-    && chown -R agent:agent /app /state /codex-home /tmp/media-issue-agent-workspace
+RUN mkdir -p /config/state /config/codex /tmp/media-issue-agent-workspace \
+    && chown -R agent:agent /app /config /tmp/media-issue-agent-workspace
 
 USER agent
 

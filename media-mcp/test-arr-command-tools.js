@@ -1761,6 +1761,10 @@ async function run() {
     assert.equal(archiveEnvironment.visiblePath, tempRoot);
     assert.equal(archiveEnvironment.writeCheck.skipped, true);
     assert.ok(Array.isArray(archiveEnvironment.blockers));
+    assert.deepEqual(
+      archiveEnvironment.mediaPathMaps.filter(mapping => mapping.source === "/downloads"),
+      [{ source: "/downloads", target: tempRoot }]
+    );
 
     const queue = await tool("sonarr_queue", { limit: 5 });
     const escapedQueueItem = queue.records.find(record => record.id === 1003);

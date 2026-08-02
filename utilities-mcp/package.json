@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Optional utility monitoring MCP sidecar for Unraid Addons.",
   "scripts": {
-    "check": "node --check server.js"
+    "check": "node --check server.js && node --check test-scrutiny-url.js",
+    "test:scrutiny-url": "node test-scrutiny-url.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

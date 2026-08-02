@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -44,17 +45,7 @@ EXPECTED_STABLE_CONFIGS = {
             "/mnt/user/appdata/codex-terminal",
         ),
         "Unraid MCP Bearer Token": ("UNRAID_MCP_BEARER_TOKEN", "", ""),
-        "Media MCP URL": (
-            "MEDIA_MCP_URL",
-            "http://media-mcp:6971/mcp",
-            "http://media-mcp:6971/mcp",
-        ),
         "Media MCP Bearer Token": ("MEDIA_MCP_BEARER_TOKEN", "", ""),
-        "Utilities MCP URL": (
-            "UTILITIES_MCP_URL",
-            "http://utilities-mcp:6972/mcp",
-            "http://utilities-mcp:6972/mcp",
-        ),
         "Utilities MCP Bearer Token": ("UTILITIES_MCP_BEARER_TOKEN", "", ""),
     },
     "unraid-mcp.xml": {
@@ -68,11 +59,6 @@ EXPECTED_STABLE_CONFIGS = {
             "/mnt/user/appdata/unraid-mcp/logs",
             "/mnt/user/appdata/unraid-mcp/logs",
         ),
-        "Backups": (
-            "/app/backups",
-            "/mnt/user/appdata/unraid-mcp/backups",
-            "/mnt/user/appdata/unraid-mcp/backups",
-        ),
         "Unraid API URL": (
             "UNRAID_API_URL",
             "http://tower.local/graphql",
@@ -80,57 +66,31 @@ EXPECTED_STABLE_CONFIGS = {
         ),
         "Unraid API Key": ("UNRAID_API_KEY", "", ""),
         "Unraid MCP Bearer Token": ("UNRAID_MCP_BEARER_TOKEN", "", ""),
-        "MCP Port": ("UNRAID_MCP_PORT", "6970", "6970"),
     },
     "media-mcp.xml": {
         "Media MCP Bearer Token": ("MEDIA_MCP_BEARER_TOKEN", "", ""),
-        "MCP Host": ("MEDIA_MCP_HOST", "0.0.0.0", "0.0.0.0"),
-        "MCP Port": ("MEDIA_MCP_PORT", "6971", "6971"),
         "Downloads Automation Mount": ("/mnt/unraid/downloads", "", ""),
         "Media Automation Mount": ("/mnt/unraid/media", "", ""),
         "Allowed Media Delete Roots": ("MEDIA_MCP_MEDIA_ROOTS", "", ""),
         "Media MCP Path Maps": ("MEDIA_MCP_PATH_MAPS", "", ""),
     },
     "media-issue-agent.xml": {
-        "State Directory": (
-            "/state",
-            "/mnt/user/appdata/media-issue-agent/state",
-            "/mnt/user/appdata/media-issue-agent/state",
-        ),
-        "Codex Home": (
-            "/codex-home",
-            "/mnt/user/appdata/media-issue-agent/codex",
-            "/mnt/user/appdata/media-issue-agent/codex",
+        "Appdata": (
+            "/config",
+            "/mnt/user/appdata/media-issue-agent",
+            "/mnt/user/appdata/media-issue-agent",
         ),
         "WebUI Port": ("6983", "6983", "6983"),
-        "Media MCP URL": (
-            "ISSUE_AGENT_MEDIA_MCP_URL",
-            "http://media-mcp:6971/mcp",
-            "http://media-mcp:6971/mcp",
-        ),
         "Media MCP Bearer Token": (
             "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN",
             "",
             "",
         ),
-        "Codex Home Env": ("CODEX_HOME", "/codex-home", "/codex-home"),
-        "DB Path": (
-            "ISSUE_AGENT_DB_PATH",
-            "/state/media-issue-agent.sqlite",
-            "/state/media-issue-agent.sqlite",
-        ),
-        "Repair Workspace Root": (
-            "ISSUE_AGENT_REPAIR_WORKSPACE_ROOT",
-            "/state/repair-workspaces",
-            "/state/repair-workspaces",
-        ),
+        "WebUI Password": ("ISSUE_AGENT_WEB_PASSWORD", "", ""),
     },
     "utilities-mcp.xml": {
         "Utilities MCP Bearer Token": ("UTILITIES_MCP_BEARER_TOKEN", "", ""),
-        "MCP Host": ("UTILITIES_MCP_HOST", "0.0.0.0", "0.0.0.0"),
-        "MCP Port": ("UTILITIES_MCP_PORT", "6972", "6972"),
         "Scrutiny URL": ("SCRUTINY_URL", "", ""),
-        "Scrutiny Base Path": ("SCRUTINY_BASE_PATH", "", ""),
     },
 }
 
@@ -144,42 +104,23 @@ EXPECTED_TEMPLATE_TARGETS = {
         "SSH_AUTHORIZED_KEYS",
         "SSH_PASSWORD_LOGIN",
         "SSH_PASSWORD",
-        "SSH_PASSWORD_HASH",
-        "WEBUI_ENABLED",
-        "WEBUI_AUTH",
-        "WEBUI_USERNAME",
         "WEBUI_PASSWORD",
-        "WEBUI_MAX_CLIENTS",
-        "WEBUI_TMUX_SESSION",
-        "WEBUI_LOG_LEVEL",
         "AUTO_LAUNCH_CODEX",
         "CODEX_WEBUI_BYPASS_APPROVALS",
-        "CODEX_UPDATE_ON_START",
-        "CODEX_NPM_VERSION",
-        "CODEX_UPDATE_ON_START_TIMEOUT",
         "CODEX_MEDIA_PATH_MAPS",
         "UNRAID_MCP_BEARER_TOKEN",
-        "MEDIA_MCP_URL",
         "MEDIA_MCP_BEARER_TOKEN",
-        "UTILITIES_MCP_URL",
         "UTILITIES_MCP_BEARER_TOKEN",
     ),
     "unraid-mcp.xml": (
         "/home/mcp/.unraid-mcp",
         "/app/logs",
-        "/app/backups",
         "UNRAID_API_URL",
         "UNRAID_API_KEY",
         "UNRAID_MCP_BEARER_TOKEN",
-        "UNRAID_MCP_TRANSPORT",
-        "UNRAID_MCP_HOST",
-        "UNRAID_MCP_PORT",
     ),
     "media-mcp.xml": (
         "MEDIA_MCP_BEARER_TOKEN",
-        "MEDIA_MCP_HOST",
-        "MEDIA_MCP_PORT",
-        "MEDIA_MCP_REQUEST_TIMEOUT_MS",
         "/mnt/unraid/downloads",
         "/mnt/unraid/media",
         "MEDIA_MCP_MEDIA_ROOTS",
@@ -212,28 +153,10 @@ EXPECTED_TEMPLATE_TARGETS = {
         "SEERR_API_KEY",
     ),
     "media-issue-agent.xml": (
-        "/state",
-        "/codex-home",
+        "/config",
         "6983",
-        "ISSUE_AGENT_MEDIA_MCP_URL",
         "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN",
-        "ISSUE_AGENT_WEB_USERNAME",
         "ISSUE_AGENT_WEB_PASSWORD",
-        "CODEX_HOME",
-        "ISSUE_AGENT_DB_PATH",
-        "ISSUE_AGENT_REPAIR_WORKSPACE_ROOT",
-        "ISSUE_AGENT_REPAIR_CONTEXT",
-        "ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME",
-        "ISSUE_AGENT_POLL_INTERVAL_SECONDS",
-        "ISSUE_AGENT_SNAPSHOT_RETENTION",
-        "ISSUE_AGENT_CODEX_MODEL",
-        "ISSUE_AGENT_CODEX_REASONING_EFFORT",
-        "ISSUE_AGENT_CODEX_FAST_MODE",
-        "ISSUE_AGENT_CODEX_SERVICE_TIER",
-        "ISSUE_AGENT_CODEX_ENV_ALLOWLIST",
-        "ISSUE_AGENT_WEB_ENABLED",
-        "ISSUE_AGENT_WEB_HOST",
-        "ISSUE_AGENT_WEB_PORT",
         "ISSUE_AGENT_PUSHOVER_APP_TOKEN",
         "ISSUE_AGENT_PUSHOVER_USER_KEY",
         "ISSUE_AGENT_SLACK_ENABLED",
@@ -244,12 +167,48 @@ EXPECTED_TEMPLATE_TARGETS = {
     ),
     "utilities-mcp.xml": (
         "UTILITIES_MCP_BEARER_TOKEN",
-        "UTILITIES_MCP_HOST",
-        "UTILITIES_MCP_PORT",
-        "UTILITIES_MCP_REQUEST_TIMEOUT_MS",
         "SCRUTINY_URL",
-        "SCRUTINY_BASE_PATH",
     ),
+}
+
+EXPECTED_ALWAYS_TARGETS = {
+    "codex-terminal.xml": ("2222", "7681", "/config", "SSH_AUTHORIZED_KEYS", "WEBUI_PASSWORD", "UNRAID_MCP_BEARER_TOKEN"),
+    "unraid-mcp.xml": ("UNRAID_API_URL", "UNRAID_API_KEY", "UNRAID_MCP_BEARER_TOKEN"),
+    "media-mcp.xml": ("MEDIA_MCP_BEARER_TOKEN", "SONARR_URL", "SONARR_API_KEY", "RADARR_URL", "RADARR_API_KEY", "PLEX_URL", "PLEX_TOKEN"),
+    "media-issue-agent.xml": ("/config", "6983", "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEB_PASSWORD"),
+    "utilities-mcp.xml": ("UTILITIES_MCP_BEARER_TOKEN", "SCRUTINY_URL"),
+}
+
+EXPECTED_REQUIRED_TARGETS = {
+    "codex-terminal.xml": {"2222", "7681", "/config", "WEBUI_PASSWORD", "UNRAID_MCP_BEARER_TOKEN"},
+    "unraid-mcp.xml": {"/home/mcp/.unraid-mcp", "UNRAID_API_URL", "UNRAID_API_KEY", "UNRAID_MCP_BEARER_TOKEN"},
+    "media-mcp.xml": {"MEDIA_MCP_BEARER_TOKEN"},
+    "media-issue-agent.xml": {"/config", "6983", "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEB_PASSWORD"},
+    "utilities-mcp.xml": {"UTILITIES_MCP_BEARER_TOKEN", "SCRUTINY_URL"},
+}
+
+EXPECTED_MASKED_TARGETS = {
+    "codex-terminal.xml": {"SSH_PASSWORD", "WEBUI_PASSWORD", "UNRAID_MCP_BEARER_TOKEN", "MEDIA_MCP_BEARER_TOKEN", "UTILITIES_MCP_BEARER_TOKEN"},
+    "unraid-mcp.xml": {"UNRAID_API_KEY", "UNRAID_MCP_BEARER_TOKEN"},
+    "media-mcp.xml": {"MEDIA_MCP_BEARER_TOKEN", "SONARR_API_KEY", "RADARR_API_KEY", "PLEX_TOKEN", "TAUTULLI_API_KEY", "TRACEARR_API_KEY", "THREADFIN_PASSWORD", "THREADFIN_TOKEN", "BAZARR_API_KEY", "PROWLARR_API_KEY", "QBITTORRENT_PASSWORD", "NZBGET_PASSWORD", "SEERR_API_KEY"},
+    "media-issue-agent.xml": {"ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEB_PASSWORD", "ISSUE_AGENT_PUSHOVER_APP_TOKEN", "ISSUE_AGENT_PUSHOVER_USER_KEY", "ISSUE_AGENT_SLACK_APP_TOKEN", "ISSUE_AGENT_SLACK_BOT_TOKEN", "ISSUE_AGENT_OPENAI_MODERATION_API_KEY"},
+    "utilities-mcp.xml": {"UTILITIES_MCP_BEARER_TOKEN"},
+}
+
+EXPECTED_PATH_MODES = {
+    "codex-terminal.xml": {"/config": "rw", "/mnt/unraid/media": "ro", "/mnt/unraid/downloads": "rw"},
+    "unraid-mcp.xml": {"/home/mcp/.unraid-mcp": "rw", "/app/logs": "rw"},
+    "media-mcp.xml": {"/mnt/unraid/downloads": "rw", "/mnt/unraid/media": "rw"},
+    "media-issue-agent.xml": {"/config": "rw"},
+    "utilities-mcp.xml": {},
+}
+
+EXPECTED_PORT_TARGETS = {
+    "codex-terminal.xml": {"2222", "7681"},
+    "unraid-mcp.xml": set(),
+    "media-mcp.xml": set(),
+    "media-issue-agent.xml": {"6983"},
+    "utilities-mcp.xml": set(),
 }
 
 EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
@@ -257,44 +216,39 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
         "SSH_AUTHORIZED_KEYS",
         "SSH_PASSWORD_LOGIN",
         "SSH_PASSWORD",
-        "SSH_PASSWORD_HASH",
-        "UNRAID_MCP_BEARER_TOKEN",
-        "MEDIA_MCP_URL",
-        "MEDIA_MCP_BEARER_TOKEN",
-        "UTILITIES_MCP_URL",
-        "UTILITIES_MCP_BEARER_TOKEN",
-        "WEBUI_ENABLED",
-        "WEBUI_AUTH",
-        "WEBUI_USERNAME",
         "WEBUI_PASSWORD",
-        "WEBUI_PORT",
-        "WEBUI_MAX_CLIENTS",
-        "WEBUI_TMUX_SESSION",
-        "WEBUI_LOG_LEVEL",
         "AUTO_LAUNCH_CODEX",
         "CODEX_WEBUI_BYPASS_APPROVALS",
-        "CODEX_UPDATE_ON_START",
-        "CODEX_NPM_VERSION",
-        "CODEX_UPDATE_ON_START_TIMEOUT",
         "CODEX_MEDIA_PATH_MAPS",
+        "UNRAID_MCP_BEARER_TOKEN",
+        "MEDIA_MCP_BEARER_TOKEN",
+        "UTILITIES_MCP_BEARER_TOKEN",
     ),
     "unraid-mcp": (
         "UNRAID_API_URL",
         "UNRAID_API_KEY",
         "UNRAID_MCP_BEARER_TOKEN",
-        "UNRAID_MCP_TRANSPORT",
-        "UNRAID_MCP_HOST",
-        "UNRAID_MCP_PORT",
     ),
     "media-mcp": (
         "MEDIA_MCP_BEARER_TOKEN",
-        "MEDIA_MCP_HOST",
-        "MEDIA_MCP_PORT",
-        "MEDIA_MCP_REQUEST_TIMEOUT_MS",
+        "MEDIA_MCP_MEDIA_ROOTS",
+        "MEDIA_MCP_PATH_MAPS",
         "SONARR_URL",
         "SONARR_API_KEY",
         "RADARR_URL",
         "RADARR_API_KEY",
+        "PLEX_URL",
+        "PLEX_TOKEN",
+        "TAUTULLI_URL",
+        "TAUTULLI_API_KEY",
+        "TRACEARR_URL",
+        "TRACEARR_API_KEY",
+        "THREADFIN_URL",
+        "THREADFIN_USERNAME",
+        "THREADFIN_PASSWORD",
+        "THREADFIN_TOKEN",
+        "BAZARR_URL",
+        "BAZARR_API_KEY",
         "PROWLARR_URL",
         "PROWLARR_API_KEY",
         "QBITTORRENT_URL",
@@ -305,44 +259,9 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
         "NZBGET_PASSWORD",
         "SEERR_URL",
         "SEERR_API_KEY",
-        "PLEX_URL",
-        "PLEX_TOKEN",
-        "TAUTULLI_URL",
-        "TAUTULLI_API_KEY",
-        "TRACEARR_URL",
-        "TRACEARR_API_KEY",
-        "BAZARR_URL",
-        "BAZARR_API_KEY",
-        "THREADFIN_URL",
-        "THREADFIN_USERNAME",
-        "THREADFIN_PASSWORD",
-        "THREADFIN_TOKEN",
-        "MEDIA_MCP_PATH_MAPS",
-        "MEDIA_MCP_MEDIA_ROOTS",
     ),
     "media-issue-agent": (
-        "CODEX_HOME",
-        "ISSUE_AGENT_MEDIA_MCP_URL",
         "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN",
-        "ISSUE_AGENT_DB_PATH",
-        "ISSUE_AGENT_LOG_PATH",
-        "ISSUE_AGENT_REPAIR_WORKSPACE_ROOT",
-        "ISSUE_AGENT_REPAIR_CONTEXT",
-        "ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME",
-        "ISSUE_AGENT_POLL_INTERVAL_SECONDS",
-        "ISSUE_AGENT_SNAPSHOT_RETENTION",
-        "ISSUE_AGENT_CODEX_MODEL",
-        "ISSUE_AGENT_CODEX_REASONING_EFFORT",
-        "ISSUE_AGENT_CODEX_FAST_MODE",
-        "ISSUE_AGENT_CODEX_SERVICE_TIER",
-        "ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS",
-        "ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS",
-        "ISSUE_AGENT_RECOVER_STALE_RUN_SECONDS",
-        "ISSUE_AGENT_CODEX_ENV_ALLOWLIST",
-        "ISSUE_AGENT_WEB_ENABLED",
-        "ISSUE_AGENT_WEB_HOST",
-        "ISSUE_AGENT_WEB_PORT",
-        "ISSUE_AGENT_WEB_USERNAME",
         "ISSUE_AGENT_WEB_PASSWORD",
         "ISSUE_AGENT_PUSHOVER_APP_TOKEN",
         "ISSUE_AGENT_PUSHOVER_USER_KEY",
@@ -354,12 +273,24 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
     ),
     "utilities-mcp": (
         "UTILITIES_MCP_BEARER_TOKEN",
-        "UTILITIES_MCP_HOST",
-        "UTILITIES_MCP_PORT",
-        "UTILITIES_MCP_REQUEST_TIMEOUT_MS",
         "SCRUTINY_URL",
-        "SCRUTINY_BASE_PATH",
     ),
+}
+
+FORBIDDEN_DEPLOYMENT_KEYS = {
+    "SSH_PASSWORD_HASH", "WEBUI_ENABLED", "WEBUI_AUTH", "WEBUI_USERNAME", "WEBUI_PORT",
+    "WEBUI_MAX_CLIENTS", "WEBUI_TMUX_SESSION", "WEBUI_LOG_LEVEL", "CODEX_UPDATE_ON_START",
+    "CODEX_NPM_VERSION", "CODEX_UPDATE_ON_START_TIMEOUT", "MEDIA_MCP_URL", "UTILITIES_MCP_URL",
+    "UNRAID_MCP_TRANSPORT", "UNRAID_MCP_HOST", "UNRAID_MCP_PORT", "UNRAID_MCP_BACKUP_DIR",
+    "MEDIA_MCP_HOST", "MEDIA_MCP_PORT", "MEDIA_MCP_REQUEST_TIMEOUT_MS", "ISSUE_AGENT_MEDIA_MCP_URL",
+    "CODEX_HOME", "ISSUE_AGENT_DB_PATH", "ISSUE_AGENT_LOG_PATH", "ISSUE_AGENT_REPAIR_WORKSPACE_ROOT",
+    "ISSUE_AGENT_REPAIR_CONTEXT", "ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME", "ISSUE_AGENT_POLL_INTERVAL_SECONDS",
+    "ISSUE_AGENT_SNAPSHOT_RETENTION", "ISSUE_AGENT_CODEX_MODEL", "ISSUE_AGENT_CODEX_REASONING_EFFORT",
+    "ISSUE_AGENT_CODEX_FAST_MODE", "ISSUE_AGENT_CODEX_SERVICE_TIER", "ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS",
+    "ISSUE_AGENT_MCP_REQUEST_TIMEOUT_MS", "ISSUE_AGENT_RECOVER_STALE_RUN_SECONDS", "ISSUE_AGENT_CODEX_ENV_ALLOWLIST",
+    "ISSUE_AGENT_WEB_ENABLED", "ISSUE_AGENT_WEB_HOST", "ISSUE_AGENT_WEB_PORT", "ISSUE_AGENT_WEB_USERNAME",
+    "ISSUE_AGENT_STATE_DIR", "ISSUE_AGENT_CODEX_HOME", "UTILITIES_MCP_HOST", "UTILITIES_MCP_PORT",
+    "UTILITIES_MCP_REQUEST_TIMEOUT_MS", "SCRUTINY_BASE_PATH", "CODEX_MEDIA_LIBRARY_DIR", "CODEX_DOWNLOADS_DIR",
 }
 
 
@@ -450,6 +381,58 @@ for template_name, expected_targets in EXPECTED_TEMPLATE_TARGETS.items():
         [config.get("Target") for config in template.findall("Config")],
         expected_targets,
     )
+    configs = template.findall("Config")
+    always_targets = set(EXPECTED_ALWAYS_TARGETS[template_name])
+    required_targets = EXPECTED_REQUIRED_TARGETS[template_name]
+    masked_targets = EXPECTED_MASKED_TARGETS[template_name]
+    path_modes = EXPECTED_PATH_MODES[template_name]
+    port_targets = EXPECTED_PORT_TARGETS[template_name]
+    for config in configs:
+        target = config.get("Target") or ""
+        location = f"templates/{template_name} target {target!r}"
+        expected_display = (
+            "always"
+            if target in always_targets
+            else "advanced-hide"
+            if template_name == "codex-terminal.xml" and target == "SSH_PASSWORD"
+            else "advanced"
+        )
+        require_equal(f"{location} Display", config.get("Display"), expected_display)
+        require_equal(
+            f"{location} Required",
+            config.get("Required"),
+            "true" if target in required_targets else "false",
+        )
+        require_equal(
+            f"{location} Mask",
+            config.get("Mask"),
+            "true" if target in masked_targets else "false",
+        )
+        if target in path_modes:
+            expected_type, expected_mode = "Path", path_modes[target]
+        elif target in port_targets:
+            expected_type, expected_mode = "Port", "tcp"
+        else:
+            expected_type, expected_mode = "Variable", ""
+        require_equal(f"{location} Type", config.get("Type"), expected_type)
+        require_equal(f"{location} Mode", config.get("Mode"), expected_mode)
+        if target in masked_targets and (
+            config.get("Default", "").strip() or (config.text or "").strip()
+        ):
+            errors.append(f"{location} is secret and must have an empty default/value")
+    actual_always = tuple(
+        config.get("Target") for config in configs if config.get("Display") == "always"
+    )
+    require_sequence(
+        f"templates/{template_name} routine Config targets",
+        list(actual_always),
+        EXPECTED_ALWAYS_TARGETS[template_name],
+    )
+
+if sum(len(targets) for targets in EXPECTED_TEMPLATE_TARGETS.values()) != 64:
+    errors.append("validator template contract must contain exactly 64 Config targets")
+if sum(len(targets) for targets in EXPECTED_ALWAYS_TARGETS.values()) != 22:
+    errors.append("validator template contract must contain exactly 22 routine targets")
 
 
 def require_empty_defaults(template_name: str, config_names: tuple[str, ...]) -> None:
@@ -524,18 +507,11 @@ for stable_compose_fragment in (
     '"${CODEX_SSH_PORT:-2222}:2222/tcp"',
     '"${CODEX_WEBUI_PORT:-7681}:7681/tcp"',
     '"${ISSUE_AGENT_WEBUI_PORT:-6983}:6983/tcp"',
-    "MEDIA_MCP_URL: ${MEDIA_MCP_URL:-http://media-mcp:6971/mcp}",
-    "UTILITIES_MCP_URL: ${UTILITIES_MCP_URL:-http://utilities-mcp:6972/mcp}",
-    "ISSUE_AGENT_MEDIA_MCP_URL: "
-    "${ISSUE_AGENT_MEDIA_MCP_URL:-http://media-mcp:6971/mcp}",
     "${CODEX_CONFIG_DIR:-./data/codex-terminal}:/config:rw",
     "${UNRAID_MCP_STATE_DIR:-./data/unraid-mcp/state}:"
     "/home/mcp/.unraid-mcp:rw",
     "${UNRAID_MCP_LOG_DIR:-./data/unraid-mcp/logs}:/app/logs:rw",
-    "${UNRAID_MCP_BACKUP_DIR:-./data/unraid-mcp/backups}:/app/backups:rw",
-    "${ISSUE_AGENT_STATE_DIR:-./data/media-issue-agent/state}:/state:rw",
-    "${ISSUE_AGENT_CODEX_HOME:-./data/media-issue-agent/codex}:"
-    "/codex-home:rw",
+    "${ISSUE_AGENT_CONFIG_DIR:-./data/media-issue-agent}:/config:rw",
 ):
     require_count(
         "docker-compose.yml stable runtime interfaces",
@@ -569,9 +545,80 @@ for service, expected_keys in EXPECTED_COMPOSE_ENVIRONMENT_KEYS.items():
         expected_keys,
     )
 
+template_for_service = {
+    "codex-terminal": "codex-terminal.xml",
+    "unraid-mcp": "unraid-mcp.xml",
+    "media-mcp": "media-mcp.xml",
+    "media-issue-agent": "media-issue-agent.xml",
+    "utilities-mcp": "utilities-mcp.xml",
+}
+for service, template_name in template_for_service.items():
+    template = parsed_templates.get(template_name)
+    if template is None:
+        continue
+    template_variables = [
+        config.get("Target")
+        for config in template.findall("Config")
+        if config.get("Type") == "Variable"
+    ]
+    require_sequence(
+        f"template/Compose environment parity for {service}",
+        template_variables,
+        EXPECTED_COMPOSE_ENVIRONMENT_KEYS[service],
+    )
+
+deployment_targets = {
+    config.get("Target")
+    for template in parsed_templates.values()
+    for config in template.findall("Config")
+}
+compose_keys = {
+    key for keys in compose_environment_keys.values() for key in keys if key is not None
+}
+for forbidden_key in sorted(FORBIDDEN_DEPLOYMENT_KEYS):
+    if forbidden_key in deployment_targets or forbidden_key in compose_keys:
+        errors.append(f"removed deployment key {forbidden_key!r} is still exposed")
+for forbidden_fragment in ("/app/backups", ":/state:rw", ":/codex-home:rw"):
+    require_count("docker-compose.yml removed mounts", compose, forbidden_fragment, 0)
+
 environment = (ROOT / ".env.example").read_text(encoding="utf-8")
 for variable, image in expected_compose_images.items():
     require_count(".env.example", environment, f"{variable}={image}", 1)
+
+expected_environment_keys = (
+    "CODEX_TERMINAL_IMAGE", "UNRAID_MCP_IMAGE", "MEDIA_MCP_IMAGE", "UTILITIES_MCP_IMAGE", "ISSUE_AGENT_IMAGE",
+    "CODEX_SSH_PORT", "SSH_AUTHORIZED_KEYS", "SSH_PASSWORD_LOGIN", "SSH_PASSWORD", "CODEX_WEBUI_PORT",
+    "WEBUI_PASSWORD", "AUTO_LAUNCH_CODEX", "CODEX_WEBUI_BYPASS_APPROVALS", "CODEX_MEDIA_PATH_MAPS",
+    "UNRAID_MCP_BEARER_TOKEN", "MEDIA_MCP_BEARER_TOKEN", "UTILITIES_MCP_BEARER_TOKEN", "UNRAID_API_URL", "UNRAID_API_KEY",
+    "MEDIA_MCP_DOWNLOADS_DIR", "MEDIA_MCP_MEDIA_DIR", "MEDIA_MCP_MEDIA_ROOTS", "MEDIA_MCP_PATH_MAPS",
+    "SONARR_URL", "SONARR_API_KEY", "RADARR_URL", "RADARR_API_KEY", "PLEX_URL", "PLEX_TOKEN",
+    "TAUTULLI_URL", "TAUTULLI_API_KEY", "TRACEARR_URL", "TRACEARR_API_KEY", "THREADFIN_URL", "THREADFIN_USERNAME",
+    "THREADFIN_PASSWORD", "THREADFIN_TOKEN", "BAZARR_URL", "BAZARR_API_KEY", "PROWLARR_URL", "PROWLARR_API_KEY",
+    "QBITTORRENT_URL", "QBITTORRENT_USERNAME", "QBITTORRENT_PASSWORD", "NZBGET_URL", "NZBGET_USERNAME",
+    "NZBGET_PASSWORD", "SEERR_URL", "SEERR_API_KEY", "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEBUI_PORT",
+    "ISSUE_AGENT_WEB_PASSWORD", "ISSUE_AGENT_PUSHOVER_APP_TOKEN", "ISSUE_AGENT_PUSHOVER_USER_KEY", "ISSUE_AGENT_SLACK_ENABLED",
+    "ISSUE_AGENT_SLACK_APP_TOKEN", "ISSUE_AGENT_SLACK_BOT_TOKEN", "ISSUE_AGENT_SLACK_CHANNEL_ID",
+    "ISSUE_AGENT_OPENAI_MODERATION_API_KEY", "SCRUTINY_URL", "CODEX_CONFIG_DIR", "UNRAID_MCP_STATE_DIR",
+    "UNRAID_MCP_LOG_DIR", "ISSUE_AGENT_CONFIG_DIR",
+)
+environment_keys = [
+    line.split("=", 1)[0]
+    for line in environment.splitlines()
+    if line and not line.startswith("#") and "=" in line
+]
+require_sequence(".env.example keys", environment_keys, expected_environment_keys)
+for forbidden_key in sorted(FORBIDDEN_DEPLOYMENT_KEYS):
+    if forbidden_key in environment_keys:
+        errors.append(f".env.example contains removed key {forbidden_key!r}")
+
+mount_override = (ROOT / "docker-compose.media-paths.yml.example").read_text(encoding="utf-8")
+compose_substitutions = set(re.findall(r"\$\{([A-Z0-9_]+)(?::[^}]*)?\}", compose + mount_override))
+if compose_substitutions != set(environment_keys):
+    errors.append(
+        ".env.example/Compose substitution keys differ: "
+        f"missing={sorted(compose_substitutions - set(environment_keys))!r}, "
+        f"extra={sorted(set(environment_keys) - compose_substitutions)!r}"
+    )
 
 workflow = (ROOT / ".github/workflows/docker.yml").read_text(encoding="utf-8")
 expected_workflow_images = {
@@ -635,6 +682,18 @@ require_count(
 require_count(
     "media-mcp/server.js", media_server, f"{RETIRED_BRAND} Media MCP", 0
 )
+require_count(
+    "media-mcp/server.js standard path map",
+    media_server,
+    'parsePathMaps(`/downloads=/mnt/unraid/downloads,${additionalMediaPathMaps}`)',
+    1,
+)
+require_count(
+    "media-mcp/server.js additive path map input",
+    media_server,
+    'const additionalMediaPathMaps = env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "";',
+    1,
+)
 
 utilities_server = (ROOT / "utilities-mcp/server.js").read_text(encoding="utf-8")
 require_count(
@@ -656,6 +715,78 @@ require_count("entrypoint.sh", entrypoint, 'sync_optional_mcp_server_block "medi
 require_count(
     "entrypoint.sh", entrypoint, 'sync_optional_mcp_server_block "utilities"', 1
 )
+for updater_fragment in (
+    'local update_prefix="/opt/codex-startup-update"',
+    "ln -sfn /usr/local/bin/codex-bundled /usr/local/bin/codex",
+    'timeout 180 npm install -g --prefix "${update_prefix}" "@openai/codex@latest"',
+    'run_as_codex "${update_prefix}/bin/codex" --version',
+    "continuing with bundled version",
+):
+    require_count("entrypoint.sh fixed Codex updater", entrypoint, updater_fragment, 1)
+
+terminal_dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+require_count(
+    "Dockerfile bundled Codex fallback",
+    terminal_dockerfile,
+    "/usr/local/bin/codex-bundled",
+    1,
+)
+web_terminal = (ROOT / "web-terminal.sh").read_text(encoding="utf-8")
+for fixed_web_fragment in (
+    'SESSION_NAME="codex"',
+    'WEBUI_PORT="7681"',
+    'WEBUI_MAX_CLIENTS="5"',
+    'WEBUI_USERNAME="codex"',
+    'WEBUI_LOG_LEVEL="1"',
+    'ttyd_args+=(--credential "${WEBUI_USERNAME}:${WEBUI_PASSWORD}")',
+):
+    require_count("web-terminal.sh fixed WebUI topology", web_terminal, fixed_web_fragment, 1)
+
+issue_dockerfile = (ROOT / "Dockerfile.media-issue-agent").read_text(encoding="utf-8")
+for fixed_issue_fragment in (
+    "CODEX_HOME=/config/codex",
+    "ISSUE_AGENT_DB_PATH=/config/state/media-issue-agent.sqlite",
+    "ISSUE_AGENT_MEDIA_MCP_URL=http://media-mcp:6971/mcp",
+    "ISSUE_AGENT_WEB_HOST=0.0.0.0",
+    "ISSUE_AGENT_WEB_PORT=6983",
+    "ISSUE_AGENT_WEB_USERNAME=operator",
+    "mkdir -p /config/state /config/codex",
+):
+    require_count(
+        "Dockerfile.media-issue-agent fixed paths/topology",
+        issue_dockerfile,
+        fixed_issue_fragment,
+        1,
+    )
+
+for dockerfile_name, fixed_fragments in {
+    "Dockerfile.unraid-mcp": (
+        "UNRAID_MCP_TRANSPORT=streamable-http",
+        "UNRAID_MCP_HOST=0.0.0.0",
+        "UNRAID_MCP_PORT=6970",
+    ),
+    "Dockerfile.media-mcp": (
+        "MEDIA_MCP_HOST=0.0.0.0",
+        "MEDIA_MCP_PORT=6971",
+        "MEDIA_MCP_REQUEST_TIMEOUT_MS=30000",
+    ),
+    "Dockerfile.utilities-mcp": (
+        "UTILITIES_MCP_HOST=0.0.0.0",
+        "UTILITIES_MCP_PORT=6972",
+        "UTILITIES_MCP_REQUEST_TIMEOUT_MS=30000",
+    ),
+}.items():
+    dockerfile_text = (ROOT / dockerfile_name).read_text(encoding="utf-8")
+    for fragment in fixed_fragments:
+        require_count(f"{dockerfile_name} fixed topology", dockerfile_text, fragment, 1)
+
+for no_backup_path in ("Dockerfile.unraid-mcp", "unraid-mcp-entrypoint.sh"):
+    require_count(
+        f"{no_backup_path} removed backup directory",
+        (ROOT / no_backup_path).read_text(encoding="utf-8"),
+        "/app/backups",
+        0,
+    )
 
 issue_agent_codex = (ROOT / "media-issue-agent/src/codex.js").read_text(
     encoding="utf-8"
@@ -720,6 +851,15 @@ if mount_override.count("create_host_path: false") != 2:
         "docker-compose.media-paths.yml.example must prevent Docker from "
         "creating both optional host paths"
     )
+if mount_override.count("read_only: false") != 2 or "read_only: true" in mount_override:
+    errors.append(
+        "docker-compose.media-paths.yml.example must mount both media-mcp "
+        "automation paths read/write"
+    )
+if mount_override.count("target: /mnt/unraid/downloads") != 1:
+    errors.append("media path override must mount downloads exactly once")
+if mount_override.count("target: /mnt/unraid/media") != 1:
+    errors.append("media path override must mount media exactly once")
 for required_variable in ("MEDIA_MCP_DOWNLOADS_DIR:?", "MEDIA_MCP_MEDIA_DIR:?"):
     if required_variable not in mount_override:
         errors.append(

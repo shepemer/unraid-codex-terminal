@@ -355,6 +355,7 @@ async function run() {
     const toolNames = new Set(tools.result.tools.map(toolInfo => toolInfo.name));
     const toolsByName = new Map(tools.result.tools.map(toolInfo => [toolInfo.name, toolInfo]));
     assert.ok(toolNames.has("media_file_delete"));
+    assert.ok(toolNames.has("media_archive_environment_check"));
     assert.ok(toolNames.has("media_probe_video_content"));
     assert.ok(toolNames.has("plex_delete_metadata"));
     assert.ok(toolNames.has("plex_list_show_seasons"));
@@ -370,6 +371,19 @@ async function run() {
     assert.ok(toolsByName.get("media_probe_video_content").inputSchema.properties.episodeIndex);
     assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /delete\/remove bad-content workflows/);
     assert.match(toolsByName.get("sonarr_blocklist_episode_file_source").description, /content-probe-confirmed bad files/);
+
+    const pathMapEnvironment = await tool("media_archive_environment_check", {
+      downloadsPath: "/downloads",
+      writeTest: false
+    });
+    assert.deepEqual(
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/downloads"),
+      { source: "/downloads", target: "/mnt/unraid/downloads" }
+    );
+    assert.deepEqual(
+      pathMapEnvironment.mediaPathMaps.find(mapping => mapping.source === "/movies"),
+      { source: "/movies", target: mediaRoot }
+    );
 
     const dryFileDelete = await tool("media_file_delete", {
       path: "/movies/Delete Fixture (2026)/Delete Fixture.mkv",
