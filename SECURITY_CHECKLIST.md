@@ -20,13 +20,14 @@ Use this before deploying or publishing the templates.
 - [ ] `media-issue-agent` has `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN` configured and no media app credentials of its own.
 - [ ] `media-issue-agent` has no `OPENAI_API_KEY` or `CODEX_API_KEY`; it uses Codex ChatGPT auth under `/config/codex`.
 - [ ] `media-issue-agent` `/config/codex/auth.json` and `/config/state` are treated as sensitive and are never committed, pasted, or logged.
+- [ ] Trusted server-owner aliases use stable usernames when available; any reporter-name-only alias has been checked for cross-source collisions and accepted as mutable/non-unique authority.
 - [ ] Pushover, Slack, moderation, API-key, password, and bearer-token template fields are masked and have empty defaults.
 - [ ] Integration secrets remain in Unraid environment fields; they are not saved in the issue agent's plaintext SQLite settings table.
 - [ ] Scrutiny endpoints are configured only on `utilities-mcp`.
 - [ ] `UTILITIES_MCP_BEARER_TOKEN` is long, random, and matches `utilities-mcp` and `codex-terminal` when utilities MCP is enabled.
 - [ ] Root SSH login is disabled.
 - [ ] Password SSH login is disabled unless there is a specific need.
-- [ ] If password SSH login is enabled, `SSH_PASSWORD` is strong and unique.
+- [ ] If password SSH login is enabled, exactly one of `SSH_PASSWORD` and `SSH_PASSWORD_HASH` is set; the plaintext password represented by either form is strong and unique.
 - [ ] No container uses `privileged: true`.
 - [ ] No container uses host networking, host PID, host IPC, or host devices.
 - [ ] No container mounts `/var/run/docker.sock`.
@@ -53,7 +54,8 @@ Use this before deploying or publishing the templates.
 - [ ] qBittorrent delete-with-files is treated as destructive and requires explicit confirmation.
 - [ ] Seerr request approval, decline, and delete actions require explicit confirmation.
 - [ ] Sonarr/Radarr add actions use known root folders and quality profiles.
-- [ ] `MEDIA_MCP_PATH_MAPS` contains only additional nonstandard mappings; the standard `/downloads=/mnt/unraid/downloads` mapping remains built in.
+- [ ] Optional `MEDIA_MCP_DOWNLOADS_PATH` and `MEDIA_MCP_MEDIA_PATH` values are absolute service-reported roots backed by the matching narrow mount; blank fields create no path mapping.
+- [ ] Any expert-only legacy `MEDIA_MCP_PATH_MAPS` override is still necessary, maps only narrow mounted paths, and cannot be represented by the two supported fields.
 
 ## Utility App Scope
 
@@ -94,7 +96,7 @@ Use this before deploying or publishing the templates.
 - [ ] Root SSH login fails.
 - [ ] Password SSH login fails by default.
 - [ ] Interactive SSH with a TTY stays connected.
-- [ ] Password SSH login works only after `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD` are set.
+- [ ] Password SSH login works only after `SSH_PASSWORD_LOGIN=true` and exactly one of `SSH_PASSWORD` or `SSH_PASSWORD_HASH` is set.
 - [ ] The `codex` shell user cannot modify global npm packages directly.
 - [ ] The container cannot access `/var/run/docker.sock`.
 - [ ] Recreating `codex-terminal` preserves `/config/.codex`, SSH host keys, authorized keys, and workspace files.

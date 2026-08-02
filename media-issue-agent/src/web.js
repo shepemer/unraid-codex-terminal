@@ -78,10 +78,10 @@ const HTML = `<!doctype html>
             <input id="operations-snapshot-retention" type="number" min="1" step="1" inputmode="numeric">
           </label>
           <label class="compact-field">
-            <span>Trusted server-owner reporter</span>
-            <input id="operations-server-owner-reporter" type="text" maxlength="200" autocomplete="off" placeholder="Optional exact username">
+            <span>Trusted server-owner reporters</span>
+            <input id="operations-server-owner-reporter" type="text" maxlength="200" autocomplete="off" placeholder="Optional: alice, admin, alice-plex">
           </label>
-          <p class="runner-help">Matching reports and comments are treated as trusted server-owner guidance for new or re-run investigations.</p>
+          <p class="runner-help">Comma-separated exact usernames or source-provided reporter names. Matching is case-insensitive; structured usernames take precedence, and Slack is never trusted this way. Reporter-name-only aliases apply across issue sources and may be mutable or non-unique, so add only aliases you have verified.</p>
           <div class="runner-button-row">
             <button id="operations-settings-reset" type="button" class="secondary">Reset Operations</button>
             <button id="operations-settings-save" type="button">Save Operations</button>
@@ -3739,6 +3739,28 @@ function settingSourceLabel(value) {
   }[value] || String(value || "default");
 }
 
+function normalizedReporterNames(value) {
+  const seen = new Set();
+  return String(value || "")
+    .split(",")
+    .map(name => name.trim())
+    .filter(Boolean)
+    .filter(name => {
+      const identity = name.toLowerCase();
+      if (seen.has(identity)) {
+        return false;
+      }
+      seen.add(identity);
+      return true;
+    });
+}
+
+function reporterNameSetsDiffer(previousValue, nextValue) {
+  const previous = new Set(normalizedReporterNames(previousValue).map(name => name.toLowerCase()));
+  const next = new Set(normalizedReporterNames(nextValue).map(name => name.toLowerCase()));
+  return previous.size !== next.size || [...previous].some(name => !next.has(name));
+}
+
 function renderOperationsSettings(settings) {
   state.operationsSettings = settings || null;
   const effective = settings?.effective || settings?.defaults || {};
@@ -3751,7 +3773,7 @@ function renderOperationsSettings(settings) {
   el.operationsSettingsSource.title = [
     "Poll interval: " + settingSourceLabel(sources.pollIntervalSeconds),
     "Snapshot retention: " + settingSourceLabel(sources.snapshotRetention),
-    "Trusted reporter: " + settingSourceLabel(sources.serverOwnerReporterUsername)
+    "Trusted reporters: " + settingSourceLabel(sources.serverOwnerReporterUsername)
   ].join(" · ");
 }
 
@@ -5538,14 +5560,17 @@ async function saveOperationsSettings() {
   if (!el.operationsPollInterval.reportValidity() || !el.operationsSnapshotRetention.reportValidity()) {
     return;
   }
-  const previousUsername = String(state.operationsSettings?.effective?.serverOwnerReporterUsername || "").trim();
-  const nextUsername = el.operationsServerOwnerReporter.value.trim();
-  const trustChanged = Boolean(nextUsername)
-    && previousUsername.toLowerCase() !== nextUsername.toLowerCase();
+  const previousUsername = normalizedReporterNames(
+    state.operationsSettings?.effective?.serverOwnerReporterUsername
+  ).join(", ");
+  const nextReporterNames = normalizedReporterNames(el.operationsServerOwnerReporter.value);
+  const nextUsername = nextReporterNames.join(", ");
+  const trustChanged = nextReporterNames.length > 0
+    && reporterNameSetsDiffer(previousUsername, nextUsername);
   let confirmServerOwnerReporterTrust = false;
   if (trustChanged) {
     confirmServerOwnerReporterTrust = window.confirm(
-      'Trust reports and comments from "' + nextUsername + '" as server-owner guidance for new or re-run investigations?'
+      'Trust reports and comments from these exact reporter identities as server-owner guidance for new or re-run investigations? Reporter-name-only aliases may be mutable or non-unique and apply across issue sources.\\n\\n' + nextUsername
     );
     if (!confirmServerOwnerReporterTrust) {
       return;

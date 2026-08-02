@@ -29,7 +29,7 @@ function configFor(root, codexHome, codexBin, promptLog) {
     codexWorkspace: path.join(root, "codex-workspace"),
     repairWorkspaceRoot: path.join(root, "repair-workspaces"),
     repairContext: "",
-    serverOwnerReporterUsername: "fixture-owner",
+    serverOwnerReporterUsername: "primary-owner, FIXTURE-OWNER",
     mediaMcpUrl: "http://media-mcp.invalid/mcp",
     mediaMcpBearerToken: "fixture-token",
     codexTimeoutMs: 5_000,
@@ -167,9 +167,16 @@ async function testWorkflowLearningAndTrustedReporterGuidance() {
                 ? trustedEntry.description
                 : spoofedEntry.description,
               comments: trusted ? [{
-                user: { username: "fixture-owner" },
+                username: "primary-owner",
                 message: "Prefer a server-side subtitle search and verify the resulting track."
-              }] : []
+              }, {
+                createdBy: { displayName: "FIXTURE-OWNER" },
+                message: "A reporter-name-only identity is also accepted when no username is provided."
+              }] : [{
+                user: { username: "fixture-other", displayName: "primary-owner" },
+                author: { username: "primary-owner" },
+                message: "Spoofed comment guidance must not be trusted."
+              }]
             }
           };
         }
@@ -194,6 +201,7 @@ async function testWorkflowLearningAndTrustedReporterGuidance() {
     assert.equal(trustedInvestigation.evidence.trustedReporterGuidance.source, "configured_server_owner_reporter");
     assert.match(trustedInvestigation.evidence.trustedReporterGuidance.message, /managed subtitle availability/);
     assert.match(trustedInvestigation.evidence.trustedReporterGuidance.message, /server-side subtitle search/);
+    assert.match(trustedInvestigation.evidence.trustedReporterGuidance.message, /reporter-name-only identity/);
 
     const spoofedInvestigation = await agent.investigate(snapshot.id, 2);
     assert.equal(spoofedInvestigation.evidence.trustedReporterGuidance, null);

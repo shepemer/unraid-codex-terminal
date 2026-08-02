@@ -30,16 +30,35 @@ The legacy GHCR packages remain available at their last published versions, but 
 | `media-issue-agent` | `ghcr.io/shepemer/unraid-codex-terminal-media-issue-agent:latest` | `ghcr.io/shepemer/unraid-addons-media-issue-agent:latest` |
 | `utilities-mcp` | `ghcr.io/shepemer/unraid-codex-terminal-utilities-mcp:latest` | `ghcr.io/shepemer/unraid-addons-utilities-mcp:latest` |
 
-The same release also reduces the five DockerMan templates from 105 fields to 64. Replacing an XML file alone neither changes an installed Repository nor removes environment rows already saved in an Unraid container. Use the staged migration below rather than editing an existing container in place indefinitely.
+The same release also reduces the five DockerMan templates from 105 fields to 66. Replacing an XML file alone neither changes an installed Repository nor removes environment rows already saved in an Unraid container. Use the staged migration below rather than editing an existing container in place indefinitely.
+
+### Release precondition after merge
+
+Merging to `main` publishes the immutable full commit-SHA tag and the mutable `:main` tag; it does **not** update `:latest`. The templates point at `:latest`, so promote the exact tested merge commit before recreating anything. From a clone with GitHub CLI access:
+
+```sh
+MERGED_PR_NUMBER=123  # Replace 123 with the merged pull-request number.
+MERGE_SHA="$(gh pr view "$MERGED_PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid')"
+gh run list --workflow docker.yml --branch main --event push --limit 5
+# Wait for the push run containing $MERGE_SHA to complete successfully.
+gh workflow run docker.yml --ref main -f ref="$MERGE_SHA" -f channel=latest
+gh run list --workflow docker.yml --event workflow_dispatch --limit 5
+# Watch the new workflow_dispatch run and require a successful result.
+gh run watch <workflow-dispatch-run-id> --exit-status
+```
+
+If you use the Web UI, open **Actions → Docker → Run workflow**, leave the workflow branch as `main`, enter the full merge SHA in **Git ref to publish**, select `latest`, and wait for every build and scan job to pass. Optionally promote the same SHA to `beta` first for a canary. Do not use a later moving `main` ref for the second promotion; promote the same immutable SHA.
 
 ### Unraid migration
 
-1. Have the retained API keys, bearer tokens, WebUI passwords, integration credentials, host ports, and host paths available for recreation. Record the exact existing host sources mounted at the issue agent's `/state` and `/codex-home` targets. Do not export secrets into an unprotected text file.
-2. Edit the installed `media-issue-agent` Repository to the new package and select Apply **without changing its existing `/state` and `/codex-home` mounts or legacy environment rows**. Let this new image complete one healthy start. That intermediate boot imports non-default, non-secret runner and operations settings into SQLite before those DockerMan fields disappear.
+1. Have the retained API keys, bearer tokens, WebUI passwords, integration credentials, host ports, and host paths available for recreation. Record the exact existing host sources mounted at the issue agent's `/state` and `/codex-home` targets, whether terminal SSH uses plaintext or a crypt-format hash, and every old `MEDIA_MCP_PATH_MAPS` entry. Do not export secrets into an unprotected text file.
+2. Edit the installed `media-issue-agent` Repository to `ghcr.io/shepemer/unraid-addons-media-issue-agent:<MERGE_SHA>` and select Apply **without changing its existing `/state` and `/codex-home` mounts or legacy environment rows**. This applies whether the old Repository uses the frozen legacy namespace or an earlier `unraid-addons` image. Let the exact new image complete one healthy start and confirm the Web UI still shows issue history and settings. That intermediate boot imports non-default, non-secret runner and operations settings into SQLite before those DockerMan fields disappear.
 3. Edit the other four installed Repository fields to their corresponding `unraid-addons` packages. Replacing the template XML alone is not sufficient.
-4. Stop the stack. Remove only the Docker containers, not their images or appdata, then copy/install the reduced templates and recreate the containers with the same names on `codex-mgmt`. This explicit recreation is what removes obsolete environment rows.
+4. Stop the stack. Remove only the Docker containers, not their images or appdata, then copy/install the reduced templates and recreate the containers with the same names on `codex-mgmt`. This explicit recreation is what removes obsolete environment rows. Do not remove appdata and do not use Unraid's **Delete Image And Container** cleanup option.
 5. For `media-issue-agent`, the parent-only migration is zero-move only when the old host sources are sibling directories named `state` and `codex` beneath `/mnt/user/appdata/media-issue-agent`. In that default layout, map the existing parent to `/config`; the children become `/config/state` and `/config/codex`. If either old source was customized, disjoint, or named differently, map a persistent parent to `/config` and manually add two narrow DockerMan Path entries: the exact old `/state` host source to `/config/state`, and the exact old `/codex-home` host source to `/config/codex`. Docker's nested bind mounts preserve both custom locations without moving their contents. Re-enter the retained secrets in the new template.
-6. Verify terminal auth/config, Unraid MCP state and logs, issue history, repair workspaces, and Codex authentication before deleting any recoverable appdata or backup. The former Unraid MCP `backups/` host directory is no longer mounted or used; this migration deliberately leaves it untouched for manual review or later cleanup.
+6. On `codex-terminal`, keep SSH key login or enable password login and fill exactly one of **SSH Password** and **SSH Password Hash**. On `media-mcp`, an install that relied on the former implicit `/downloads=/mnt/unraid/downloads` mapping must now set **Download Path** to `/downloads`; translate an explicit mapping the same way. Translate `/media=/mnt/unraid/media` to **Media Path** `/media`; use the actual source roots from your old maps rather than these examples. Both fields are optional and should stay blank when no translation is needed. Arbitrary old maps with multiple source roots or custom target subdirectories remain expert-only legacy environment overrides and must be added manually if still required.
+7. Start `unraid-mcp`, `media-mcp`, `utilities-mcp`, `codex-terminal`, then `media-issue-agent`. In the authenticated issue-agent Web UI, open **Operations**, enter the comma-separated exact usernames/reporter names allowed to supply server-owner guidance, select **Save Operations**, and approve the trust confirmation.
+8. Verify terminal auth/config, Unraid MCP state and logs, media path resolution, issue history, repair workspaces, and Codex authentication before deleting any recoverable appdata or backup. The former Unraid MCP `backups/` host directory is no longer mounted or used; this migration deliberately leaves it untouched for manual review or later cleanup.
 
 The image's legacy environment/path support makes the intermediate issue-agent boot safe, but it is not a substitute for recreating the DockerMan definition. Saved Web UI values take precedence over a legacy environment value, which takes precedence over the image default.
 
@@ -62,6 +81,17 @@ services:
 
 Replace both example sources with the paths from the old deployment. Remove obsolete configuration keys, update any other image overrides, and run `docker compose pull` followed by `docker compose up -d` with the same profile and file flags you already use. With local `:dev` images, run `docker compose build` before `up -d` instead.
 
+Translate the old media path-map behavior before starting the new Compose file. If you relied on the former implicit `/downloads=/mnt/unraid/downloads` mapping, or configured that entry explicitly, set `MEDIA_MCP_DOWNLOADS_PATH=/downloads`. A former `/media=/mnt/unraid/media` entry becomes `MEDIA_MCP_MEDIA_PATH=/media`. If every explicit old entry fits those two fixed targets, remove `MEDIA_MCP_PATH_MAPS` from `.env`. For multiple sources or a custom target subdirectory that cannot be translated, keep the old value and explicitly pass it through a local `docker-compose.override.yml`:
+
+```yaml
+services:
+  media-mcp:
+    environment:
+      MEDIA_MCP_PATH_MAPS: ${MEDIA_MCP_PATH_MAPS:-}
+```
+
+The base Compose file intentionally publishes only the two supported fields. Leaving `MEDIA_MCP_PATH_MAPS` in `.env` without this override does not pass it into the container.
+
 Do not run `docker compose down`, rename the Compose project, or move `./data`. The compatibility project name remains `unraid-codex-terminal` specifically so upgrades reuse the existing containers and state.
 
 If you follow `:beta`, use `:beta` on the corresponding new package. Historical SHA tags were not copied: keep an old SHA pinned to its frozen legacy package, or move to `main`, `beta`, `latest`, or a SHA published after the new packages were created.
@@ -79,13 +109,13 @@ The unchanged host appdata preserves terminal Codex auth and config, SSH keys, w
 
 ## Configuration Surface
 
-The reduced DockerMan templates expose 64 fields, with 22 shown routinely and the rest behind Advanced View:
+The reduced DockerMan templates expose 66 fields, with 22 shown routinely and the rest behind Advanced View:
 
 | Container | Routine | Advanced | Total |
 | --- | ---: | ---: | ---: |
-| `codex-terminal` | 6 | 9 | 15 |
+| `codex-terminal` | 6 | 10 | 16 |
 | `unraid-mcp` | 3 | 2 | 5 |
-| `media-mcp` | 7 | 24 | 31 |
+| `media-mcp` | 7 | 25 | 32 |
 | `media-issue-agent` | 4 | 7 | 11 |
 | `utilities-mcp` | 2 | 0 | 2 |
 
@@ -119,11 +149,11 @@ DockerMan owns host ports and mounts plus credentials that must exist before sta
    - `UNRAID_API_KEY`
    - `UNRAID_MCP_BEARER_TOKEN`
 
-5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. WebUI authentication, username `codex`, the safe ttyd log level, client limit, and tmux session are fixed internally. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and a strong masked `SSH_PASSWORD`.
+5. Install `codex-terminal`. Set the same `UNRAID_MCP_BEARER_TOKEN`, at least one public SSH key in `SSH_AUTHORIZED_KEYS`, and a strong `WEBUI_PASSWORD`. WebUI authentication, username `codex`, the safe ttyd log level, client limit, and tmux session are fixed internally. If you need SSH password login, set `SSH_PASSWORD_LOGIN=true` and exactly one of the masked **SSH Password** and **SSH Password Hash** fields. The hash must be a complete crypt-format value accepted by `chpasswd -e`.
 
    Optional terminal diagnostics can compare media-service paths with host files. Select narrow existing shares using their exact capitalization, then set `CODEX_MEDIA_PATH_MAPS` to mappings such as `/downloads=/mnt/unraid/downloads,/media=/mnt/unraid/media`. The terminal media mount is read-only. Its downloads mount is read/write for intentional shell-side archive checks or extraction; leave it empty if that capability is not needed.
 
-6. Optional: install `media-mcp` on `codex-mgmt`. For guarded archive extraction, select the existing downloads share with its exact capitalization and mount it read/write at `/mnt/unraid/downloads`. The standard `/downloads=/mnt/unraid/downloads` mapping is always present; use `MEDIA_MCP_PATH_MAPS` only for additional nonstandard download-client, Plex, or Radarr paths. For scoped raw media-file deletion, select the narrowest existing media library root with its exact capitalization, mount it at `/mnt/unraid/media`, and explicitly allow it with `MEDIA_MCP_MEDIA_ROOTS=/mnt/unraid/media`. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
+6. Optional: install `media-mcp` on `codex-mgmt`. For guarded archive extraction, select the existing downloads share with its exact capitalization and mount it read/write at `/mnt/unraid/downloads`. If a media app reports that same root under another absolute path, set the optional Advanced **Download Path** field to the service-side root, such as `/downloads`; it maps to `/mnt/unraid/downloads`. For scoped raw media-file operations, select the narrowest existing media library root with its exact capitalization, mount it at `/mnt/unraid/media`, optionally set **Media Path** to the service-side root, such as `/media`, and explicitly allow deletion with `MEDIA_MCP_MEDIA_ROOTS=/mnt/unraid/media`. The path fields do not create mounts, and leaving one blank creates no mapping. Set `MEDIA_MCP_BEARER_TOKEN` and at least one complete service credential set:
 
    - Sonarr: `SONARR_URL` and `SONARR_API_KEY`
    - Radarr: `RADARR_URL` and `RADARR_API_KEY`
@@ -168,7 +198,7 @@ DockerMan owns host ports and mounts plus credentials that must exist before sta
    http://<unraid-ip>:6983/
    ```
 
-   Use username `operator` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, steer investigations with operator notes, inspect jobs, configure Codex model/speed defaults and non-secret repair context, configure poll interval/snapshot retention/trusted reporter, reset either settings group to its fallback, and approve or reject pending work. Changing trusted-reporter authority requires an explicit confirmation and creates an audit event. Investigations are cached per job after they run; selecting an issue shows the cached result, while Re-investigate reruns Codex and replaces the stored investigation. Each steering note supersedes the previous pending repair prompt approval and creates a new one. Action approval either records a client-side/no-op determination or launches an autonomous `codex exec --json` repair run with full access inside the issue-agent container and direct `media-mcp` access. While a repair runs, the detail pane shows a focused, human-readable live activity stream; the full investigation is available from a separate report dialog. After the repair run returns verified final JSON, the job moves to approve-fix with a structured execution result and drafted resolution comment. A failed repair remains in a failure-review state with its result and offers Retry same repair, Re-investigate, or Close anyway; it does not silently create a replacement approval. Final approval posts the resolution, adds `Closed.`, and resolves Seerr-family issues when applicable. The CLI remains available for the same workflow:
+   Use username `operator` and `ISSUE_AGENT_WEB_PASSWORD` for browser Basic auth. The Web UI can complete Codex ChatGPT setup, poll, list current snapshots, start investigations, steer investigations with operator notes, inspect jobs, configure Codex model/speed defaults and non-secret repair context, configure poll interval/snapshot retention/comma-separated trusted server-owner reporters, reset either settings group to its fallback, and approve or reject pending work. Reporter matching is exact and case-insensitive; duplicates and surrounding whitespace are normalized. A structured username takes precedence over a display name when both exist, and Slack identities never inherit this trust. Reporter-name-only aliases apply across non-Slack issue sources and may be mutable or non-unique, so use them only when an upstream source supplies no stable username and you have verified the collision risk. Changing the trusted set requires an explicit confirmation and creates an audit event. Investigations are cached per job after they run; selecting an issue shows the cached investigation when one exists, while Re-investigate reruns Codex and replaces the stored investigation. Each steering note supersedes the previous pending repair prompt approval and creates a new one. Action approval either records a client-side/no-op determination or launches an autonomous `codex exec --json` repair run with full access inside the issue-agent container and direct `media-mcp` access. While a repair runs, the detail pane shows a focused, human-readable live activity stream; the full investigation is available from a separate report dialog. After the repair run returns verified final JSON, the job moves to approve-fix with a structured execution result and drafted resolution comment. A failed repair remains in a failure-review state with its result and offers Retry same repair, Re-investigate, or Close anyway; it does not silently create a replacement approval. Final approval posts the resolution, adds `Closed.`, and resolves Seerr-family issues when applicable. The CLI remains available for the same workflow:
 
    ```sh
    docker compose --profile issue-agent run --rm media-issue-agent node src/cli.js poll-once
@@ -212,7 +242,7 @@ docker compose \
   --profile media up -d media-mcp
 ```
 
-The override uses `create_host_path: false`, so startup fails instead of creating a misspelled share. Leave the mounts and `MEDIA_MCP_MEDIA_ROOTS` blank when direct filesystem tools are not needed. `MEDIA_MCP_PATH_MAPS` is empty by default and adds custom entries without removing the standard downloads mapping.
+The override uses `create_host_path: false`, so startup fails instead of creating a misspelled share. Leave the mounts, `MEDIA_MCP_DOWNLOADS_PATH`, `MEDIA_MCP_MEDIA_PATH`, and `MEDIA_MCP_MEDIA_ROOTS` blank when direct filesystem tools are not needed. A service-path setting is useful only when the media apps report a different root from the corresponding fixed container mount. Multiple source namespaces or custom destination subdirectories require an expert manual legacy `MEDIA_MCP_PATH_MAPS` environment override; that compatibility input is intentionally not exposed by the template or base Compose file.
 
 If Fix Common Problems already reports two differently cased shares, stop every container that mounts either path. Compare both shares and their per-disk directories before moving or deleting anything:
 
@@ -268,7 +298,7 @@ ssh unraid-codex codex mcp list --json
 
 Codex Desktop Remote SSH should detect this host from your local SSH config. Open `/workspace` as the project path.
 
-SSH password auth is disabled by default. If a client cannot use SSH keys, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`; keep SSH exposed only on LAN, VPN, or Tailscale. The published template no longer includes `SSH_PASSWORD_HASH`, although expert manual deployments can still supply it; never set both password forms.
+SSH password auth is disabled by default. If a client cannot use SSH keys, set `SSH_PASSWORD_LOGIN=true` and exactly one of `SSH_PASSWORD` or `SSH_PASSWORD_HASH`; setting both, or setting neither while password login is enabled, stops startup. Generate a SHA-512 crypt hash without putting the plaintext in the DockerMan template by running `openssl passwd -6`, entering the password at its prompts, and pasting the complete one-line `$6$...` result into **SSH Password Hash**. In a Compose `.env` file, single-quote the hash (`SSH_PASSWORD_HASH='$6$...'`) so dollar signs remain literal. Keep SSH exposed only on LAN, VPN, or Tailscale.
 
 SSH as `codex`, not `root`. Root login is intentionally disabled.
 
@@ -335,7 +365,7 @@ Sonarr/Radarr search, rescan, and refresh command tools queue the native Arr com
 
 Queue-based manual import tools use the queue item's decoded `outputPath`, `downloadId`, and target `seriesId` or `movieId` when calling the Arr manual import API. If the API returns rows from library roots such as `/tv/...` or `/movies/...` instead of the queue/download folder, those rows are excluded from valid candidates and reported as blockers. Queue summaries expose decoded display paths and include raw values when upstream fields arrive HTML-escaped.
 
-NZBGet post-processing retry tools are dry-run-first and never remove history or files. Use `download_client_archive_diagnosis` with a Sonarr/Radarr queue item to match the NZBGet history record by Arr `downloadId`/NZBGet `drone` parameter, inspect `UnpackStatus`, and report archive files exposed by NZBGet. Use `nzbget_retry_postprocess` with `dryRun=false` to call `editqueue("HistoryProcess", 0, [NZBID])` for one exact history item. Deleted history items require `force=true`. `nzbget_extract_archives` only operates inside the matched history item's `DestDir`, requires `dryRun=false`, and requires the media MCP container to see that path, write to it, and run `unrar` or `7z`/`7zz`. If NZBGet exposes no `listfiles` archive roots for a completed history item, the tool maps `DestDir` with `MEDIA_MCP_PATH_MAPS`, finds root archives directly on disk, skips volume-only files such as `.r00`, extracts the roots, and can queue the matching Sonarr/Radarr downloaded scan for the original download path and download ID.
+NZBGet post-processing retry tools are dry-run-first and never remove history or files. Use `download_client_archive_diagnosis` with a Sonarr/Radarr queue item to match the NZBGet history record by Arr `downloadId`/NZBGet `drone` parameter, inspect `UnpackStatus`, and report archive files exposed by NZBGet. Use `nzbget_retry_postprocess` with `dryRun=false` to call `editqueue("HistoryProcess", 0, [NZBID])` for one exact history item. Deleted history items require `force=true`. `nzbget_extract_archives` only operates inside the matched history item's `DestDir`, requires `dryRun=false`, and requires the media MCP container to see that path, write to it, and run `unrar` or `7z`/`7zz`. If NZBGet exposes no `listfiles` archive roots for a completed history item, the tool maps `DestDir` through the configured **Download Path**, finds root archives directly on disk, skips volume-only files such as `.r00`, extracts the roots, and can queue the matching Sonarr/Radarr downloaded scan for the original download path and download ID.
 
 Use `media_archive_environment_check` or the container command below to verify the archive environment. The command reports `unrar`, `7z` or `7zz`, and a safe temporary write probe under the downloads mount when it is present:
 
@@ -357,7 +387,7 @@ Important behavior:
 - The Web UI requires Basic auth with fixed username `operator` and `ISSUE_AGENT_WEB_PASSWORD`.
 - If Codex auth is missing, the Web UI starts in setup mode and can launch `codex login --device-auth` against `/config/codex`.
 - Runner settings and Operations settings are saved separately. Each API response reports `defaults`, `effective`, `saved`, and per-field `sources`; precedence is saved UI value, then legacy environment value, then code default. Reset deletes the saved group and exposes the next fallback.
-- Operations settings cover poll interval, snapshot retention, and the trusted server-owner reporter username. Poll interval must be at least 30 seconds and retention at least 1. Granting or changing reporter trust requires confirmation and is audited; clearing it does not require confirmation. Trust changes affect new or re-run investigations rather than rewriting cached evidence.
+- Operations settings cover poll interval, snapshot retention, and a comma-separated list of trusted server-owner usernames/reporter names. Poll interval must be at least 30 seconds and retention at least 1. Reporter names are trimmed, de-duplicated case-insensitively, and matched exactly without case sensitivity; a structured username wins over a display name. A reporter-name-only alias is a deliberate fallback that applies across non-Slack issue sources and may be mutable or non-unique. Granting or changing the trusted set requires confirmation and is audited; clearing it does not require confirmation. Trust changes affect new or re-run investigations rather than rewriting cached evidence.
 - The first upgraded start imports non-default legacy, non-secret settings once. Credentials are never imported into the settings table or returned by these APIs.
 - Authenticated clients can use `GET`/`POST`/`DELETE /api/settings/codex` and `GET`/`POST`/`DELETE /api/settings/operations`. Reporter trust grants or changes in the Operations POST include `confirmServerOwnerReporterTrust: true`.
 - The Web UI defaults to dark mode and includes an optional light theme. The selected theme is stored in the browser only and does not change server-side agent behavior.
@@ -585,7 +615,7 @@ docker compose build
 docker compose up -d
 ```
 
-For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key. To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and `SSH_PASSWORD`. For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
+For local SSH testing, set `SSH_AUTHORIZED_KEYS` to your public key. To test SSH password login, set `SSH_PASSWORD_LOGIN=true` and exactly one of `SSH_PASSWORD` or `SSH_PASSWORD_HASH`. For local WebUI testing, set `WEBUI_PASSWORD` before starting the container.
 
 The Unraid MCP sidecar entrypoint refuses to start unless `UNRAID_API_URL`, `UNRAID_API_KEY`, and `UNRAID_MCP_BEARER_TOKEN` are set. The media MCP sidecar refuses to start unless `MEDIA_MCP_BEARER_TOKEN` and at least one supported media service credential set are configured. The media issue agent refuses to start if OpenAI API key auth is present or `ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN` is unset. When `/config/codex/auth.json` is missing, it starts in setup mode so ChatGPT login can be completed. The utilities MCP sidecar refuses to start unless `UTILITIES_MCP_BEARER_TOKEN` and `SCRUTINY_URL` are configured.
 

@@ -16,6 +16,32 @@ export const OPERATIONS_SETTING_DEFAULTS = Object.freeze({
   serverOwnerReporterUsername: ""
 });
 
+export function normalizeReporterUsernames(value) {
+  const raw = String(value || "");
+  if (/[\r\n\0]/.test(raw)) {
+    throw new Error("Trusted server-owner reporters must be a comma-separated single line.");
+  }
+  const seen = new Set();
+  const reporters = [];
+  for (const candidate of raw.split(",")) {
+    const reporter = candidate.trim();
+    if (!reporter) {
+      continue;
+    }
+    const identity = reporter.toLowerCase();
+    if (seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    reporters.push(reporter);
+  }
+  const normalized = reporters.join(", ");
+  if (normalized.length > 200) {
+    throw new Error("Trusted server-owner reporters must be at most 200 characters after normalization.");
+  }
+  return normalized;
+}
+
 function truthy(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -161,7 +187,9 @@ export async function loadConfig(env = process.env, options = {}) {
     logPath: env.ISSUE_AGENT_LOG_PATH || defaultDiagnosticLogPath(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"),
     repairWorkspaceRoot: env.ISSUE_AGENT_REPAIR_WORKSPACE_ROOT || path.join(path.dirname(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"), "repair-workspaces"),
     repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || CODEX_SETTING_DEFAULTS.repairContext,
-    serverOwnerReporterUsername: String(env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername).trim(),
+    serverOwnerReporterUsername: normalizeReporterUsernames(
+      env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername
+    ),
     pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, OPERATIONS_SETTING_DEFAULTS.pollIntervalSeconds, 30),
     issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, OPERATIONS_SETTING_DEFAULTS.snapshotRetention, 1),
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",

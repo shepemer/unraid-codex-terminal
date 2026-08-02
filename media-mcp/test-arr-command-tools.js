@@ -61,8 +61,11 @@ async function run() {
   let commandId = 1000;
   const commandRecords = new Map();
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "media-mcp-archives-"));
+  const listedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Example.Archive.Series.S01.1080p.BluRay.H264-TEST");
   const mappedArchiveDir = path.join(tempRoot, "usenet/completed/Series/Archive.Bundle.S01.1080p-GRP");
+  await mkdir(listedArchiveDir, { recursive: true });
   await mkdir(mappedArchiveDir, { recursive: true });
+  await writeFile(path.join(listedArchiveDir, "Example.Archive.Series.S01E01.part01.rar"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.rar"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e01.r00"), "placeholder\n");
   await writeFile(path.join(mappedArchiveDir, "archive.bundle.s01e02.part01.rar"), "placeholder\n");

@@ -47,6 +47,7 @@ EXPECTED_STABLE_CONFIGS = {
         "Unraid MCP Bearer Token": ("UNRAID_MCP_BEARER_TOKEN", "", ""),
         "Media MCP Bearer Token": ("MEDIA_MCP_BEARER_TOKEN", "", ""),
         "Utilities MCP Bearer Token": ("UTILITIES_MCP_BEARER_TOKEN", "", ""),
+        "SSH Password Hash": ("SSH_PASSWORD_HASH", "", ""),
     },
     "unraid-mcp.xml": {
         "State": (
@@ -70,9 +71,10 @@ EXPECTED_STABLE_CONFIGS = {
     "media-mcp.xml": {
         "Media MCP Bearer Token": ("MEDIA_MCP_BEARER_TOKEN", "", ""),
         "Downloads Automation Mount": ("/mnt/unraid/downloads", "", ""),
+        "Download Path": ("MEDIA_MCP_DOWNLOADS_PATH", "", ""),
         "Media Automation Mount": ("/mnt/unraid/media", "", ""),
+        "Media Path": ("MEDIA_MCP_MEDIA_PATH", "", ""),
         "Allowed Media Delete Roots": ("MEDIA_MCP_MEDIA_ROOTS", "", ""),
-        "Media MCP Path Maps": ("MEDIA_MCP_PATH_MAPS", "", ""),
     },
     "media-issue-agent.xml": {
         "Appdata": (
@@ -104,6 +106,7 @@ EXPECTED_TEMPLATE_TARGETS = {
         "SSH_AUTHORIZED_KEYS",
         "SSH_PASSWORD_LOGIN",
         "SSH_PASSWORD",
+        "SSH_PASSWORD_HASH",
         "WEBUI_PASSWORD",
         "AUTO_LAUNCH_CODEX",
         "CODEX_WEBUI_BYPASS_APPROVALS",
@@ -122,9 +125,10 @@ EXPECTED_TEMPLATE_TARGETS = {
     "media-mcp.xml": (
         "MEDIA_MCP_BEARER_TOKEN",
         "/mnt/unraid/downloads",
+        "MEDIA_MCP_DOWNLOADS_PATH",
         "/mnt/unraid/media",
+        "MEDIA_MCP_MEDIA_PATH",
         "MEDIA_MCP_MEDIA_ROOTS",
-        "MEDIA_MCP_PATH_MAPS",
         "SONARR_URL",
         "SONARR_API_KEY",
         "RADARR_URL",
@@ -188,7 +192,7 @@ EXPECTED_REQUIRED_TARGETS = {
 }
 
 EXPECTED_MASKED_TARGETS = {
-    "codex-terminal.xml": {"SSH_PASSWORD", "WEBUI_PASSWORD", "UNRAID_MCP_BEARER_TOKEN", "MEDIA_MCP_BEARER_TOKEN", "UTILITIES_MCP_BEARER_TOKEN"},
+    "codex-terminal.xml": {"SSH_PASSWORD", "SSH_PASSWORD_HASH", "WEBUI_PASSWORD", "UNRAID_MCP_BEARER_TOKEN", "MEDIA_MCP_BEARER_TOKEN", "UTILITIES_MCP_BEARER_TOKEN"},
     "unraid-mcp.xml": {"UNRAID_API_KEY", "UNRAID_MCP_BEARER_TOKEN"},
     "media-mcp.xml": {"MEDIA_MCP_BEARER_TOKEN", "SONARR_API_KEY", "RADARR_API_KEY", "PLEX_TOKEN", "TAUTULLI_API_KEY", "TRACEARR_API_KEY", "THREADFIN_PASSWORD", "THREADFIN_TOKEN", "BAZARR_API_KEY", "PROWLARR_API_KEY", "QBITTORRENT_PASSWORD", "NZBGET_PASSWORD", "SEERR_API_KEY"},
     "media-issue-agent.xml": {"ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEB_PASSWORD", "ISSUE_AGENT_PUSHOVER_APP_TOKEN", "ISSUE_AGENT_PUSHOVER_USER_KEY", "ISSUE_AGENT_SLACK_APP_TOKEN", "ISSUE_AGENT_SLACK_BOT_TOKEN", "ISSUE_AGENT_OPENAI_MODERATION_API_KEY"},
@@ -216,6 +220,7 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
         "SSH_AUTHORIZED_KEYS",
         "SSH_PASSWORD_LOGIN",
         "SSH_PASSWORD",
+        "SSH_PASSWORD_HASH",
         "WEBUI_PASSWORD",
         "AUTO_LAUNCH_CODEX",
         "CODEX_WEBUI_BYPASS_APPROVALS",
@@ -231,8 +236,9 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
     ),
     "media-mcp": (
         "MEDIA_MCP_BEARER_TOKEN",
+        "MEDIA_MCP_DOWNLOADS_PATH",
+        "MEDIA_MCP_MEDIA_PATH",
         "MEDIA_MCP_MEDIA_ROOTS",
-        "MEDIA_MCP_PATH_MAPS",
         "SONARR_URL",
         "SONARR_API_KEY",
         "RADARR_URL",
@@ -278,7 +284,7 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
 }
 
 FORBIDDEN_DEPLOYMENT_KEYS = {
-    "SSH_PASSWORD_HASH", "WEBUI_ENABLED", "WEBUI_AUTH", "WEBUI_USERNAME", "WEBUI_PORT",
+    "MEDIA_MCP_PATH_MAPS", "WEBUI_ENABLED", "WEBUI_AUTH", "WEBUI_USERNAME", "WEBUI_PORT",
     "WEBUI_MAX_CLIENTS", "WEBUI_TMUX_SESSION", "WEBUI_LOG_LEVEL", "CODEX_UPDATE_ON_START",
     "CODEX_NPM_VERSION", "CODEX_UPDATE_ON_START_TIMEOUT", "MEDIA_MCP_URL", "UTILITIES_MCP_URL",
     "UNRAID_MCP_TRANSPORT", "UNRAID_MCP_HOST", "UNRAID_MCP_PORT", "UNRAID_MCP_BACKUP_DIR",
@@ -394,7 +400,7 @@ for template_name, expected_targets in EXPECTED_TEMPLATE_TARGETS.items():
             "always"
             if target in always_targets
             else "advanced-hide"
-            if template_name == "codex-terminal.xml" and target == "SSH_PASSWORD"
+            if template_name == "codex-terminal.xml" and target in {"SSH_PASSWORD", "SSH_PASSWORD_HASH"}
             else "advanced"
         )
         require_equal(f"{location} Display", config.get("Display"), expected_display)
@@ -429,8 +435,8 @@ for template_name, expected_targets in EXPECTED_TEMPLATE_TARGETS.items():
         EXPECTED_ALWAYS_TARGETS[template_name],
     )
 
-if sum(len(targets) for targets in EXPECTED_TEMPLATE_TARGETS.values()) != 64:
-    errors.append("validator template contract must contain exactly 64 Config targets")
+if sum(len(targets) for targets in EXPECTED_TEMPLATE_TARGETS.values()) != 66:
+    errors.append("validator template contract must contain exactly 66 Config targets")
 if sum(len(targets) for targets in EXPECTED_ALWAYS_TARGETS.values()) != 22:
     errors.append("validator template contract must contain exactly 22 routine targets")
 
@@ -455,9 +461,10 @@ require_empty_defaults(
     "media-mcp.xml",
     (
         "Downloads Automation Mount",
+        "Download Path",
         "Media Automation Mount",
+        "Media Path",
         "Allowed Media Delete Roots",
-        "Media MCP Path Maps",
     ),
 )
 require_empty_defaults(
@@ -584,13 +591,15 @@ for forbidden_fragment in ("/app/backups", ":/state:rw", ":/codex-home:rw"):
 environment = (ROOT / ".env.example").read_text(encoding="utf-8")
 for variable, image in expected_compose_images.items():
     require_count(".env.example", environment, f"{variable}={image}", 1)
+require_count(".env.example SSH hash quoting", environment, "SSH_PASSWORD_HASH=''", 1)
+require_count(".env.example SSH hash quoting", environment, "SSH_PASSWORD_HASH='$6$salt$hash'", 1)
 
 expected_environment_keys = (
     "CODEX_TERMINAL_IMAGE", "UNRAID_MCP_IMAGE", "MEDIA_MCP_IMAGE", "UTILITIES_MCP_IMAGE", "ISSUE_AGENT_IMAGE",
-    "CODEX_SSH_PORT", "SSH_AUTHORIZED_KEYS", "SSH_PASSWORD_LOGIN", "SSH_PASSWORD", "CODEX_WEBUI_PORT",
+    "CODEX_SSH_PORT", "SSH_AUTHORIZED_KEYS", "SSH_PASSWORD_LOGIN", "SSH_PASSWORD", "SSH_PASSWORD_HASH", "CODEX_WEBUI_PORT",
     "WEBUI_PASSWORD", "AUTO_LAUNCH_CODEX", "CODEX_WEBUI_BYPASS_APPROVALS", "CODEX_MEDIA_PATH_MAPS",
     "UNRAID_MCP_BEARER_TOKEN", "MEDIA_MCP_BEARER_TOKEN", "UTILITIES_MCP_BEARER_TOKEN", "UNRAID_API_URL", "UNRAID_API_KEY",
-    "MEDIA_MCP_DOWNLOADS_DIR", "MEDIA_MCP_MEDIA_DIR", "MEDIA_MCP_MEDIA_ROOTS", "MEDIA_MCP_PATH_MAPS",
+    "MEDIA_MCP_DOWNLOADS_DIR", "MEDIA_MCP_DOWNLOADS_PATH", "MEDIA_MCP_MEDIA_DIR", "MEDIA_MCP_MEDIA_PATH", "MEDIA_MCP_MEDIA_ROOTS",
     "SONARR_URL", "SONARR_API_KEY", "RADARR_URL", "RADARR_API_KEY", "PLEX_URL", "PLEX_TOKEN",
     "TAUTULLI_URL", "TAUTULLI_API_KEY", "TRACEARR_URL", "TRACEARR_API_KEY", "THREADFIN_URL", "THREADFIN_USERNAME",
     "THREADFIN_PASSWORD", "THREADFIN_TOKEN", "BAZARR_URL", "BAZARR_API_KEY", "PROWLARR_URL", "PROWLARR_API_KEY",
@@ -637,6 +646,12 @@ for label in (
     "org.opencontainers.image.description",
 ):
     require_count(".github/workflows/docker.yml", workflow, f"{label}=", 1)
+require_count(
+    ".github/workflows/docker.yml SSH password behavior test",
+    workflow,
+    "bash scripts/test-ssh-password.sh",
+    1,
+)
 
 npm_packages = {
     "media-mcp": "unraid-addons-media-mcp",
@@ -682,17 +697,28 @@ require_count(
 require_count(
     "media-mcp/server.js", media_server, f"{RETIRED_BRAND} Media MCP", 0
 )
+for path_mapping_fragment in (
+    "const mediaPathMaps = configuredMediaPathMaps(env);",
+    "const mediaDeleteRoots = configuredMediaDeleteRoots(",
+    'environment.MEDIA_MCP_MEDIA_PATH, "MEDIA_MCP_MEDIA_PATH"',
+    'environment.MEDIA_MCP_DOWNLOADS_PATH, "MEDIA_MCP_DOWNLOADS_PATH"',
+    'source: mediaSource, target: "/mnt/unraid/media", scope: "media"',
+    'source: downloadsSource, target: "/mnt/unraid/downloads", scope: "downloads"',
+    "environment.MEDIA_MCP_PATH_MAPS || environment.CODEX_MEDIA_PATH_MAPS || \"\"",
+    "async function existingRealPathInside(roots, candidate)",
+    "const candidateRecords = downloadPathCandidateRecords(pathValue);",
+):
+    require_count(
+        "media-mcp/server.js configured path mapping",
+        media_server,
+        path_mapping_fragment,
+        1,
+    )
 require_count(
-    "media-mcp/server.js standard path map",
+    "media-mcp/server.js removed implicit downloads path map",
     media_server,
-    'parsePathMaps(`/downloads=/mnt/unraid/downloads,${additionalMediaPathMaps}`)',
-    1,
-)
-require_count(
-    "media-mcp/server.js additive path map input",
-    media_server,
-    'const additionalMediaPathMaps = env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "";',
-    1,
+    "/downloads=/mnt/unraid/downloads",
+    0,
 )
 
 utilities_server = (ROOT / "utilities-mcp/server.js").read_text(encoding="utf-8")
@@ -723,6 +749,33 @@ for updater_fragment in (
     "continuing with bundled version",
 ):
     require_count("entrypoint.sh fixed Codex updater", entrypoint, updater_fragment, 1)
+
+for ssh_password_hash_fragment in (
+    "configure_ssh_password() {",
+    'SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one',
+    'SSH_PASSWORD_HASH must not contain newlines',
+    'printf \'codex:%s\\n\' "${SSH_PASSWORD_HASH}" | "${chpasswd_bin}" -e',
+    'neither SSH_PASSWORD nor SSH_PASSWORD_HASH is set',
+):
+    require_count(
+        "entrypoint.sh SSH password hash support",
+        entrypoint,
+        ssh_password_hash_fragment,
+        1,
+    )
+
+ssh_password_test = (ROOT / "scripts/test-ssh-password.sh").read_text(encoding="utf-8")
+for ssh_password_test_fragment, expected_count in (
+    ("SSH_PASSWORD_HASH='$6$fixture-salt$fixture-hash'", 2),
+    ("SSH_PASSWORD_HASH=$'$6$fixture\\nnewline'", 1),
+    ("SSH_PASSWORD and SSH_PASSWORD_HASH are both set", 1),
+):
+    require_count(
+        "scripts/test-ssh-password.sh behavioral coverage",
+        ssh_password_test,
+        ssh_password_test_fragment,
+        expected_count,
+    )
 
 terminal_dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 require_count(

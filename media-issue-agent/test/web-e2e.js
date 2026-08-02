@@ -777,7 +777,7 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#operations-snapshot-retention")).toHaveValue("200");
     await page.locator("#operations-poll-interval").fill("45");
     await page.locator("#operations-snapshot-retention").fill("7");
-    await page.locator("#operations-server-owner-reporter").fill("FixtureOwner");
+    await page.locator("#operations-server-owner-reporter").fill("FixtureOwner, BackupOwner, fixtureowner");
     page.once("dialog", dialog => dialog.accept());
     await page.locator("#operations-settings-save").click();
     await expect(page.locator("#toast")).toContainText("Operations settings saved");
@@ -793,7 +793,7 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#repair-context-button")).toHaveText("Context Set");
     await expect(page.locator("#operations-poll-interval")).toHaveValue("45");
     await expect(page.locator("#operations-snapshot-retention")).toHaveValue("7");
-    await expect(page.locator("#operations-server-owner-reporter")).toHaveValue("FixtureOwner");
+    await expect(page.locator("#operations-server-owner-reporter")).toHaveValue("FixtureOwner, BackupOwner");
     await expect(page.locator("#operations-settings-source")).toContainText("saved");
     await page.locator("#repair-context-button").click();
     await expect(page.locator("#codex-repair-context")).toHaveValue("Prefer exact IDs in browser tests.");

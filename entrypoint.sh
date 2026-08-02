@@ -22,6 +22,30 @@ truthy() {
   esac
 }
 
+configure_ssh_password() {
+  local chpasswd_bin="${CHPASSWD_BIN:-chpasswd}"
+
+  if [ -n "${SSH_PASSWORD:-}" ] && [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    die "SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one"
+  fi
+
+  if [ -n "${SSH_PASSWORD:-}" ]; then
+    case "${SSH_PASSWORD}" in
+      *$'\n'*|*$'\r'*) die "SSH_PASSWORD must not contain newlines" ;;
+    esac
+    printf 'codex:%s\n' "${SSH_PASSWORD}" | "${chpasswd_bin}" \
+      || die "failed to apply SSH_PASSWORD; password mode requires a writable root filesystem"
+  elif [ -n "${SSH_PASSWORD_HASH:-}" ]; then
+    case "${SSH_PASSWORD_HASH}" in
+      *$'\n'*|*$'\r'*) die "SSH_PASSWORD_HASH must not contain newlines" ;;
+    esac
+    printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | "${chpasswd_bin}" -e \
+      || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
+  else
+    die "SSH_PASSWORD_LOGIN is enabled, but neither SSH_PASSWORD nor SSH_PASSWORD_HASH is set"
+  fi
+}
+
 shell_quote() {
   local value="$1"
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
@@ -197,22 +221,7 @@ update_codex_cli
 
 password_authentication="no"
 if truthy "${SSH_PASSWORD_LOGIN:-false}"; then
-  if [ -n "${SSH_PASSWORD:-}" ] && [ -n "${SSH_PASSWORD_HASH:-}" ]; then
-    die "SSH_PASSWORD and SSH_PASSWORD_HASH are both set; use only one"
-  fi
-
-  if [ -n "${SSH_PASSWORD:-}" ]; then
-    case "${SSH_PASSWORD}" in
-      *$'\n'*|*$'\r'*) die "SSH_PASSWORD must not contain newlines" ;;
-    esac
-    printf 'codex:%s\n' "${SSH_PASSWORD}" | chpasswd \
-      || die "failed to apply SSH_PASSWORD; password mode requires a writable root filesystem"
-  elif [ -n "${SSH_PASSWORD_HASH:-}" ]; then
-    printf 'codex:%s\n' "${SSH_PASSWORD_HASH}" | chpasswd -e \
-      || die "failed to apply SSH_PASSWORD_HASH; password mode requires a writable root filesystem"
-  else
-    die "SSH_PASSWORD_LOGIN is enabled, but SSH_PASSWORD is empty"
-  fi
+  configure_ssh_password
   password_authentication="yes"
 fi
 

@@ -3,7 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import nodePath from "node:path";
 import * as z from "zod/v4";
 
@@ -14,9 +14,8 @@ const bearerToken = env.MEDIA_MCP_BEARER_TOKEN || "";
 const requestTimeoutMs = Number(env.MEDIA_MCP_REQUEST_TIMEOUT_MS || 30000);
 const mediaProbeCommandTimeoutMs = Number(env.MEDIA_MCP_MEDIA_PROBE_COMMAND_TIMEOUT_MS || 30000);
 const allowedHosts = allowedHostnames(env.MEDIA_MCP_ALLOWED_HOSTS, "media-mcp", host);
-const additionalMediaPathMaps = env.MEDIA_MCP_PATH_MAPS || env.CODEX_MEDIA_PATH_MAPS || "";
-const mediaPathMaps = parsePathMaps(`/downloads=/mnt/unraid/downloads,${additionalMediaPathMaps}`);
-const mediaDeleteRoots = parsePathList(env.MEDIA_MCP_MEDIA_ROOTS || env.MEDIA_MCP_ALLOWED_MEDIA_ROOTS || "");
+const mediaPathMaps = configuredMediaPathMaps(env);
+const mediaDeleteRoots = configuredMediaDeleteRoots(env.MEDIA_MCP_MEDIA_ROOTS || env.MEDIA_MCP_ALLOWED_MEDIA_ROOTS || "");
 
 if (!bearerToken) {
   console.error("media-mcp: MEDIA_MCP_BEARER_TOKEN is required");
@@ -741,7 +740,51 @@ function cleanPath(value) {
   return decoded.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-function parsePathMaps(value) {
+function configuredServicePath(value, variableName) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const cleanedSource = cleanPath(raw);
+  const pathParts = cleanedSource.split("/");
+  const source = nodePath.resolve(cleanedSource);
+  if (
+    !nodePath.isAbsolute(cleanedSource)
+    || source === "/"
+    || source.length > 1024
+    || cleanedSource.includes(",")
+    || cleanedSource.includes("=")
+    || /[\0-\x1f\x7f]/.test(cleanedSource)
+    || pathParts.includes("..")
+  ) {
+    console.error(`media-mcp: ${variableName} must be a non-root absolute path without commas, equals signs, control characters, or parent traversal`);
+    process.exit(1);
+  }
+  return source;
+}
+
+function configuredMediaPathMaps(environment) {
+  const mediaSource = configuredServicePath(environment.MEDIA_MCP_MEDIA_PATH, "MEDIA_MCP_MEDIA_PATH");
+  const downloadsSource = configuredServicePath(environment.MEDIA_MCP_DOWNLOADS_PATH, "MEDIA_MCP_DOWNLOADS_PATH");
+  if (mediaSource && downloadsSource && mediaSource === downloadsSource) {
+    console.error("media-mcp: MEDIA_MCP_MEDIA_PATH and MEDIA_MCP_DOWNLOADS_PATH must not use the same source path");
+    process.exit(1);
+  }
+  const legacyMappings = environment.MEDIA_MCP_PATH_MAPS || environment.CODEX_MEDIA_PATH_MAPS || "";
+  const mappings = [
+    ...parsePathMaps(legacyMappings, "legacy"),
+    ...(mediaSource ? [{ source: mediaSource, target: "/mnt/unraid/media", scope: "media" }] : []),
+    ...(downloadsSource ? [{ source: downloadsSource, target: "/mnt/unraid/downloads", scope: "downloads" }] : [])
+  ];
+  const mappingsBySource = new Map();
+  for (const mapping of mappings) {
+    mappingsBySource.set(mapping.source, mapping);
+  }
+  return [...mappingsBySource.values()]
+    .sort((a, b) => b.source.length - a.source.length);
+}
+
+function parsePathMaps(value, scope = "legacy") {
   const mappings = String(value || "")
     .split(",")
     .map(entry => entry.trim())
@@ -753,50 +796,127 @@ function parsePathMaps(value) {
       }
       const source = cleanPath(entry.slice(0, separator));
       const target = cleanPath(entry.slice(separator + 1));
-      if (!source || !target) {
+      const resolvedSource = nodePath.resolve(source);
+      const resolvedTarget = nodePath.resolve(target);
+      if (
+        !nodePath.isAbsolute(source)
+        || !nodePath.isAbsolute(target)
+        || resolvedSource === "/"
+        || resolvedTarget === "/"
+        || source.split("/").includes("..")
+        || target.split("/").includes("..")
+        || /[\0-\x1f\x7f]/.test(source)
+        || /[\0-\x1f\x7f]/.test(target)
+      ) {
         return null;
       }
-      return { source, target };
+      return { source: resolvedSource, target: resolvedTarget, scope };
     })
     .filter(Boolean);
-  const mappingsBySource = new Map();
-  for (const mapping of mappings) {
-    mappingsBySource.set(mapping.source, mapping);
-  }
-  return [...mappingsBySource.values()]
-    .sort((a, b) => b.source.length - a.source.length);
+  return mappings;
 }
 
-function parsePathList(value) {
-  return uniqueValues(String(value || "")
-    .split(",")
-    .map(entry => cleanPath(entry.trim()))
-    .filter(Boolean));
+function configuredMediaDeleteRoots(value) {
+  const roots = [];
+  for (const entry of String(value || "").split(",")) {
+    const rawRoot = entry.trim();
+    if (!rawRoot) {
+      continue;
+    }
+    const root = cleanPath(rawRoot);
+    const resolvedRoot = nodePath.resolve(root);
+    if (
+      !root
+      || !nodePath.isAbsolute(root)
+      || resolvedRoot === "/"
+      || root.split("/").includes("..")
+      || /[\0-\x1f\x7f]/.test(root)
+    ) {
+      console.error("media-mcp: MEDIA_MCP_MEDIA_ROOTS must contain only non-root absolute paths without control characters or parent traversal");
+      process.exit(1);
+    }
+    roots.push(resolvedRoot);
+  }
+  return uniqueValues(roots);
 }
 
 function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
-function mediaPathCandidates(pathValue) {
-  const clean = cleanPath(pathValue);
+function safeAbsolutePath(value) {
+  const clean = cleanPath(value);
+  if (
+    !clean
+    || !nodePath.isAbsolute(clean)
+    || /[\0-\x1f\x7f]/.test(clean)
+    || clean.split("/").includes("..")
+  ) {
+    return "";
+  }
+  return nodePath.resolve(clean);
+}
+
+function mediaPathCandidateRecords(pathValue) {
+  const clean = safeAbsolutePath(pathValue);
   if (!clean) {
     return [];
   }
-  const candidates = [clean];
+  const candidates = [{ path: clean, scope: "direct" }];
   for (const map of mediaPathMaps) {
     if (!pathInside(map.source, clean)) {
       continue;
     }
     const suffix = clean === map.source ? "" : clean.slice(map.source.length + 1);
-    candidates.push(suffix ? `${map.target}/${suffix}` : map.target);
+    const mappedPath = nodePath.resolve(map.target, suffix);
+    if (!resolvedPathInside(map.target, mappedPath)) {
+      continue;
+    }
+    candidates.push({ path: mappedPath, allowedRoot: map.target, scope: map.scope });
   }
-  return uniqueValues(candidates);
+  const unique = new Map();
+  for (const candidate of candidates) {
+    unique.set(`${candidate.path}\0${candidate.allowedRoot || ""}`, candidate);
+  }
+  return [...unique.values()];
+}
+
+function mediaPathCandidates(pathValue) {
+  return uniqueValues(mediaPathCandidateRecords(pathValue).map(candidate => candidate.path));
+}
+
+function downloadPathCandidateRecords(pathValue) {
+  const fixedDownloadsRoot = "/mnt/unraid/downloads";
+  const records = [];
+  for (const candidate of mediaPathCandidateRecords(pathValue)) {
+    if (candidate.allowedRoot) {
+      if (candidate.scope === "downloads" || candidate.scope === "legacy") {
+        records.push(candidate);
+      }
+      continue;
+    }
+    const roots = [
+      fixedDownloadsRoot,
+      ...mediaPathMaps
+        .filter(mapping => mapping.scope === "downloads" || mapping.scope === "legacy")
+        .map(mapping => mapping.target)
+    ];
+    for (const root of uniqueValues(roots)) {
+      if (pathInside(root, candidate.path)) {
+        records.push({ ...candidate, allowedRoot: root });
+      }
+    }
+  }
+  const unique = new Map();
+  for (const candidate of records) {
+    unique.set(`${candidate.path}\0${candidate.allowedRoot}`, candidate);
+  }
+  return [...unique.values()];
 }
 
 function mediaReadPathCandidates(pathValue) {
   const candidates = mediaPathCandidates(pathValue);
-  const clean = cleanPath(pathValue);
+  const clean = safeAbsolutePath(pathValue);
   if (!clean || !nodePath.isAbsolute(clean)) {
     return candidates;
   }
@@ -823,12 +943,12 @@ function mediaReadPathCandidates(pathValue) {
 }
 
 function pathInside(parent, candidate) {
-  const cleanParent = cleanPath(parent);
-  const cleanCandidate = cleanPath(candidate);
+  const cleanParent = safeAbsolutePath(parent);
+  const cleanCandidate = safeAbsolutePath(candidate);
   if (!cleanParent || !cleanCandidate) {
     return false;
   }
-  return cleanCandidate === cleanParent || cleanCandidate.startsWith(`${cleanParent}/`);
+  return resolvedPathInside(cleanParent, cleanCandidate);
 }
 
 function resolvedPathInside(parent, candidate) {
@@ -838,6 +958,26 @@ function resolvedPathInside(parent, candidate) {
   const resolvedParent = nodePath.resolve(parent);
   const resolvedCandidate = nodePath.resolve(candidate);
   return resolvedCandidate === resolvedParent || resolvedCandidate.startsWith(`${resolvedParent}${nodePath.sep}`);
+}
+
+async function existingRealPathInside(roots, candidate) {
+  let resolvedCandidate;
+  try {
+    resolvedCandidate = await realpath(candidate);
+  } catch {
+    return null;
+  }
+  for (const root of roots) {
+    try {
+      const resolvedRoot = await realpath(root);
+      if (resolvedPathInside(resolvedRoot, resolvedCandidate)) {
+        return { path: nodePath.resolve(candidate), realPath: resolvedCandidate, root: resolvedRoot };
+      }
+    } catch {
+      // Missing roots cannot authorize an existing path.
+    }
+  }
+  return null;
 }
 
 function likelyLibraryPath(serviceName, pathValue) {
@@ -3779,23 +3919,33 @@ async function resolveMediaDeleteTarget(pathValue) {
     if (!info.exists) {
       continue;
     }
-    if (info.directory) {
+    const constrained = await existingRealPathInside(allowedRoots, candidate);
+    if (!constrained) {
+      blockers.push({
+        type: "path_outside_allowed_roots",
+        path: candidate,
+        message: "Refusing file delete because the existing path resolves outside MEDIA_MCP_MEDIA_ROOTS."
+      });
+      continue;
+    }
+    const constrainedInfo = constrained.path === candidate ? info : await mediaFileInfo(constrained.path);
+    if (constrainedInfo.directory) {
       blockers.push({
         type: "refusing_directory",
-        path: candidate,
+        path: constrained.path,
         message: "media_file_delete deletes exact files only, not directories."
       });
       continue;
     }
-    if (!info.file) {
+    if (!constrainedInfo.file) {
       blockers.push({
         type: "not_regular_file",
-        path: candidate,
+        path: constrained.path,
         message: "media_file_delete deletes regular files only."
       });
       continue;
     }
-    return { path: candidate, candidates, allowedRoots, checked, info, blockers: [] };
+    return { path: constrained.path, candidates, allowedRoots, checked, info: constrainedInfo, blockers: [] };
   }
   return {
     path: null,
@@ -3847,10 +3997,15 @@ async function resolveMediaReadTarget(pathValue) {
     if (!info.exists) {
       continue;
     }
-    if (!info.file) {
+    const constrained = await existingRealPathInside(allowedRoots, candidate);
+    if (!constrained) {
       continue;
     }
-    if (!info.readable) {
+    const constrainedInfo = constrained.path === candidate ? info : await mediaFileInfo(constrained.path);
+    if (!constrainedInfo.file) {
+      continue;
+    }
+    if (!constrainedInfo.readable) {
       return {
         path: null,
         candidates,
@@ -3858,12 +4013,12 @@ async function resolveMediaReadTarget(pathValue) {
         checked,
         blockers: [{
           type: "file_not_readable",
-          path: candidate,
+          path: constrained.path,
           message: "The resolved media file is not readable inside media-mcp."
         }]
       };
     }
-    return { path: candidate, candidates, allowedRoots, checked, info, blockers: [] };
+    return { path: constrained.path, candidates, allowedRoots, checked, info: constrainedInfo, blockers: [] };
   }
   return {
     path: null,
@@ -3942,13 +4097,17 @@ async function mediaFileDelete(input) {
 }
 
 async function resolveReadableDirectory(pathValue) {
-  const candidates = mediaPathCandidates(pathValue);
+  const candidateRecords = downloadPathCandidateRecords(pathValue);
+  const candidates = uniqueValues(candidateRecords.map(candidate => candidate.path));
   const checked = [];
-  for (const candidate of candidates) {
-    const info = await pathInfo(candidate);
+  for (const candidate of candidateRecords) {
+    const info = await pathInfo(candidate.path);
     checked.push(info);
     if (info.directory && info.readable) {
-      return { path: candidate, candidates, checked };
+      const constrained = await existingRealPathInside([candidate.allowedRoot], candidate.path);
+      if (constrained) {
+        return { path: constrained.path, candidates, checked };
+      }
     }
   }
   return { path: null, candidates, checked };
@@ -4042,7 +4201,7 @@ async function archiveEnvironmentCheck(input = {}) {
     tools,
     versions,
     downloadsPath,
-    mediaPathMaps,
+    mediaPathMaps: mediaPathMaps.map(({ source, target }) => ({ source, target })),
     pathCandidates: pathResolution.candidates,
     visiblePath: pathResolution.path || undefined,
     checkedPaths: pathResolution.checked,
@@ -4339,9 +4498,11 @@ async function extractNzbgetArchives(input) {
   const localDestDir = pathResolution.path || destDir;
   let archiveSource = "nzbget_listfiles";
   let discoveredArchiveRoots = [];
-  let roots = uniqueValues(listfileRoots
-    .map(file => rootArchivePathFromListfile(file, localDestDir, destDir))
-    .filter(Boolean));
+  let roots = pathResolution.path
+    ? uniqueValues(listfileRoots
+      .map(file => rootArchivePathFromListfile(file, localDestDir, destDir))
+      .filter(Boolean))
+    : [];
 
   if (!roots.length && pathResolution.path) {
     archiveSource = "filesystem";
@@ -4378,6 +4539,37 @@ async function extractNzbgetArchives(input) {
       blockers
     };
   }
+
+  const constrainedRoots = [];
+  const unsafeRoots = [];
+  for (const archivePath of roots) {
+    const constrained = await existingRealPathInside([localDestDir], archivePath);
+    if (constrained) {
+      constrainedRoots.push(constrained.path);
+    } else {
+      unsafeRoots.push(archivePath);
+    }
+  }
+  if (unsafeRoots.length) {
+    return {
+      dryRun: input.dryRun,
+      record,
+      destDir,
+      localDestDir,
+      pathCandidates: pathResolution.candidates,
+      checkedPaths: pathResolution.checked,
+      archiveSource,
+      archiveRoots: roots,
+      discoveredArchiveRoots,
+      extractedMediaFiles: [],
+      blockers: [{
+        type: "archive_outside_destdir",
+        message: "Refusing extraction because one or more archive roots resolve outside the mounted NZBGet DestDir.",
+        archives: unsafeRoots
+      }]
+    };
+  }
+  roots = uniqueValues(constrainedRoots);
 
   const tools = input.dryRun ? null : await archiveToolAvailability();
   const plan = roots.map(archivePath => archiveExtractionStep(archivePath, localDestDir, tools));
@@ -11047,7 +11239,7 @@ function createServer() {
 
   server.registerTool("media_file_delete", {
     title: "Scoped Media File Delete",
-    description: "Stat or delete one exact media file path after resolving MEDIA_MCP_PATH_MAPS, constrained to MEDIA_MCP_MEDIA_ROOTS. Dry-run is enabled by default.",
+    description: "Stat or delete one exact media file path after resolving the configured media/download path mapping, constrained to MEDIA_MCP_MEDIA_ROOTS. Dry-run is enabled by default.",
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
       path: z.string().min(1),
@@ -11058,7 +11250,7 @@ function createServer() {
 
   server.registerTool("media_probe_video_content", {
     title: "Video Content Probe",
-    description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with MEDIA_MCP_PATH_MAPS path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+    description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with the configured media/download path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       path: z.string().min(1).optional(),

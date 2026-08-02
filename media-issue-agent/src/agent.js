@@ -73,6 +73,7 @@ import {
   CODEX_SETTING_DEFAULTS,
   OPERATIONS_SETTING_DEFAULTS,
   inspectCodexAuth,
+  normalizeReporterUsernames,
   validateCodexHome
 } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
@@ -526,30 +527,65 @@ function reporterIdentityValues(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return [];
   }
-  return [
+  const usernames = [
     value.username,
     value.userName
   ].filter(entry => typeof entry === "string" && entry.trim()).map(entry => entry.trim());
-}
-
-function reporterMatches(value, configuredUsername) {
-  const expected = String(configuredUsername || "").trim().toLowerCase();
-  return Boolean(expected) && reporterIdentityValues(value).some(identity => identity.toLowerCase() === expected);
-}
-
-function commentAuthorMatches(comment, configuredUsername) {
+  if (usernames.length) {
+    return usernames;
+  }
   return [
+    value.displayName,
+    value.name
+  ].filter(entry => typeof entry === "string" && entry.trim()).map(entry => entry.trim());
+}
+
+function reporterNameList(value) {
+  const normalized = normalizeReporterUsernames(value);
+  return normalized ? normalized.split(", ") : [];
+}
+
+function reporterNameSet(value) {
+  return new Set(reporterNameList(value).map(reporter => reporter.toLowerCase()));
+}
+
+function reporterValuesMatch(values, configuredReporters, explicitUsernames = []) {
+  const expected = configuredReporters instanceof Set
+    ? configuredReporters
+    : reporterNameSet(configuredReporters);
+  const stableUsernames = [
+    ...explicitUsernames,
+    ...values.flatMap(value => value && typeof value === "object" && !Array.isArray(value)
+      ? [value.username, value.userName]
+      : [])
+  ].filter(value => typeof value === "string" && value.trim()).map(value => value.trim());
+  const stableUsernameSet = new Set(stableUsernames.map(value => value.toLowerCase()));
+  if (stableUsernameSet.size > 1) {
+    return false;
+  }
+  const identities = stableUsernames.length
+    ? stableUsernames
+    : values.flatMap(reporterIdentityValues);
+  return expected.size > 0
+    && identities.some(identity => expected.has(identity.toLowerCase()));
+}
+
+function commentAuthorMatches(comment, configuredReporters) {
+  const values = [
     comment?.reporter,
     comment?.user,
     comment?.author,
-    comment?.createdBy,
+    comment?.createdBy
+  ];
+  return reporterValuesMatch(values, configuredReporters, [
     comment?.username,
     comment?.userName
-  ].some(value => reporterMatches(value, configuredUsername));
+  ]);
 }
 
-function trustedServerOwnerGuidance(entry, details, configuredUsername) {
-  if (!String(configuredUsername || "").trim()) {
+function trustedServerOwnerGuidance(entry, details, configuredUsernames) {
+  const configuredReporters = reporterNameSet(configuredUsernames);
+  if (!configuredReporters.size) {
     return "";
   }
   const issue = details?.issue || details || {};
@@ -564,8 +600,7 @@ function trustedServerOwnerGuidance(entry, details, configuredUsername) {
   if (!sourceReporterIdentities.length) {
     sourceReporterIdentities.push(entry?.reporter);
   }
-  const reportAuthoredByOwner = sourceReporterIdentities
-    .some(value => reporterMatches(value, configuredUsername));
+  const reportAuthoredByOwner = reporterValuesMatch(sourceReporterIdentities, configuredReporters);
   const guidance = [];
   if (reportAuthoredByOwner) {
     guidance.push(
@@ -583,7 +618,7 @@ function trustedServerOwnerGuidance(entry, details, configuredUsername) {
     ...(Array.isArray(issue.comments) ? issue.comments : [])
   ];
   for (const comment of comments) {
-    if (commentAuthorMatches(comment, configuredUsername)) {
+    if (commentAuthorMatches(comment, configuredReporters)) {
       guidance.push(comment.message || comment.text || comment.body);
     }
   }
@@ -1746,14 +1781,11 @@ function normalizeOperationsSettings(values = {}, defaults = {}) {
   if (!Number.isInteger(snapshotRetention) || snapshotRetention < 1) {
     throw new Error("Snapshot retention must be an integer greater than or equal to 1.");
   }
-  const serverOwnerReporterUsername = String(
+  const serverOwnerReporterUsername = normalizeReporterUsernames(
     values.serverOwnerReporterUsername
       ?? defaults.serverOwnerReporterUsername
       ?? OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername
-  ).trim();
-  if (serverOwnerReporterUsername.length > 200 || /[\r\n\0]/.test(serverOwnerReporterUsername)) {
-    throw new Error("Server-owner reporter username must be a single line of at most 200 characters.");
-  }
+  );
   return { pollIntervalSeconds, snapshotRetention, serverOwnerReporterUsername };
 }
 
@@ -1811,18 +1843,36 @@ function nonDefaultSettingValues(values, defaults, fields) {
 }
 
 function reporterTrustTransition(previousUsername, nextUsername) {
-  const previous = String(previousUsername || "").trim();
-  const next = String(nextUsername || "").trim();
-  if (previous.toLowerCase() === next.toLowerCase()) {
+  const previous = normalizeReporterUsernames(previousUsername);
+  const next = normalizeReporterUsernames(nextUsername);
+  const previousReporterNames = reporterNameList(previous);
+  const nextReporterNames = reporterNameList(next);
+  const previousSet = new Set(previousReporterNames.map(name => name.toLowerCase()));
+  const nextSet = new Set(nextReporterNames.map(name => name.toLowerCase()));
+  const addedReporterNames = nextReporterNames.filter(name => !previousSet.has(name.toLowerCase()));
+  const removedReporterNames = previousReporterNames.filter(name => !nextSet.has(name.toLowerCase()));
+  if (!addedReporterNames.length && !removedReporterNames.length) {
     return null;
   }
   if (!next) {
-    return { eventType: "server_owner_reporter_trust_cleared", previousUsername: previous, nextUsername: "" };
+    return {
+      eventType: "server_owner_reporter_trust_cleared",
+      previousUsername: previous,
+      nextUsername: "",
+      previousReporterNames,
+      nextReporterNames,
+      addedReporterNames,
+      removedReporterNames
+    };
   }
   return {
     eventType: previous ? "server_owner_reporter_trust_changed" : "server_owner_reporter_trust_granted",
     previousUsername: previous,
-    nextUsername: next
+    nextUsername: next,
+    previousReporterNames,
+    nextReporterNames,
+    addedReporterNames,
+    removedReporterNames
   };
 }
 
@@ -2992,13 +3042,17 @@ export class MediaIssueAgent {
       payload: sanitizeValue({
         actor,
         previousUsername: transition.previousUsername,
-        nextUsername: transition.nextUsername
+        nextUsername: transition.nextUsername,
+        previousReporterNames: transition.previousReporterNames,
+        nextReporterNames: transition.nextReporterNames,
+        addedReporterNames: transition.addedReporterNames,
+        removedReporterNames: transition.removedReporterNames
       })
     };
   }
 
   assertReporterTrustConfirmed(transition, values = {}) {
-    if (transition?.nextUsername && values.confirmServerOwnerReporterTrust !== true) {
+    if (transition?.nextReporterNames?.length && values.confirmServerOwnerReporterTrust !== true) {
       throw new Error("Explicit confirmation is required before granting or changing trusted server-owner reporter guidance.");
     }
   }

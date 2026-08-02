@@ -1616,7 +1616,7 @@ async function testMissingMcpCapabilityCheckIsDeterministicWhenAgentVaries() {
           {
             name: "media_probe_video_content",
             title: "Video Content Probe",
-            description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with MEDIA_MCP_PATH_MAPS path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
+            description: "Probe one exact media file, Plex media part, or show/season child episode by Plex rating key with the configured media/download path mapping, ffprobe metadata, embedded title extraction, and optional average-hash frame comparison.",
             inputSchema: {
               path: "",
               ratingKey: "",
@@ -2723,7 +2723,7 @@ async function testLegacySettingsMigrationAndSources() {
     ISSUE_AGENT_REPAIR_CONTEXT: "Legacy non-secret repair context.",
     ISSUE_AGENT_POLL_INTERVAL_SECONDS: "45",
     ISSUE_AGENT_SNAPSHOT_RETENTION: "2",
-    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: "LegacyOwner"
+    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: " LegacyOwner, BackupOwner, legacyowner "
   }, { requireCodexAuth: false });
   config.suppressInitLog = true;
   try {
@@ -2751,7 +2751,7 @@ async function testLegacySettingsMigrationAndSources() {
     assert.deepEqual(operations.effective, {
       pollIntervalSeconds: 45,
       snapshotRetention: 2,
-      serverOwnerReporterUsername: "LegacyOwner"
+      serverOwnerReporterUsername: "LegacyOwner, BackupOwner"
     });
     assert.deepEqual(operations.sources, {
       pollIntervalSeconds: "saved",
@@ -2818,7 +2818,7 @@ async function testOperationsSettingsValidationTrustAuditAndDynamicRetention() {
   try {
     await agent.init();
     await assert.rejects(
-      async () => agent.updateOperationsSettings({ serverOwnerReporterUsername: "NewOwner" }, "test"),
+      async () => agent.updateOperationsSettings({ serverOwnerReporterUsername: "NewOwner, BackupOwner" }, "test"),
       /Explicit confirmation is required/
     );
     assert.equal(agent.operationsSettings().effective.serverOwnerReporterUsername, "LegacyOwner");
@@ -2826,11 +2826,11 @@ async function testOperationsSettingsValidationTrustAuditAndDynamicRetention() {
     const changed = agent.updateOperationsSettings({
       pollIntervalSeconds: 60,
       snapshotRetention: 2,
-      serverOwnerReporterUsername: "NewOwner",
+      serverOwnerReporterUsername: "NewOwner, BackupOwner, newowner",
       confirmServerOwnerReporterTrust: true,
       slackBotToken: "xoxb-must-not-persist"
     }, "test");
-    assert.equal(changed.effective.serverOwnerReporterUsername, "NewOwner");
+    assert.equal(changed.effective.serverOwnerReporterUsername, "NewOwner, BackupOwner");
     assert.deepEqual(changed.sources, {
       pollIntervalSeconds: "saved",
       snapshotRetention: "saved",
@@ -2838,6 +2838,11 @@ async function testOperationsSettingsValidationTrustAuditAndDynamicRetention() {
     });
     assert.doesNotMatch(JSON.stringify(changed), /xoxb-must-not-persist|slackBotToken/);
     assert.doesNotMatch(JSON.stringify(getSetting(dbPath, "operations", null)), /xoxb-must-not-persist|slackBotToken/);
+
+    const formattingOnly = agent.updateOperationsSettings({
+      serverOwnerReporterUsername: " newowner, BackupOwner, NEWOWNER "
+    }, "test");
+    assert.equal(formattingOnly.effective.serverOwnerReporterUsername, "newowner, BackupOwner");
 
     await assert.rejects(
       async () => agent.resetOperationsSettings({}, "test"),
@@ -2851,10 +2856,10 @@ async function testOperationsSettingsValidationTrustAuditAndDynamicRetention() {
     const cleared = agent.updateOperationsSettings({ serverOwnerReporterUsername: "" }, "test");
     assert.equal(cleared.effective.serverOwnerReporterUsername, "");
     const granted = agent.updateOperationsSettings({
-      serverOwnerReporterUsername: "FinalOwner",
+      serverOwnerReporterUsername: "FinalOwner, BackupOwner, finalowner",
       confirmServerOwnerReporterTrust: true
     }, "test");
-    assert.equal(granted.effective.serverOwnerReporterUsername, "FinalOwner");
+    assert.equal(granted.effective.serverOwnerReporterUsername, "FinalOwner, BackupOwner");
 
     await assert.rejects(
       async () => agent.updateOperationsSettings({ pollIntervalSeconds: 29 }, "test"),
@@ -2884,6 +2889,18 @@ ORDER BY id;
     assert.equal(auditTypes.includes("server_owner_reporter_trust_changed"), true);
     assert.equal(auditTypes.includes("server_owner_reporter_trust_cleared"), true);
     assert.equal(auditTypes.includes("server_owner_reporter_trust_granted"), true);
+    const changedTrustAudit = sqliteExec(dbPath, `
+SELECT redacted_payload_json AS payloadJson
+FROM audit_events
+WHERE event_type = 'server_owner_reporter_trust_changed'
+ORDER BY id
+LIMIT 1;
+`, { json: true })[0];
+    const changedTrustPayload = JSON.parse(changedTrustAudit.payloadJson);
+    assert.deepEqual(changedTrustPayload.previousReporterNames, ["LegacyOwner"]);
+    assert.deepEqual(changedTrustPayload.nextReporterNames, ["NewOwner", "BackupOwner"]);
+    assert.deepEqual(changedTrustPayload.addedReporterNames, ["NewOwner", "BackupOwner"]);
+    assert.deepEqual(changedTrustPayload.removedReporterNames, ["LegacyOwner"]);
 
     const auditCountBeforeFailure = sqliteExec(dbPath, "SELECT COUNT(*) AS count FROM audit_events;", { json: true })[0].count;
     sqliteExec(dbPath, `
@@ -2895,7 +2912,7 @@ BEGIN
 END;
 `);
     assert.throws(() => agent.updateOperationsSettings({
-      serverOwnerReporterUsername: "AtomicOwner",
+      serverOwnerReporterUsername: "AtomicOwner, BackupOwner",
       confirmServerOwnerReporterTrust: true
     }, "test"), /forced trusted-reporter audit failure/);
     assert.equal(agent.operationsSettings().effective.serverOwnerReporterUsername, "");
@@ -2903,7 +2920,7 @@ END;
     sqliteExec(dbPath, "DROP TRIGGER reject_trusted_reporter_grant;");
 
     agent.updateOperationsSettings({
-      serverOwnerReporterUsername: "AtomicOwner",
+      serverOwnerReporterUsername: "AtomicOwner, BackupOwner",
       confirmServerOwnerReporterTrust: true
     }, "test");
     sqliteExec(dbPath, `
@@ -2917,7 +2934,7 @@ END;
     assert.throws(() => agent.resetOperationsSettings({
       confirmServerOwnerReporterTrust: true
     }, "test"), /forced operations-reset audit failure/);
-    assert.equal(agent.operationsSettings().saved.serverOwnerReporterUsername, "AtomicOwner");
+    assert.equal(agent.operationsSettings().saved.serverOwnerReporterUsername, "AtomicOwner, BackupOwner");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -3055,11 +3072,19 @@ async function testAuthConfig() {
     CODEX_HOME: codexHome,
     ISSUE_AGENT_DB_PATH: "/tmp/media-issue-agent.sqlite",
     ISSUE_AGENT_LOG_PATH: "/tmp/media-issue-agent-diagnostics.log",
-    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: " fixture-owner "
+    ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: " fixture-owner, Backup Admin, FIXTURE-OWNER "
   });
   assert.equal(loaded.codexHome, codexHome);
   assert.equal(loaded.logPath, "/tmp/media-issue-agent-diagnostics.log");
-  assert.equal(loaded.serverOwnerReporterUsername, "fixture-owner");
+  assert.equal(loaded.serverOwnerReporterUsername, "fixture-owner, Backup Admin");
+  await assert.rejects(
+    () => loadConfig({
+      ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
+      CODEX_HOME: codexHome,
+      ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME: "fixture-owner\nspoofed-owner"
+    }),
+    /comma-separated single line/
+  );
   const chatGptLoaded = await loadConfig({
     ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token",
     CODEX_HOME: chatGptCodexHome

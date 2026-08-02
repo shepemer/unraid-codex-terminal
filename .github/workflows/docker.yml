@@ -51,7 +51,9 @@ jobs:
           node-version: "22"
 
       - name: Validate deployment configuration
-        run: python3 scripts/validate-deployment.py
+        run: |
+          python3 scripts/validate-deployment.py
+          bash scripts/test-ssh-password.sh
 
       - name: Run media MCP checks
         run: |
